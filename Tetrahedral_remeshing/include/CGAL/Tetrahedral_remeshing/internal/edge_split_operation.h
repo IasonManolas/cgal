@@ -50,6 +50,8 @@ class EdgeSplitOperation
 {
 
 public:
+  static constexpr bool ordered_processing = true;
+
   using Tr = typename C3t3::Triangulation;
   using Vertex_handle = typename Tr::Vertex_handle;
   using Cell_handle = typename Tr::Cell_handle;

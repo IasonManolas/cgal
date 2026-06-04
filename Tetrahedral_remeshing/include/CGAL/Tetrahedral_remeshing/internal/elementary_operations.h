@@ -27,6 +27,10 @@
 #include <tbb/concurrent_queue.h>
 #endif
 
+#ifndef LOCK_GRID_SIZE
+#  define LOCK_GRID_SIZE 8
+#endif
+
 #include <atomic>
 #include <algorithm>
 #include <random>
@@ -55,7 +59,8 @@ public:
   ElementaryOperation() = default;
   virtual ~ElementaryOperation() = default;
 
-  // Processing strategy trait - determines execution approach
+  // Compile-time processing strategy trait
+  static constexpr bool ordered_processing = false;
   virtual bool requires_ordered_processing() const { return false; }
   // Pure element logic methods
   virtual ElementSource get_element_source(const C3t3& c3t3) const = 0;
@@ -296,39 +301,77 @@ private:
     return true;
   }
 
-  // Unordered processing using parallel_for_each (for operations like VertexSmooth, EdgeFlip)
-  bool apply_unordered_processing(std::vector<ElementType>& elements, Operation& op, C3t3& c3t3) {
+  // Unordered processing using spatial bucketing (for operations like VertexSmooth, EdgeFlip)
+  bool apply_unordered_processing(
+    std::vector<ElementType>& elements,
+    Operation& op,
+    C3t3& c3t3,
+    const CGAL::Bbox_3& bb)
+  {
 #if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
-    std::random_device rd;
-    std::mt19937 g(rd());
-
-    std::shuffle(elements.begin(), elements.end(), g);
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
     std::atomic<size_t> num_successful_locks = 0;
     std::atomic<size_t> num_failed_locks = 0;
 #endif
-    tbb::parallel_for_each(elements, [&](const ElementType& element) {
-      bool lock_acquired = false;
-      while(!lock_acquired) {
-        lock_acquired = op.lock_zone(element, c3t3);
-        if(!lock_acquired) {
-          c3t3.triangulation().unlock_all_elements();
-          std::this_thread::yield(); // backoff to reduce contention
-#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
-          num_failed_locks++;
-#endif
-        }
+
+    const double min_sq_dim = (std::min)(CGAL::square(bb.xmax() - bb.xmin()),
+                                (std::min)(CGAL::square(bb.ymax() - bb.ymin()),
+                                           CGAL::square(bb.zmax() - bb.zmin())));
+    const float grid_cell_size = 0.5f * CGAL::approximate_sqrt(min_sq_dim);
+    const float inv_cell_size = 1.f / grid_cell_size;
+
+    struct Grid_cell_index
+    {
+      int i, j, k;
+      bool operator==(const Grid_cell_index& other) const
+      { return i == other.i && j == other.j && k == other.k; }
+    };
+
+    struct Grid_cell_index_hasher
+    {
+      std::size_t operator()(const Grid_cell_index& ci) const
+      {
+        return ((std::hash<int>()(ci.i) ^ (std::hash<int>()(ci.j) << 1)) >> 1)
+               ^ (std::hash<int>()(ci.k) << 1);
       }
+    };
 
-      op.execute_operation(element, c3t3);
+    auto compute_cell_index
+      = [&](const typename C3t3::Triangulation::Geom_traits::Point_3& p) -> Grid_cell_index
+        {
+          return {static_cast<int>(std::floor(p.x() * inv_cell_size)),
+                  static_cast<int>(std::floor(p.y() * inv_cell_size)),
+                  static_cast<int>(std::floor(p.z() * inv_cell_size))};
+        };
+
+    std::unordered_map<Grid_cell_index, std::vector<ElementType>, Grid_cell_index_hasher> spatialBuckets;
+    for(const auto& e : elements)
+    {
+      Grid_cell_index idx = compute_cell_index(op.point_on_element(e));
+      spatialBuckets[idx].push_back(e);
+    }
+
+    tbb::parallel_for_each(spatialBuckets.begin(), spatialBuckets.end(),
+      [&](const std::pair<const Grid_cell_index, std::vector<ElementType>>& bucket)
+      {
+        for(const auto& element : bucket.second)
+        {
+          while(!op.lock_zone(element, c3t3))
+          {
+            c3t3.triangulation().unlock_all_elements();
+            std::this_thread::yield();
 #ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
-      num_successful_locks++;
+            num_failed_locks++;
 #endif
-
-      c3t3.triangulation().unlock_all_elements();
-    });
-    // #endif
+          }
+          op.execute_operation(element, c3t3);
+#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
+          num_successful_locks++;
+#endif
+          c3t3.triangulation().unlock_all_elements();
+        }
+      });
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
     {
@@ -370,11 +413,10 @@ public:
     }
 
     // Choose processing strategy based on operation requirements
-    if(op.requires_ordered_processing()) {
+    if constexpr (Operation::ordered_processing)
       return apply_ordered_processing(elements, op, c3t3);
-    } else {
-      return apply_unordered_processing(elements, op, c3t3);
-    }
+    else
+      return apply_unordered_processing(elements, op, c3t3, c3t3.bbox());
   }
 }; // class ElementaryOperationExecution
 

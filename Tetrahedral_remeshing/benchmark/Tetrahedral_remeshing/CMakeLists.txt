@@ -62,12 +62,14 @@ create_single_source_cgal_program("benchmark_adaptive_tetrahedral_remeshing.cpp"
 create_single_source_cgal_program("benchmark_refactored_tetrahedral_remeshing.cpp")
 create_single_source_cgal_program("benchmark_original_tetrahedral_remeshing.cpp")
 create_single_source_cgal_program("benchmark_refactored_sequential_tetrahedral_remeshing.cpp")
+create_single_source_cgal_program("benchmark_refactored_parallel_tetrahedral_remeshing.cpp")
 
 target_include_directories(benchmark_tetrahedral_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/Benchmark_creation/external/)
 target_include_directories(benchmark_adaptive_tetrahedral_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/Benchmark_creation/external)
 target_include_directories(benchmark_refactored_tetrahedral_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/Benchmark_creation/external)
 target_include_directories(benchmark_original_tetrahedral_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/Benchmark_creation/external)
 target_include_directories(benchmark_refactored_sequential_tetrahedral_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/Benchmark_creation/external)
+target_include_directories(benchmark_refactored_parallel_tetrahedral_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/Benchmark_creation/external)
 
 if(TARGET CGAL::TBB_support)
   target_link_libraries(benchmark_tetrahedral_remeshing PRIVATE CGAL::TBB_support)
@@ -75,6 +77,7 @@ if(TARGET CGAL::TBB_support)
   target_link_libraries(benchmark_refactored_tetrahedral_remeshing PRIVATE CGAL::TBB_support)
   target_link_libraries(benchmark_original_tetrahedral_remeshing PRIVATE CGAL::TBB_support)
   target_link_libraries(benchmark_refactored_sequential_tetrahedral_remeshing PRIVATE CGAL::TBB_support)
+  target_link_libraries(benchmark_refactored_parallel_tetrahedral_remeshing PRIVATE CGAL::TBB_support)
 endif()
 
 # Link with Boost.ProgramOptions (optional)

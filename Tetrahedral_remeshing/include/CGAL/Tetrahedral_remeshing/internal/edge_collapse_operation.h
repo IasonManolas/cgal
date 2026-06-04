@@ -53,6 +53,7 @@ class EdgeCollapseOperation : public ElementaryOperation<C3t3,
                                                          typename C3t3::Triangulation::Cell_handle>
 {
 public:
+  static constexpr bool ordered_processing = true;
   using Triangulation = typename C3t3::Triangulation;
   using Vertex_handle = typename Triangulation::Vertex_handle;
   using Edge = typename Triangulation::Edge;

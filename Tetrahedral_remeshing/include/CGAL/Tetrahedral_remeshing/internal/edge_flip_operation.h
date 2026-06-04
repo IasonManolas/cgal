@@ -74,6 +74,13 @@ public:
   // Provide access to member variables for execution classes
   CellSelector& get_cell_selector() { return m_cell_selector; }
   bool get_protect_boundaries() const { return m_protect_boundaries; }
+
+  typename Tr::Geom_traits::Point_3
+  point_on_element(const std::pair<Vertex_handle, Vertex_handle>& vp) const
+  {
+    auto cp = typename Tr::Geom_traits().construct_point_3_object();
+    return cp(vp.first->point());
+  }
 };
 
 // Internal Edge Flip Operation - processes vertex pairs like original get_internal_edges
@@ -105,6 +112,7 @@ public:
 
   // Import types from base class
   using typename BaseClass::Edge;
+  using BaseClass::point_on_element;
 
 public:
   InternalEdgeFlipOperation(C3t3& c3t3,
@@ -248,6 +256,7 @@ public:
   // Import types from base class
   using typename BaseClass::Edge;
   using typename BaseClass::Facet;
+  using BaseClass::point_on_element;
 
   using Subdomain_index = typename C3t3::Subdomain_index;
   using Surface_patch_index = typename C3t3::Surface_patch_index;
