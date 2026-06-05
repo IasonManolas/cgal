@@ -180,6 +180,12 @@ public:
     return success;
   }
 
+  typename Triangulation::Geom_traits::Point_3 point_on_element(const ElementType& e) const
+  {
+    auto cp = typename Triangulation::Geom_traits().construct_point_3_object();
+    return cp(e.first->vertex(e.second)->point());
+  }
+
   std::string operation_name() const override { return "Edge Collapse"; }
   bool requires_ordered_processing() const override { return true; }
 };
