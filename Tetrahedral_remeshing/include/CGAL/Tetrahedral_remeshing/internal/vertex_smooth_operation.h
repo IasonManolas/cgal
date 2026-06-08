@@ -69,6 +69,13 @@ public:
   bool m_flip_smooth_steps = false;
   std::vector<Move> m_moves;
 
+  // Finite edges scanned once per smooth phase (topology is constant during
+  // smoothing -- only positions change). Internal and surface preprocessing both
+  // iterate this cache instead of re-running the expensive finite_edges()
+  // canonical-cell iterator. Results are identical: each op still reads live
+  // vertex positions when it computes its moves.
+  std::vector<Edge> m_finite_edges;
+
   // Incident cells data (used by all 3 operations)
   using Incident_cells_vector = boost::container::small_vector<Cell_handle, 64>;
   std::vector<Incident_cells_vector> m_inc_cells;
@@ -136,6 +143,12 @@ public:
     reset_vertex_id_map(c3t3.triangulation());
     reset_free_vertices(c3t3.triangulation());
     collect_incident_cells(c3t3.triangulation());
+
+    // Cache the finite edges once for this smooth phase (reused by internal and
+    // surface preprocessing). Topology is stable through the whole phase.
+    m_finite_edges.clear();
+    for(const Edge& e : c3t3.triangulation().finite_edges())
+      m_finite_edges.push_back(e);
   }
 
   void start_flip_smooth_steps(const C3t3& c3t3) {
@@ -549,7 +562,7 @@ public:
     const typename BaseClass::Context::Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
     m_context->m_moves.assign(nbv, default_move);
 
-    for(const Edge& e : tr.finite_edges()) {
+    for(const Edge& e : m_context->m_finite_edges) {
       if(is_outside(e, c3t3, m_context->m_cell_selector))
         continue;
 
@@ -655,7 +668,7 @@ private:
     const typename BaseClass::Context::Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
     m_context->m_moves.assign(nbv, default_move);
 
-    for(const Edge& e : tr.finite_edges()) {
+    for(const Edge& e : m_context->m_finite_edges) {
       if(!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector)) {
         const Vertex_handle vh0 = e.first->vertex(e.second);
         const Vertex_handle vh1 = e.first->vertex(e.third);
