@@ -271,6 +271,10 @@ private:
     return s_boundary_vertices_valences;
   }
 
+  // Cached result of perform_global_preprocessing: avoids a second O(E) finite_edges
+  // scan in get_element_source. Populated once per flip phase on the main thread,
+  // serially, before any parallel work begins -- no concurrency issue.
+  mutable std::vector<ElementType> m_cached_boundary_vertex_pairs;
 
 public:
   BoundaryEdgeFlipOperation(C3t3& c3t3,
@@ -280,29 +284,27 @@ public:
       : BaseClass(c3t3, cell_selector, protect_boundaries, visitor) {}
 
   void perform_global_preprocessing(const C3t3& c3t3) const {
-    // Collect boundary edges and compute vertices valences (needed for boundary flipping)
-    std::vector<Edge> boundary_edges; // We don't need to store this
+    // One O(E) scan: collect boundary edges and compute vertices valences.
     boost::unordered_map<Vertex_handle, std::unordered_set<Subdomain_index>> vertices_subdomain_indices;
+    std::vector<Edge> boundary_edges;
     collectBoundaryEdgesAndComputeVerticesValences(c3t3, m_cell_selector, boundary_edges,
                                                    get_static_boundary_vertices_valences(), vertices_subdomain_indices);
+
+    // Reuse the boundary_edges already collected above to cache the element source,
+    // avoiding a second finite_edges scan in get_element_source. boundary_edges holds
+    // exactly the is_boundary() edges (flip_edges.h), so filtering !is_in_complex here
+    // reproduces the original get_element_source filter is_boundary && !is_in_complex.
+    m_cached_boundary_vertex_pairs.clear();
+    for(const Edge& e : boundary_edges)
+      if(!c3t3.is_in_complex(e))
+        m_cached_boundary_vertex_pairs.push_back(make_vertex_pair(e));
   }
 
   std::vector<ElementType> get_element_source(const C3t3& c3t3) const override {
-    // Perform global preprocessing (valences computation, subdomain collection)
+    // perform_global_preprocessing populates the cache in one scan; just return it.
+    // Called serially on the same thread before any parallel work -- safe.
     perform_global_preprocessing(c3t3);
-
-    // Collect boundary vertex pairs fresh each time
-    std::vector<ElementType> boundary_vertex_pairs;
-
-    // Collect boundary edges as vertex pairs to match original behavior
-    for(const Edge& e : c3t3.triangulation().finite_edges()) {
-      if(is_boundary(c3t3, e, m_cell_selector) && !c3t3.is_in_complex(e)) {
-        boundary_vertex_pairs.push_back(make_vertex_pair(e));
-      }
-    }
-
-    // Return container by value
-    return boundary_vertex_pairs;
+    return m_cached_boundary_vertex_pairs;
   }
 
   bool lock_zone(const ElementType& e, const C3t3& c3t3) const override {
