@@ -28,6 +28,12 @@
 #include <limits>
 #include <queue>
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
+#endif
+
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
 #include <CGAL/Real_timer.h>
 #endif
@@ -1247,17 +1253,65 @@ void collectBoundaryEdgesAndComputeVerticesValences(
   typedef typename C3T3::Vertex_handle       Vertex_handle;
   typedef typename C3T3::Edge                Edge;
   typedef typename C3T3::Triangulation::Facet_circulator Facet_circulator;
+  typedef typename C3T3::Triangulation::Cell_handle      Cell_handle;
+  typedef typename C3T3::Triangulation::Cell_circulator  Cell_circulator;
 
   const typename C3T3::Triangulation& tr = c3t3.triangulation();
 
   boundary_edges.clear();
   boundary_vertices_valences.clear();
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  // Parallel cell-scan: enumerate finite edges in parallel over cells. Each cell
+  // emits an edge only if it is the edge's minimum-handle (canonical) cell -- the
+  // same rule the finite_edges iterator uses -- so each edge is produced exactly
+  // once with no shared dedup structure. The mesh is read-only here (preprocessing
+  // before the parallel flip phase), so the scan is safe to parallelize.
+  std::vector<Cell_handle> cells;
+  cells.reserve(tr.number_of_finite_cells() + 64);
+  for (auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+    cells.push_back(cit);
+
+  static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+  tbb::enumerable_thread_specific<std::vector<Edge>> tl_boundary_edges;
+  tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+    [&](const tbb::blocked_range<std::size_t>& range)
+    {
+      std::vector<Edge>& local = tl_boundary_edges.local();
+      for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
+      {
+        const Cell_handle c = cells[ci];
+        for (int s = 0; s < 6; ++s)
+        {
+          const Edge e(c, edge_slots[s][0], edge_slots[s][1]);
+          if (tr.is_infinite(e))
+            continue;
+
+          // canonical-owner test (same as the finite_edges iterator)
+          Cell_circulator ccir = tr.incident_cells(e);
+          do { ++ccir; } while (c < Cell_handle(ccir));
+          if (Cell_handle(ccir) != c)
+            continue;
+
+          if (is_boundary(c3t3, e, cell_selector))
+            local.push_back(e);
+        }
+      }
+    });
+
+  std::size_t total = 0;
+  for (const auto& l : tl_boundary_edges) total += l.size();
+  boundary_edges.reserve(total);
+  for (const auto& l : tl_boundary_edges)
+    boundary_edges.insert(boundary_edges.end(), l.begin(), l.end());
+#else
   for (const Edge& e : tr.finite_edges())
   {
     if (is_boundary(c3t3, e, cell_selector))
       boundary_edges.push_back(e);
   }
+#endif
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
   CGAL::Tetrahedral_remeshing::debug::dump_edges(boundary_edges,
