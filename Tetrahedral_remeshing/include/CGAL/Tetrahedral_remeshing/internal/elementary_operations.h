@@ -28,7 +28,7 @@
 #endif
 
 #ifndef LOCK_GRID_SIZE
-#  define LOCK_GRID_SIZE 8
+#  define LOCK_GRID_SIZE 128 // grid cells per axis for the spatial lock grid
 #endif
 
 #include <atomic>
@@ -118,10 +118,10 @@ private:
 
 #ifndef USE_TAG_NON_BLOCKING
       static typename C3t3::Triangulation::Lock_data_structure lock_ds(c3t3.bbox(), // Use C3T3's bounding box
-                                                                       8 // Default grid size (same as Mesh_3 default)
+                                                                       LOCK_GRID_SIZE // grid size (overridable)
       );
 #else
-      static CGAL::Spatial_lock_grid_3<Tag_non_blocking> lock_ds(c3t3.bbox(), 8);
+      static CGAL::Spatial_lock_grid_3<Tag_non_blocking> lock_ds(c3t3.bbox(), LOCK_GRID_SIZE);
 #endif
       triangulation.set_lock_data_structure(&lock_ds);
     }
