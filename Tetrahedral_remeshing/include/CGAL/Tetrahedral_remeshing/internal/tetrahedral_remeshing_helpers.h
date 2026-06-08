@@ -33,6 +33,13 @@
 #include <boost/bimap.hpp>
 
 #include <optional>
+#include <vector>
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
+#endif
 
 namespace CGAL
 {
@@ -596,6 +603,61 @@ auto make_vertex_pair(const Edge& e)
 {
   return make_vertex_pair(e.first->vertex(e.second), e.first->vertex(e.third));
 }
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+// Parallel enumeration of finite edges via a cell-scan, used for candidate
+// collection. Each finite edge is visited exactly once -- by its minimum-handle
+// (canonical) cell, the same rule the finite_edges() iterator uses -- so there is
+// no shared deduplication structure. For every canonical finite edge the callback
+// `fn(e, local)` is invoked and appends its results to the supplied thread-local
+// vector; the merged result is returned. The mesh must be read-only during the
+// call (candidate collection / preprocessing happens before the parallel phase).
+template<typename T, typename Tr, typename Fn>
+std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
+{
+  using Cell_handle = typename Tr::Cell_handle;
+  using Edge = typename Tr::Edge;
+  using Cell_circulator = typename Tr::Cell_circulator;
+
+  std::vector<Cell_handle> cells;
+  cells.reserve(tr.number_of_finite_cells() + 64);
+  for(auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+    cells.push_back(cit);
+
+  static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+  tbb::enumerable_thread_specific<std::vector<T>> tl;
+  tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+    [&](const tbb::blocked_range<std::size_t>& range)
+    {
+      std::vector<T>& local = tl.local();
+      for(std::size_t ci = range.begin(); ci != range.end(); ++ci)
+      {
+        const Cell_handle c = cells[ci];
+        for(int s = 0; s < 6; ++s)
+        {
+          const Edge e(c, edge_slots[s][0], edge_slots[s][1]);
+          if(tr.is_infinite(e))
+            continue;
+          // canonical-owner test: c owns the edge iff no ring cell has a smaller handle
+          Cell_circulator ccir = tr.incident_cells(e);
+          do { ++ccir; } while(c < Cell_handle(ccir));
+          if(Cell_handle(ccir) != c)
+            continue;
+          fn(e, local);
+        }
+      }
+    });
+
+  std::vector<T> result;
+  std::size_t total = 0;
+  for(const auto& l : tl) total += l.size();
+  result.reserve(total);
+  for(const auto& l : tl)
+    result.insert(result.end(), l.begin(), l.end());
+  return result;
+}
+#endif
 
 template<typename Edge>
 auto make_inv_vertex_pair(const Edge& e)
@@ -1265,17 +1327,30 @@ OutputIterator get_internal_edges(const C3t3& c3t3,
                                   CellSelector cell_selector,
                                   OutputIterator oit)/*holds Edges*/
 {
+  typedef typename C3t3::Edge Edge;
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  // Parallel cell-scan candidate collection (see parallel_collect_finite_edges).
+  using VPair = decltype(make_vertex_pair(std::declval<Edge>()));
+  auto pairs = parallel_collect_finite_edges<VPair>(c3t3.triangulation(),
+    [&](const Edge& e, std::vector<VPair>& out) {
+      if(is_internal(e, c3t3, cell_selector))
+        out.push_back(make_vertex_pair(e));
+    });
+  for(const auto& p : pairs)
+    *oit++ = p;
+#else
   for (typename C3t3::Triangulation::Finite_edges_iterator
        eit = c3t3.triangulation().finite_edges_begin();
        eit != c3t3.triangulation().finite_edges_end();
        ++eit)
   {
-    const typename C3t3::Edge& e = *eit;
+    const Edge& e = *eit;
     if (is_internal(e, c3t3, cell_selector))
     {
       *oit++ = make_vertex_pair(e);
     }
   }
+#endif
   return oit;
 }
 

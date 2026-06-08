@@ -108,19 +108,34 @@ public:
     std::vector<std::pair<Edge, FT>> short_edges_with_length;
     const auto& tr = c3t3.triangulation();
 
-    for(const Edge& e : tr.finite_edges()) {
+    auto eval = [&](const Edge& e, std::vector<std::pair<Edge, FT>>& out) {
       auto [collapsible, boundary] = can_be_collapsed(e, c3t3, m_protect_boundaries, m_cell_selector);
       if(!collapsible)
-        continue;
-
+        return;
       const auto sqlen = is_too_short(e, boundary, m_sizing, c3t3, m_cell_selector);
-      if(sqlen != std::nullopt) {
-        short_edges_with_length.push_back(std::make_pair(e, sqlen.value()));
-      }
-    }
-    // Sort ascending: shortest first
-    auto length_comp = [&](const std::pair<Edge, FT>& a, const std::pair<Edge, FT>& b) { return a.second < b.second; };
-    std::stable_sort(short_edges_with_length.begin(), short_edges_with_length.end(), length_comp);
+      if(sqlen != std::nullopt)
+        out.push_back(std::make_pair(e, sqlen.value()));
+    };
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    // Parallel cell-scan candidate collection (see parallel_collect_finite_edges).
+    short_edges_with_length = parallel_collect_finite_edges<std::pair<Edge, FT>>(tr, eval);
+#else
+    for(const Edge& e : tr.finite_edges())
+      eval(e, short_edges_with_length);
+#endif
+
+    // Sort ascending: shortest first. Deterministic vertex-timestamp tie-break so
+    // the parallel-collected order is reproducible (sequential path used insertion
+    // order for equal lengths).
+    auto comp = [](const std::pair<Edge, FT>& a, const std::pair<Edge, FT>& b) {
+      if(a.second != b.second) return a.second < b.second;
+      const auto pa = make_vertex_pair(a.first);
+      const auto pb = make_vertex_pair(b.first);
+      if(pa.first != pb.first) return pa.first < pb.first;
+      return pa.second < pb.second;
+    };
+    std::sort(short_edges_with_length.begin(), short_edges_with_length.end(), comp);
 
     std::vector<ElementType> short_edges;
     short_edges.reserve(short_edges_with_length.size());
