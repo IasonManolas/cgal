@@ -37,6 +37,12 @@
 #include <list>
 #include <optional>
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
+#endif
+
 namespace CGAL {
 namespace Tetrahedral_remeshing {
 namespace internal {
@@ -146,9 +152,52 @@ public:
 
     // Cache the finite edges once for this smooth phase (reused by internal and
     // surface preprocessing). Topology is stable through the whole phase.
+    const Tr& tr = c3t3.triangulation();
     m_finite_edges.clear();
-    for(const Edge& e : c3t3.triangulation().finite_edges())
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    // Parallel cell-scan: each cell emits an edge only if it is the edge's
+    // minimum-handle (canonical) cell -- same rule as the finite_edges iterator --
+    // so each edge is produced exactly once with no shared dedup structure. The
+    // mesh is read-only here (preprocessing before the parallel smooth phase).
+    std::vector<Cell_handle> cells;
+    cells.reserve(tr.number_of_finite_cells() + 64);
+    for(auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+      cells.push_back(cit);
+
+    static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+    tbb::enumerable_thread_specific<std::vector<Edge>> tl_edges;
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& range)
+      {
+        std::vector<Edge>& local = tl_edges.local();
+        for(std::size_t ci = range.begin(); ci != range.end(); ++ci)
+        {
+          const Cell_handle c = cells[ci];
+          for(int s = 0; s < 6; ++s)
+          {
+            const Edge e(c, edge_slots[s][0], edge_slots[s][1]);
+            if(tr.is_infinite(e))
+              continue;
+            typename Tr::Cell_circulator ccir = tr.incident_cells(e);
+            do { ++ccir; } while(c < Cell_handle(ccir));
+            if(Cell_handle(ccir) != c)
+              continue;
+            local.push_back(e);
+          }
+        }
+      });
+
+    std::size_t total = 0;
+    for(const auto& l : tl_edges) total += l.size();
+    m_finite_edges.reserve(total);
+    for(const auto& l : tl_edges)
+      m_finite_edges.insert(m_finite_edges.end(), l.begin(), l.end());
+#else
+    for(const Edge& e : tr.finite_edges())
       m_finite_edges.push_back(e);
+#endif
   }
 
   void start_flip_smooth_steps(const C3t3& c3t3) {
