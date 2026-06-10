@@ -282,9 +282,60 @@ public:
 
   bool resolution_reached()
   {
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    std::vector<Cell_handle> cells;
+    cells.reserve(tr().number_of_finite_cells() + 64);
+    for (auto cit = tr().all_cells_begin(); cit != tr().all_cells_end(); ++cit)
+      cells.push_back(cit);
+
+    static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+    std::atomic<bool> out_of_resolution{false};
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& range)
+      {
+        for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
+        {
+          if (out_of_resolution.load(std::memory_order_relaxed))
+            return;
+
+          const Cell_handle c = cells[ci];
+          if (tr().is_infinite(c))
+            continue;
+
+          for (int s = 0; s < 6; ++s)
+          {
+            if (out_of_resolution.load(std::memory_order_relaxed))
+              return;
+
+            const Edge e(c, edge_slots[s][0], edge_slots[s][1]);
+
+            // canonical-cell dedup: emit only if c is the min-handle cell
+            typename Tr::Cell_circulator ccir = tr().incident_cells(e);
+            do { ++ccir; } while (c < Cell_handle(ccir));
+            if (Cell_handle(ccir) != c)
+              continue;
+
+            const bool boundary =
+              m_c3t3.is_in_complex(e) || is_boundary(m_c3t3, e, m_cell_selector);
+            if (m_protect_boundaries && boundary)
+              continue;
+
+            if (  is_too_long(e, boundary, m_sizing, m_c3t3, m_cell_selector)
+               || is_too_short(e, boundary, m_sizing, m_c3t3, m_cell_selector))
+            {
+              out_of_resolution.store(true, std::memory_order_relaxed);
+              return;
+            }
+          }
+        }
+      });
+
+    if (out_of_resolution.load())
+      return false;
+#else
     for (const Edge& e : tr().finite_edges())
     {
-      // skip protected edges
       const bool boundary =
         m_c3t3.is_in_complex(e) || is_boundary(m_c3t3, e, m_cell_selector);
       if (m_protect_boundaries && boundary)
@@ -294,6 +345,7 @@ public:
         || is_too_short(e, boundary, m_sizing, m_c3t3, m_cell_selector))
         return false;
     }
+#endif
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
     std::cout << "Resolution reached" << std::endl;
