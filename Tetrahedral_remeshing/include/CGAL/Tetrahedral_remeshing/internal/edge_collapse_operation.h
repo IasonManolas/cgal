@@ -34,6 +34,7 @@
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/concurrent_unordered_map.h>
+#include <boost/unordered/concurrent_flat_map.hpp>
 #endif
 
 // #define EDGE_COLLAPSE_DEBUG
@@ -75,7 +76,12 @@ private:
   const Visitor& m_visitor;
 
 #if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
-  tbb::concurrent_unordered_map<Edge, bool> should_skip_edge;
+  // boost::concurrent_flat_map (open-addressed) instead of
+  // tbb::concurrent_unordered_map: the tbb map's clear()/destructor is strictly
+  // serial (walks a split-ordered linked list, frees N scattered nodes) and cost
+  // ~0.9s of serial main-thread internal_clear in the collapse window. The
+  // flat_map bulk-frees its contiguous storage.
+  boost::concurrent_flat_map<Edge, bool, boost::hash<Edge>> should_skip_edge;
 #else
   boost::unordered_map<Edge, bool> should_skip_edge;
 #endif

@@ -1979,7 +1979,9 @@ template<typename EdgeType, typename ShouldSkipContainer>
 void remove_from_bimap(const EdgeType& e,
                       ShouldSkipContainer& should_skip)
 {
-  should_skip[e] = true;
+  // insert_or_assign rather than operator[]: boost::concurrent_flat_map has no
+  // operator[]; both it and the serial boost::unordered_map support this.
+  should_skip.insert_or_assign(e, true);
 }
 #else
 
