@@ -70,7 +70,10 @@ public:
   };
 
   // Shared pre-computed data (used by at least 2 operations)
-  std::unordered_map<Vertex_handle, std::size_t> m_vertex_id;
+  // The per-vertex dense index is stored on the vertex itself
+  // (Remeshing_vertex_base_3::smoothing_id) rather than in an
+  // unordered_map<Vertex_handle, std::size_t>: hashing the CC_iterator key and
+  // the per-lookup cost dominated the serial refresh() bookkeeping.
   std::vector<bool> m_free_vertices;
   bool m_flip_smooth_steps = false;
   std::vector<Move> m_moves;
@@ -260,18 +263,16 @@ private:
 
 
   void reset_vertex_id_map(const Tr& tr) {
-    m_vertex_id.clear();
     std::size_t id = 0;
     for(const Vertex_handle v : tr.finite_vertex_handles()) {
-      m_vertex_id[v] = id++;
+      v->set_smoothing_id(id++);
     }
   }
 
   bool is_selected(const Cell_handle c) const { return get(m_cell_selector, c); }
 
   std::size_t vertex_id(const Vertex_handle v) const {
-    CGAL_expensive_assertion(m_vertex_id.find(v) != m_vertex_id.end());
-    return m_vertex_id.at(v);
+    return v->smoothing_id();
   }
 
   void reset_free_vertices(const Tr& tr) {
@@ -322,7 +323,7 @@ private:
 
     for(const Cell_handle c : tr.finite_cell_handles()) {
       for(auto vi : tr.vertices(c)) {
-        const std::size_t idi = m_vertex_id.at(vi);
+        const std::size_t idi = vi->smoothing_id();
         if(m_free_vertices[idi])
           m_inc_cells[idi].push_back(c);
       }
@@ -655,8 +656,8 @@ public:
                     continue;
 
                 const auto [vh0, vh1] = make_vertex_pair(e);
-                const std::size_t i0 = m_context->m_vertex_id.at(vh0);
-                const std::size_t i1 = m_context->m_vertex_id.at(vh1);
+                const std::size_t i0 = vh0->smoothing_id();
+                const std::size_t i1 = vh1->smoothing_id();
 
                 const bool vh0_moving = (c3t3.in_dimension(vh0) == 3 && m_context->m_free_vertices[i0]);
                 const bool vh1_moving = (c3t3.in_dimension(vh1) == 3 && m_context->m_free_vertices[i1]);
@@ -696,8 +697,8 @@ public:
 
       const auto [vh0, vh1] = make_vertex_pair(e);
 
-      const std::size_t& i0 = m_context->m_vertex_id.at(vh0);
-      const std::size_t& i1 = m_context->m_vertex_id.at(vh1);
+      const std::size_t& i0 = vh0->smoothing_id();
+      const std::size_t& i1 = vh1->smoothing_id();
 
       const bool vh0_moving = (c3t3.in_dimension(vh0) == 3 && m_context->m_free_vertices[i0]);
       const bool vh1_moving = (c3t3.in_dimension(vh1) == 3 && m_context->m_free_vertices[i1]);
@@ -736,7 +737,7 @@ public:
   }
 
   bool execute_operation(const ElementType& v, C3t3& c3t3) override {
-    const std::size_t vid = m_context->m_vertex_id.at(v);
+    const std::size_t vid = v->smoothing_id();
     if(!(m_context->m_free_vertices[vid] && c3t3.in_dimension(v) == 3 && m_context->m_moves[vid].neighbors > 1)) {
       return false;
     }
@@ -813,8 +814,8 @@ private:
                     const Vertex_handle vh0 = e.first->vertex(e.second);
                     const Vertex_handle vh1 = e.first->vertex(e.third);
 
-                    const std::size_t i0 = m_context->m_vertex_id.at(vh0);
-                    const std::size_t i1 = m_context->m_vertex_id.at(vh1);
+                    const std::size_t i0 = vh0->smoothing_id();
+                    const std::size_t i1 = vh1->smoothing_id();
 
                     const bool vh0_moving = !is_on_feature(vh0) && m_context->m_free_vertices[i0];
                     const bool vh1_moving = !is_on_feature(vh1) && m_context->m_free_vertices[i1];
@@ -854,8 +855,8 @@ private:
         const Vertex_handle vh0 = e.first->vertex(e.second);
         const Vertex_handle vh1 = e.first->vertex(e.third);
 
-        const std::size_t& i0 = m_context->m_vertex_id.at(vh0);
-        const std::size_t& i1 = m_context->m_vertex_id.at(vh1);
+        const std::size_t& i0 = vh0->smoothing_id();
+        const std::size_t& i1 = vh1->smoothing_id();
 
         const bool vh0_moving = !is_on_feature(vh0) && m_context->m_free_vertices[i0];
         const bool vh1_moving = !is_on_feature(vh1) && m_context->m_free_vertices[i1];
@@ -934,7 +935,7 @@ public:
 
   bool execute_operation(const ElementType& v, C3t3& c3t3) override {
     auto& tr = c3t3.triangulation();
-    const std::size_t vid = m_context->m_vertex_id.at(v);
+    const std::size_t vid = v->smoothing_id();
     if(!(m_context->m_free_vertices[vid] && v->in_dimension() == 2)) {
       return false;
     }
@@ -1113,7 +1114,7 @@ public:
 
   bool execute_operation(const ElementType& v, C3t3& c3t3) override {
     auto& tr = c3t3.triangulation();
-    const std::size_t vid = m_context->m_vertex_id.at(v);
+    const std::size_t vid = v->smoothing_id();
     if(!(m_context->m_free_vertices[vid] && is_on_feature(v)))
       return false;
 
@@ -1207,8 +1208,8 @@ public:
                 CGAL_expensive_assertion(is_on_feature(vh0));
                 CGAL_expensive_assertion(is_on_feature(vh1));
 
-                const std::size_t i0 = m_context->m_vertex_id.at(vh0);
-                const std::size_t i1 = m_context->m_vertex_id.at(vh1);
+                const std::size_t i0 = vh0->smoothing_id();
+                const std::size_t i1 = vh1->smoothing_id();
 
                 const bool vh0_moving = m_context->m_free_vertices[i0];
                 const bool vh1_moving = m_context->m_free_vertices[i1];
@@ -1242,8 +1243,8 @@ public:
       CGAL_expensive_assertion(is_on_feature(vh0));
       CGAL_expensive_assertion(is_on_feature(vh1));
 
-      const std::size_t& i0 = m_context->m_vertex_id.at(vh0);
-      const std::size_t& i1 = m_context->m_vertex_id.at(vh1);
+      const std::size_t& i0 = vh0->smoothing_id();
+      const std::size_t& i1 = vh1->smoothing_id();
 
       const bool vh0_moving = m_context->m_free_vertices[i0];
       const bool vh1_moving = m_context->m_free_vertices[i1];

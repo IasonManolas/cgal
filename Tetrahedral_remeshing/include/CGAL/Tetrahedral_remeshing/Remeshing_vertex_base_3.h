@@ -54,6 +54,18 @@ public:
 
 public:
   using Vb::Vb; // constructors
+
+  // Transient dense index assigned per smooth phase by the vertex smoother
+  // (Vertex_smoothing_context::reset_vertex_id_map). Stored on the vertex to
+  // avoid an unordered_map<Vertex_handle, std::size_t> whose CC_iterator hashing
+  // and per-lookup cost dominated the serial refresh() bookkeeping. Not
+  // serialized; reassigned 0..N-1 over finite_vertex_handles() at the start of
+  // every smooth phase, so values from prior iterations are always overwritten.
+  std::size_t smoothing_id() const { return smoothing_id_; }
+  void set_smoothing_id(const std::size_t id) { smoothing_id_ = id; }
+
+private:
+  std::size_t smoothing_id_ = 0;
 };
 
 } // namespace Tetrahedral_remeshing
