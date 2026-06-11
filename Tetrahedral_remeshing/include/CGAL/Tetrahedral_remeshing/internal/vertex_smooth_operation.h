@@ -82,6 +82,14 @@ public:
   // vertex positions when it computes its moves.
   std::vector<Edge> m_finite_edges;
 
+  // Complex (feature) edges, the is_in_complex subset of m_finite_edges, also
+  // cached once per smooth phase. ComplexEdgeVertexSmoothOperation iterates this
+  // small set instead of c3t3.edges_in_complex() -- the latter is a Filter_iterator
+  // over finite_edges() that re-walks every finite edge with canonical-cell dedup
+  // (Time_stamper::less) just to keep the few complex edges (~3.5s serial). Built
+  // during the same cell-scan that produces m_finite_edges, so no extra pass.
+  std::vector<Edge> m_complex_edges;
+
   // Incident cells data (used by all 3 operations)
   using Incident_cells_vector = boost::container::small_vector<Cell_handle, 64>;
   std::vector<Incident_cells_vector> m_inc_cells;
@@ -154,12 +162,15 @@ public:
     // surface preprocessing). Topology is stable through the whole phase.
     const Tr& tr = c3t3.triangulation();
     m_finite_edges.clear();
+    m_complex_edges.clear();
 
 #if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
     // Parallel cell-scan: each cell emits an edge only if it is the edge's
     // minimum-handle (canonical) cell -- same rule as the finite_edges iterator --
     // so each edge is produced exactly once with no shared dedup structure. The
     // mesh is read-only here (preprocessing before the parallel smooth phase).
+    // The same scan also collects the is_in_complex subset into m_complex_edges
+    // (is_in_complex is a read-only complex lookup, safe for concurrent reads).
     std::vector<Cell_handle> cells;
     cells.reserve(tr.number_of_finite_cells() + 64);
     for(auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
@@ -168,10 +179,12 @@ public:
     static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
 
     tbb::enumerable_thread_specific<std::vector<Edge>> tl_edges;
+    tbb::enumerable_thread_specific<std::vector<Edge>> tl_complex_edges;
     tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
       [&](const tbb::blocked_range<std::size_t>& range)
       {
         std::vector<Edge>& local = tl_edges.local();
+        std::vector<Edge>& local_complex = tl_complex_edges.local();
         for(std::size_t ci = range.begin(); ci != range.end(); ++ci)
         {
           const Cell_handle c = cells[ci];
@@ -185,6 +198,8 @@ public:
             if(Cell_handle(ccir) != c)
               continue;
             local.push_back(e);
+            if(c3t3.is_in_complex(e))
+              local_complex.push_back(e);
           }
         }
       });
@@ -194,9 +209,19 @@ public:
     m_finite_edges.reserve(total);
     for(const auto& l : tl_edges)
       m_finite_edges.insert(m_finite_edges.end(), l.begin(), l.end());
+
+    std::size_t total_complex = 0;
+    for(const auto& l : tl_complex_edges) total_complex += l.size();
+    m_complex_edges.reserve(total_complex);
+    for(const auto& l : tl_complex_edges)
+      m_complex_edges.insert(m_complex_edges.end(), l.begin(), l.end());
 #else
     for(const Edge& e : tr.finite_edges())
+    {
       m_finite_edges.push_back(e);
+      if(c3t3.is_in_complex(e))
+        m_complex_edges.push_back(e);
+    }
 #endif
   }
 
@@ -1151,10 +1176,66 @@ public:
     const std::size_t nbv = tr.number_of_vertices();
 
     // Initialize moves vector
-    m_context->m_moves.assign(nbv, typename BaseClass::Context::Move{CGAL::NULL_VECTOR, 0, 0.});
+    const typename BaseClass::Context::Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
+    m_context->m_moves.assign(nbv, default_move);
 
-    // Collect moves from complex edges
-    for(const Edge& e : c3t3.edges_in_complex()) {
+    // Iterate the cached m_complex_edges (the is_in_complex subset of finite edges,
+    // collected once per smooth phase in refresh()), instead of c3t3.edges_in_complex().
+    // The latter is a Filter_iterator over finite_edges() that re-walks every finite edge
+    // with canonical-cell dedup (Time_stamper::less) just to keep the few complex edges
+    // (~3.5s serial main-thread). Geometry (density, positions) is read live: correctness
+    // depends only on the complex-edge topology being constant during the smooth phase.
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    // Parallel density accumulation. Each edge writes two vertex slots, so accumulate into
+    // thread-local *sparse* contribution lists (only the vertices each thread touches),
+    // then merge serially. Merge is O(threads x touched) ~ O(complex_edges), never O(V) --
+    // avoiding the full-vector reduction that would dwarf the work for so small a set.
+    using Move = typename BaseClass::Context::Move;
+    using Contrib = std::pair<std::size_t, Move>;
+    tbb::enumerable_thread_specific<std::vector<Contrib>> tl_contrib;
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, m_context->m_complex_edges.size()),
+        [&](const tbb::blocked_range<std::size_t>& range)
+        {
+            std::vector<Contrib>& local = tl_contrib.local();
+            for(std::size_t ei = range.begin(); ei != range.end(); ++ei)
+            {
+                const Edge& e = m_context->m_complex_edges[ei];
+                const Vertex_handle vh0 = e.first->vertex(e.second);
+                const Vertex_handle vh1 = e.first->vertex(e.third);
+
+                CGAL_expensive_assertion(is_on_feature(vh0));
+                CGAL_expensive_assertion(is_on_feature(vh1));
+
+                const std::size_t i0 = m_context->m_vertex_id.at(vh0);
+                const std::size_t i1 = m_context->m_vertex_id.at(vh1);
+
+                const bool vh0_moving = m_context->m_free_vertices[i0];
+                const bool vh1_moving = m_context->m_free_vertices[i1];
+
+                if(!vh0_moving && !vh1_moving)
+                    continue;
+
+                const Point_3& p0 = point(vh0->point());
+                const Point_3& p1 = point(vh1->point());
+                const FT density = BaseClass::density_along_segment(e, c3t3, true);
+
+                if(vh0_moving)
+                    local.push_back({i0, Move{density * Vector_3(p0, p1), 1, density}});
+                if(vh1_moving)
+                    local.push_back({i1, Move{density * Vector_3(p1, p0), 1, density}});
+            }
+        });
+
+    for(const std::vector<Contrib>& local : tl_contrib)
+        for(const Contrib& c : local)
+        {
+            m_context->m_moves[c.first].move += c.second.move;
+            m_context->m_moves[c.first].mass += c.second.mass;
+            m_context->m_moves[c.first].neighbors += c.second.neighbors;
+        }
+#else
+    for(const Edge& e : m_context->m_complex_edges) {
       const Vertex_handle vh0 = e.first->vertex(e.second);
       const Vertex_handle vh1 = e.first->vertex(e.third);
 
@@ -1187,6 +1268,7 @@ public:
         ++m_context->m_moves[i1].neighbors;
       }
     }
+#endif
   }
 };
 
