@@ -611,6 +611,60 @@ public:
     const typename BaseClass::Context::Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
     m_context->m_moves.assign(nbv, default_move);
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    // Parallel edge scan: density_along_segment (-> midpoint_with_info -> Time_stamper::less)
+    // dominates this loop. Each edge writes to two vertex slots so use thread-local
+    // accumulators to avoid races; reduce serially after (O(V * nthreads), negligible).
+    using MoveVec = std::vector<typename BaseClass::Context::Move>;
+    tbb::enumerable_thread_specific<MoveVec> tl_moves(
+        [&]{ return MoveVec(nbv, default_move); });
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, m_context->m_finite_edges.size()),
+        [&](const tbb::blocked_range<std::size_t>& range)
+        {
+            MoveVec& lm = tl_moves.local();
+            for(std::size_t ei = range.begin(); ei != range.end(); ++ei)
+            {
+                const Edge& e = m_context->m_finite_edges[ei];
+                if(is_outside(e, c3t3, m_context->m_cell_selector))
+                    continue;
+
+                const auto [vh0, vh1] = make_vertex_pair(e);
+                const std::size_t i0 = m_context->m_vertex_id.at(vh0);
+                const std::size_t i1 = m_context->m_vertex_id.at(vh1);
+
+                const bool vh0_moving = (c3t3.in_dimension(vh0) == 3 && m_context->m_free_vertices[i0]);
+                const bool vh1_moving = (c3t3.in_dimension(vh1) == 3 && m_context->m_free_vertices[i1]);
+
+                if(!vh0_moving && !vh1_moving)
+                    continue;
+
+                const Point_3& p0 = point(vh0->point());
+                const Point_3& p1 = point(vh1->point());
+                const FT density = BaseClass::density_along_segment(e, c3t3);
+
+                if(vh0_moving) {
+                    lm[i0].move += density * Vector_3(p0, p1);
+                    lm[i0].mass += density;
+                    ++lm[i0].neighbors;
+                }
+                if(vh1_moving) {
+                    lm[i1].move += density * Vector_3(p1, p0);
+                    lm[i1].mass += density;
+                    ++lm[i1].neighbors;
+                }
+            }
+        });
+
+    for(const MoveVec& lm : tl_moves)
+        for(std::size_t i = 0; i < nbv; ++i)
+            if(lm[i].neighbors > 0)
+            {
+                m_context->m_moves[i].move += lm[i].move;
+                m_context->m_moves[i].mass += lm[i].mass;
+                m_context->m_moves[i].neighbors += lm[i].neighbors;
+            }
+#else
     for(const Edge& e : m_context->m_finite_edges) {
       if(is_outside(e, c3t3, m_context->m_cell_selector))
         continue;
@@ -641,6 +695,7 @@ public:
         ++m_context->m_moves[i1].neighbors;
       }
     }
+#endif
   }
 
   ElementSource get_element_source(const C3t3& c3t3) const override {
@@ -713,10 +768,62 @@ private:
     auto& tr = c3t3.triangulation();
     const std::size_t nbv = tr.number_of_vertices();
 
-    // Initialize moves vector
     const typename BaseClass::Context::Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
     m_context->m_moves.assign(nbv, default_move);
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    using MoveVec = std::vector<typename BaseClass::Context::Move>;
+    tbb::enumerable_thread_specific<MoveVec> tl_moves(
+        [&]{ return MoveVec(nbv, default_move); });
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, m_context->m_finite_edges.size()),
+        [&](const tbb::blocked_range<std::size_t>& range)
+        {
+            MoveVec& lm = tl_moves.local();
+            for(std::size_t ei = range.begin(); ei != range.end(); ++ei)
+            {
+                const Edge& e = m_context->m_finite_edges[ei];
+                if(!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector))
+                {
+                    const Vertex_handle vh0 = e.first->vertex(e.second);
+                    const Vertex_handle vh1 = e.first->vertex(e.third);
+
+                    const std::size_t i0 = m_context->m_vertex_id.at(vh0);
+                    const std::size_t i1 = m_context->m_vertex_id.at(vh1);
+
+                    const bool vh0_moving = !is_on_feature(vh0) && m_context->m_free_vertices[i0];
+                    const bool vh1_moving = !is_on_feature(vh1) && m_context->m_free_vertices[i1];
+
+                    if(!vh0_moving && !vh1_moving)
+                        continue;
+
+                    const Point_3& p0 = point(vh0->point());
+                    const Point_3& p1 = point(vh1->point());
+                    const FT density = BaseClass::density_along_segment(e, c3t3, true);
+
+                    if(vh0_moving) {
+                        lm[i0].move += density * Vector_3(p0, p1);
+                        lm[i0].mass += density;
+                        ++lm[i0].neighbors;
+                    }
+                    if(vh1_moving) {
+                        lm[i1].move += density * Vector_3(p1, p0);
+                        lm[i1].mass += density;
+                        ++lm[i1].neighbors;
+                    }
+                }
+            }
+        });
+
+    for(const MoveVec& lm : tl_moves)
+        for(std::size_t i = 0; i < nbv; ++i)
+            if(lm[i].neighbors > 0)
+            {
+                m_context->m_moves[i].move += lm[i].move;
+                m_context->m_moves[i].mass += lm[i].mass;
+                m_context->m_moves[i].neighbors += lm[i].neighbors;
+            }
+#else
     for(const Edge& e : m_context->m_finite_edges) {
       if(!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector)) {
         const Vertex_handle vh0 = e.first->vertex(e.second);
@@ -747,6 +854,7 @@ private:
         }
       }
     }
+#endif
   }
 
   std::optional<Point_3> project(const Surface_patch_index& si, const Point_3& gi) {
