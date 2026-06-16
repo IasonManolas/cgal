@@ -76,6 +76,18 @@ public:
   Elementary_remesher(C3t3& c3t3)
     : m_c3t3(c3t3) {}
 
+  // PHASE-STRUCTURE INVARIANT (important for parallel correctness):
+  // each remeshing iteration runs these four phases STRICTLY IN SEQUENCE --
+  //   split() -> collapse() -> flip() -> smooth()
+  // and only split()/collapse() MUTATE the 1-D feature complex (c3t3 edges_),
+  // while flip()/smooth() only READ it (is_in_complex/curve_index). Under
+  // Parallel_tag, edges_ is a lock-free boost::concurrent_flat_map (see
+  // Complex_edges_storage in Mesh_complex_3_in_triangulation_3.h) with NO external
+  // lock: this is safe ONLY because point reads/writes never overlap a full
+  // traversal, and read-only phases never run concurrently with writers.
+  // If you change this phase structure (e.g. interleave writes with a full edges_
+  // walk, run a writer phase concurrently with a reader phase, or add a phase that
+  // both mutates and iterates edges_), REVISIT that storage's concurrency model.
   void split(const SizingFunction& sizing, const CellSelector& cell_selector, const bool protect_boundaries) {
     EdgeSplitOp split_op(sizing, cell_selector, protect_boundaries);
     ExecutionPolicy<EdgeSplitOp> executor;
@@ -115,7 +127,7 @@ public:
   }
 
   void smooth() {
-    CGAL_assertion(m_context);
+    CGAL_assertion(m_context!=nullptr);
     m_context->refresh(m_c3t3);
 
     if(!m_context->m_protect_boundaries) {
