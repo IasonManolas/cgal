@@ -165,7 +165,15 @@ public:
     if(!(tr.try_lock_vertex(v0) && tr.try_lock_vertex(v1))) {
       return false;
     }
-    if(!tr.is_vertex(v0) || !tr.is_vertex(v1)) {
+    // Lock-free validity check. tr.is_vertex() routes through
+    // Concurrent_compact_container::owns(), which takes the container's block-list
+    // mutex (a queuing_mutex) and scans all blocks -> heavy serialization under
+    // parallel collapse. We already hold v0/v1's zone locks, so the only thing that
+    // can have changed is the slot's used/free tag (a concurrent collapse that freed
+    // it before we acquired the lock). vertices().is_used() reads that tag in O(1)
+    // with no lock -- the TDS documents this as the efficient path for parallel ops.
+    const auto& tds = tr.tds();
+    if(!tds.vertices().is_used(v0) || !tds.vertices().is_used(v1)) {
       return false;
     }
     std::vector<Cell_handle> inc_cells_0, inc_cells_1;
