@@ -181,6 +181,11 @@ public:
 
   bool execute_operation(const ElementType& e, C3t3& c3t3) override { return execute_internal_edge_flip(e, c3t3); }
 
+  void locked_vertices(const ElementType& e,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override {
+    out = { e.first, e.second };
+  }
+
   bool requires_ordered_processing() const override {
     return false; // InternalEdgeFlip can use unordered parallel processing
   }
@@ -367,6 +372,11 @@ public:
   }
 
   bool execute_operation(const ElementType& e, C3t3& c3t3) override { return execute_boundary_edge_flip(e, c3t3); }
+
+  void locked_vertices(const ElementType& e,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override {
+    out = { e.first, e.second };
+  }
 
   bool requires_ordered_processing() const override {
     return false; // BoundaryEdgeFlip can use unordered parallel processing

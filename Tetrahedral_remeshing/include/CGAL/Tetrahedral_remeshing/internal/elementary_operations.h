@@ -28,6 +28,8 @@
 #include <tbb/concurrent_vector.h>
 #include <tbb/task_arena.h>
 #include <functional>
+#include <boost/unordered/concurrent_flat_map.hpp>
+#include <boost/functional/hash.hpp>
 #endif
 
 #ifndef LOCK_GRID_SIZE
@@ -44,6 +46,7 @@
 #include <algorithm>
 #include <random>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 #include <thread>
 #include <string>
 #include <utility>
@@ -76,6 +79,16 @@ public:
   virtual bool lock_zone(const ElementType& e, const C3t3& c3t3) const = 0;
   virtual bool execute_operation(const ElementType& e, C3t3& c3t3) = 0;
   virtual std::string operation_name() const = 0;
+
+  // The vertices whose incident-cell 1-rings lock_zone() locks. Used by
+  // apply_unordered_processing for interior/boundary lock elision: an element all of
+  // whose locked vertices are bucket-interior (never shared with another
+  // concurrently-processed bucket) can run lock-free. Default: empty -> the element
+  // is conservatively treated as BOUNDARY (always locked). Flip and smooth override.
+  using Vertex_handle = typename Triangulation::Vertex_handle;
+  virtual void locked_vertices(const ElementType& e,
+                               boost::container::small_vector<Vertex_handle, 2>& out) const
+  { (void)e; (void)out; }
 };
 
 // Base class for operation execution strategies
@@ -350,6 +363,7 @@ private:
 #ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
     std::atomic<size_t> num_successful_locks = 0;
     std::atomic<size_t> num_failed_locks = 0;
+    std::atomic<size_t> num_elided_locks = 0;
 #endif
 
     (void)bb; // partition is data-driven (kd-tree over element points), not bbox-grid
@@ -422,28 +436,113 @@ private:
       };
     split_range(0, eps.size());
 
-    // Process buckets concurrently; each bucket is sequential on its worker.
+    // --- interior/boundary classification for lock elision (topological) ---
+    // Tag each element-endpoint vertex with its bucket id (MIXED if >=2 buckets own
+    // it); then flag every vertex incident to a cell whose tagged vertices span >=2
+    // buckets ("boundary-touching"). An element is INTERIOR iff none of its locked
+    // vertices is boundary-touching => its whole 1-ring lock zone is single-bucket, so
+    // no other concurrently-processed bucket can touch it and it may run lock-free.
+    // flip/smooth create/destroy no vertices, so this classification stays valid for
+    // the whole phase. Empty locked_vertices() => the element falls through to the
+    // locked path (the safe default).
+    using Vh = typename C3t3::Triangulation::Vertex_handle;
+    const std::size_t MIXED_BUCKET = static_cast<std::size_t>(-1);
+    boost::concurrent_flat_map<Vh, std::size_t, boost::hash<Vh>> vertex_bucket;
+    vertex_bucket.reserve(eps.size() * 2);
+
+    // Pass 1: scatter element-endpoint vertex -> bucket id (MIXED on conflict).
     tbb::parallel_for(tbb::blocked_range<std::size_t>(0, buckets.size()),
       [&](const tbb::blocked_range<std::size_t>& r)
       {
+        boost::container::small_vector<Vh, 2> lv;
+        for(std::size_t bi = r.begin(); bi != r.end(); ++bi)
+          for(std::size_t i = buckets[bi].first; i < buckets[bi].second; ++i)
+          {
+            lv.clear();
+            op.locked_vertices(eps[i].e, lv);
+            for(const Vh& v : lv)
+              vertex_bucket.insert_or_visit(std::make_pair(v, bi),
+                [bi, MIXED_BUCKET](std::pair<const Vh, std::size_t>& kv)
+                { if(kv.second != bi) kv.second = MIXED_BUCKET; });
+          }
+      });
+
+    // Build the finite-cell list once (mesh is read-only during this preprocessing).
+    std::vector<typename C3t3::Triangulation::Cell_handle> all_cells;
+    {
+      const auto& tr_ro = c3t3.triangulation();
+      all_cells.reserve(tr_ro.number_of_finite_cells() + 64);
+      for(auto cit = tr_ro.finite_cells_begin(); cit != tr_ro.finite_cells_end(); ++cit)
+        all_cells.push_back(cit);
+    }
+
+    // Pass 2: a cell whose tagged vertices span >=2 buckets (any MIXED, or two
+    // different single-bucket tags) is shared; flag all 4 of its vertices
+    // boundary-touching. Untagged vertices are ignored (own no element -> no lock).
+    boost::concurrent_flat_map<Vh, char, boost::hash<Vh>> boundary_vertex;
+    boundary_vertex.reserve(eps.size());
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, all_cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        for(std::size_t ci = r.begin(); ci != r.end(); ++ci)
+        {
+          const auto c = all_cells[ci];
+          std::size_t first = 0; bool have = false, shared = false;
+          for(int k = 0; k < 4; ++k)
+          {
+            std::size_t b = 0;
+            const bool tagged = vertex_bucket.cvisit(c->vertex(k),
+              [&b](const std::pair<const Vh, std::size_t>& kv){ b = kv.second; }) > 0;
+            if(!tagged) continue;
+            if(b == MIXED_BUCKET || (have && b != first)) { shared = true; break; }
+            first = b; have = true;
+          }
+          if(shared)
+            for(int k = 0; k < 4; ++k)
+              boundary_vertex.insert_or_assign(c->vertex(k), char(1));
+        }
+      });
+
+    // Pass 3: process buckets concurrently; each bucket sequential on its worker.
+    // INTERIOR elements skip lock_zone (lock-free); BOUNDARY elements lock as before.
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, buckets.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        boost::container::small_vector<Vh, 2> lv;
         for(std::size_t bi = r.begin(); bi != r.end(); ++bi)
         {
           for(std::size_t i = buckets[bi].first; i < buckets[bi].second; ++i)
           {
             const ElementType& element = eps[i].e;
-            while(!op.lock_zone(element, c3t3))
+            lv.clear();
+            op.locked_vertices(element, lv);
+            bool interior = !lv.empty();
+            for(const Vh& v : lv)
+              if(boundary_vertex.contains(v)) { interior = false; break; }
+
+            if(interior)
             {
-              c3t3.triangulation().unlock_all_elements();
-              std::this_thread::yield();
+              op.execute_operation(element, c3t3);
 #ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
-              num_failed_locks++;
+              num_elided_locks++;
 #endif
             }
-            op.execute_operation(element, c3t3);
+            else
+            {
+              while(!op.lock_zone(element, c3t3))
+              {
+                c3t3.triangulation().unlock_all_elements();
+                std::this_thread::yield();
 #ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
-            num_successful_locks++;
+                num_failed_locks++;
 #endif
-            c3t3.triangulation().unlock_all_elements();
+              }
+              op.execute_operation(element, c3t3);
+#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
+              num_successful_locks++;
+#endif
+              c3t3.triangulation().unlock_all_elements();
+            }
           }
         }
       });
@@ -458,19 +557,13 @@ private:
       }
       std::ofstream ofs(csv_path, std::ios::app);
       if(need_header) {
-        ofs << "operation,num_successful_locks,num_failed_locks,lock_success_rate(%)" << std::endl;
+        ofs << "operation,num_successful_locks,num_failed_locks,lock_success_rate(%),num_elided_locks" << std::endl;
       }
-      //      size_t operation_exec_counter = (op.operation_name() == std::string("Edge Split")) ?
-      //      g_edge_split_exec_counter : 0; const size_t attempts = static_cast<size_t>(num_successful_locks +
-      //      num_failed_locks); const double lock_success_rate = (attempts == 0) ? 0.0 : 100.0 *
-      //      static_cast<double>(num_successful_locks) / static_cast<double>(attempts); ofs << op.operation_name() <<
-      //      "," << num_successful_locks << "," << num_failed_locks << "," << lock_success_rate << "," <<
-      //      operation_exec_counter << std::endl;
       const size_t attempts = static_cast<size_t>(num_successful_locks + num_failed_locks);
       const double lock_success_rate =
           (attempts == 0) ? 0.0 : 100.0 * static_cast<double>(num_successful_locks) / static_cast<double>(attempts);
       ofs << op.operation_name() << "," << num_successful_locks << "," << num_failed_locks << "," << lock_success_rate
-          << std::endl;
+          << "," << num_elided_locks << std::endl;
     }
 #endif
 #endif // concurrent

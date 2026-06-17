@@ -754,6 +754,11 @@ public:
     return false; // InternalVertexSmooth can use unordered parallel processing
   }
 
+  void locked_vertices(const ElementType& v,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override {
+    out = { v };
+  }
+
   std::string operation_name() const override { return "Vertex Smooth (Internal Vertices)"; }
 };
 
@@ -1063,6 +1068,11 @@ public:
     return false; // SurfaceVertexSmooth can use unordered parallel processing
   }
 
+  void locked_vertices(const ElementType& v,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override {
+    out = { v };
+  }
+
   std::string operation_name() const override { return "Vertex Smooth (Surface Vertices)"; }
 };
 
@@ -1162,6 +1172,11 @@ public:
 
   bool requires_ordered_processing() const override {
     return false; // ComplexEdgeVertexSmooth can use unordered parallel processing
+  }
+
+  void locked_vertices(const ElementType& v,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override {
+    out = { v };
   }
 
   std::string operation_name() const override { return "Vertex Smooth (Complex Edge Vertices)"; }
