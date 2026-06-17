@@ -131,17 +131,17 @@ public:
       eval(e, short_edges_with_length);
 #endif
 
-    // Sort ascending: shortest first. Deterministic vertex-timestamp tie-break so
-    // the parallel-collected order is reproducible (sequential path used insertion
-    // order for equal lengths).
-    auto comp = [](const std::pair<Edge, FT>& a, const std::pair<Edge, FT>& b) {
-      if(a.second != b.second) return a.second < b.second;
-      const auto pa = make_vertex_pair(a.first);
-      const auto pb = make_vertex_pair(b.first);
-      if(pa.first != pb.first) return pa.first < pb.first;
-      return pa.second < pb.second;
+    // Sort ascending: shortest first. stable_sort keeps equal-length edges in their
+    // collection order. Sequential collection is finite_edges() order (so this matches
+    // the gsoc2025 baseline exactly); parallel collection order is run-dependent, which
+    // only changes the tie-break among equal-length collapses -- quality-equivalent.
+    // We deliberately do NOT impose a reproducible tie-break in parallel: parallel
+    // execution is non-deterministic anyway (bucketed, lock-retry), so it would only
+    // add cost (length+timestamp comparisons) for no real reproducibility gain.
+    auto length_comp = [](const std::pair<Edge, FT>& a, const std::pair<Edge, FT>& b) {
+      return a.second < b.second;
     };
-    std::sort(short_edges_with_length.begin(), short_edges_with_length.end(), comp);
+    std::stable_sort(short_edges_with_length.begin(), short_edges_with_length.end(), length_comp);
 
     std::vector<ElementType> short_edges;
     short_edges.reserve(short_edges_with_length.size());
