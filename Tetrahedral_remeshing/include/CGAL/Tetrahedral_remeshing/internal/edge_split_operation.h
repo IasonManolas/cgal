@@ -95,37 +95,27 @@ public:
     Long_edges_with_lengths long_edges_with_lengths;
     const Tr& tr = c3t3.triangulation();
 
-    for(Edge e : tr.finite_edges()) {
+    auto eval = [&](const Edge& e, Long_edges_with_lengths& out) {
       auto [splittable, boundary] = can_be_split(e, c3t3, m_protect_boundaries, m_cell_selector);
       if(!splittable)
-        continue;
-
+        return;
       const std::optional<FT> sqlen = is_too_long(e, boundary, m_sizing, c3t3, m_cell_selector);
-      if(sqlen != std::nullopt) {
-        auto edge_pair = make_vertex_pair(e);
-        long_edges_with_lengths.push_back(make_pair(*sqlen, edge_pair));
-      }
-    }
-
-    // Custom comparator to match bimap's tie-breaking behavior
-    // Bimap: multiset_of<FT, std::greater<FT>> preserves insertion order for equal keys
-    // We use stable_sort with simple length comparison to achieve the same behavior
-    auto bimap_comparator = [](const std::pair<FT, Edge_vv>& a, const std::pair<FT, Edge_vv>& b) {
-      // Only compare by length - stable_sort will preserve insertion order for equal lengths
-      return a.first > b.first; // std::greater<FT> behavior (descending order)
+      if(sqlen != std::nullopt)
+        out.push_back(std::make_pair(*sqlen, make_vertex_pair(e)));
     };
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    long_edges_with_lengths = parallel_collect_finite_edges<std::pair<FT, Edge_vv>>(tr, eval);
+#else
+    for(const Edge& e : tr.finite_edges())
+      eval(e, long_edges_with_lengths);
+#endif
+
+    auto bimap_comparator = [](const std::pair<FT, Edge_vv>& a, const std::pair<FT, Edge_vv>& b) {
+      return a.first > b.first;
+    };
     std::stable_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(), bimap_comparator);
     return long_edges_with_lengths;
-
-    //// Extract just the edges (without lengths) into long_edges
-    // std::vector<std::pair<typename C3t3::Vertex_handle, typename C3t3::Vertex_handle>> long_edges;
-    // long_edges.reserve(long_edges_with_lengths.size());
-    // for(const auto& length_edge_pair : long_edges_with_lengths) {
-    //   long_edges.push_back(length_edge_pair.second);
-    // }
-
-    // return long_edges;
   }
   ElementSource get_element_source(const C3t3& c3t3) const override {
     // Collect long edges as vertex pairs
