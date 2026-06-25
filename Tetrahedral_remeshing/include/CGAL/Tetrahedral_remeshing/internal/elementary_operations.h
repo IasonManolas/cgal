@@ -264,61 +264,80 @@ private:
     std::atomic<size_t> num_failed_locks = 0;
 #endif
 
-    const double min_sq_dim = (std::min)(CGAL::square(bb.xmax() - bb.xmin()),
-                                (std::min)(CGAL::square(bb.ymax() - bb.ymin()),
-                                           CGAL::square(bb.zmax() - bb.zmin())));
-    const float grid_cell_size = 0.5f * CGAL::approximate_sqrt(min_sq_dim);
-    const float inv_cell_size = 1.f / grid_cell_size;
+    (void)bb; // data-driven kd partition over element points, not a bbox grid
 
-    struct Grid_cell_index
-    {
-      int i, j, k;
-      bool operator==(const Grid_cell_index& other) const
-      { return i == other.i && j == other.j && k == other.k; }
-    };
-
-    struct Grid_cell_index_hasher
-    {
-      std::size_t operator()(const Grid_cell_index& ci) const
+    // Equal-count, spatially-compact kd partition (same scheme as apply_unordered_processing)
+    // replacing the coarse uniform grid whose lopsided buckets caused tail load imbalance
+    // (on armadillo one cell held >50% of candidates while 7 threads idled).
+    // Elements arrive globally length-sorted; kd nth_element scrambles that order, so each
+    // element carries its original index and each bucket is sorted by it before processing
+    // to restore the greedy length order within the bucket (cheap index sort, O(B log B)).
+    struct EP { double c[3]; std::size_t idx; };
+    std::vector<EP> eps(elements.size());
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, elements.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
       {
-        return ((std::hash<int>()(ci.i) ^ (std::hash<int>()(ci.j) << 1)) >> 1)
-               ^ (std::hash<int>()(ci.k) << 1);
-      }
-    };
-
-    auto compute_cell_index
-      = [&](const typename C3t3::Triangulation::Geom_traits::Point_3& p) -> Grid_cell_index
+        for(std::size_t i = r.begin(); i != r.end(); ++i)
         {
-          return {static_cast<int>(std::floor(p.x() * inv_cell_size)),
-                  static_cast<int>(std::floor(p.y() * inv_cell_size)),
-                  static_cast<int>(std::floor(p.z() * inv_cell_size))};
-        };
+          const auto p = op.point_on_element(elements[i]);
+          eps[i] = EP{{CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z())}, i};
+        }
+      });
 
-    std::unordered_map<Grid_cell_index, std::vector<ElementType>, Grid_cell_index_hasher> spatialBuckets;
-    for(const auto& e : elements)
-    {
-      Grid_cell_index idx = compute_cell_index(op.point_on_element(e));
-      spatialBuckets[idx].push_back(e);
-    }
+    const std::size_t nthreads =
+      static_cast<std::size_t>((std::max)(1, tbb::this_task_arena::max_concurrency()));
+    const std::size_t target =
+      (std::max)(std::size_t(1), eps.size() / (std::size_t(LB_BUCKETS_PER_THREAD) * nthreads));
 
-    tbb::parallel_for_each(spatialBuckets.begin(), spatialBuckets.end(),
-      [&](const std::pair<const Grid_cell_index, std::vector<ElementType>>& bucket)
+    constexpr std::size_t PAR_SPLIT_THRESHOLD = 8192;
+    tbb::concurrent_vector<std::pair<std::size_t, std::size_t>> buckets;
+    std::function<void(std::size_t, std::size_t)> split_range =
+      [&](std::size_t lo, std::size_t hi)
       {
-        for(const auto& element : bucket.second)
+        if(hi - lo <= target) { if(hi > lo) buckets.emplace_back(lo, hi); return; }
+        double mn[3] = {eps[lo].c[0], eps[lo].c[1], eps[lo].c[2]};
+        double mx[3] = {eps[lo].c[0], eps[lo].c[1], eps[lo].c[2]};
+        for(std::size_t i = lo + 1; i < hi; ++i)
+          for(int a = 0; a < 3; ++a)
+          { mn[a] = (std::min)(mn[a], eps[i].c[a]); mx[a] = (std::max)(mx[a], eps[i].c[a]); }
+        int axis = 0; double best = mx[0] - mn[0];
+        for(int a = 1; a < 3; ++a) if(mx[a] - mn[a] > best) { best = mx[a] - mn[a]; axis = a; }
+        const std::size_t mid = lo + (hi - lo) / 2;
+        std::nth_element(eps.begin() + lo, eps.begin() + mid, eps.begin() + hi,
+                         [axis](const EP& x, const EP& y) { return x.c[axis] < y.c[axis]; });
+        if(hi - lo > PAR_SPLIT_THRESHOLD)
+        { tbb::task_group tg; tg.run([&, lo, mid] { split_range(lo, mid); }); split_range(mid, hi); tg.wait(); }
+        else { split_range(lo, mid); split_range(mid, hi); }
+      };
+    split_range(0, eps.size());
+
+    // Process buckets concurrently; within each bucket sort by original index to restore
+    // length order, then apply the standard yield-spin lock protocol sequentially.
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, buckets.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        for(std::size_t bi = r.begin(); bi != r.end(); ++bi)
         {
-          while(!op.lock_zone(element, c3t3))
+          const auto [lo, hi] = buckets[bi];
+          std::sort(eps.begin() + lo, eps.begin() + hi,
+                    [](const EP& a, const EP& b) { return a.idx < b.idx; });
+          for(std::size_t i = lo; i < hi; ++i)
           {
+            const ElementType& element = elements[eps[i].idx];
+            while(!op.lock_zone(element, c3t3))
+            {
+              c3t3.triangulation().unlock_all_elements();
+              std::this_thread::yield();
+#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
+              num_failed_locks++;
+#endif
+            }
+            op.execute_operation(element, c3t3);
+#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
+            num_successful_locks++;
+#endif
             c3t3.triangulation().unlock_all_elements();
-            std::this_thread::yield();
-#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
-            num_failed_locks++;
-#endif
           }
-          op.execute_operation(element, c3t3);
-#ifdef CGAL_TETRAHEDRAL_REMESHING_WRITE_LOCK_STATS
-          num_successful_locks++;
-#endif
-          c3t3.triangulation().unlock_all_elements();
         }
       });
 
@@ -337,7 +356,7 @@ private:
       const double lock_success_rate =
           (attempts == 0) ? 0.0 : 100.0 * static_cast<double>(num_successful_locks) / static_cast<double>(attempts);
       ofs << op.operation_name() << "," << num_successful_locks << "," << num_failed_locks
-          << "," << lock_success_rate << std::endl;
+          << "," << lock_success_rate << "," << num_elided_locks << std::endl;
     }
 #endif
 #endif // concurrent
