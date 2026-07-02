@@ -26,6 +26,10 @@
 #include <sstream>
 #include <thread>
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <execution>
+#endif
+
 namespace CGAL {
 namespace Tetrahedral_remeshing {
 namespace internal {
@@ -111,10 +115,19 @@ public:
       eval(e, long_edges_with_lengths);
 #endif
 
+    // Sort descending: longest first. stable_sort keeps equal-length edges in their
+    // collection order (see the analogous comment in edge_collapse_operation.h's
+    // get_short_edges for why this matters and why no extra tie-break is imposed).
+    // The par overload is still required by the standard to be stable -- it only
+    // parallelizes the sort, the ordering guarantee is unchanged.
     auto bimap_comparator = [](const std::pair<FT, Edge_vv>& a, const std::pair<FT, Edge_vv>& b) {
       return a.first > b.first;
     };
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    std::stable_sort(std::execution::par, long_edges_with_lengths.begin(), long_edges_with_lengths.end(), bimap_comparator);
+#else
     std::stable_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(), bimap_comparator);
+#endif
     return long_edges_with_lengths;
   }
   ElementSource get_element_source(const C3t3& c3t3) const override {
