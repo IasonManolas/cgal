@@ -37,6 +37,10 @@
 #include <boost/unordered/concurrent_flat_map.hpp>
 #endif
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <execution>
+#endif
+
 // #define EDGE_COLLAPSE_DEBUG
 
 namespace CGAL {
@@ -138,10 +142,17 @@ public:
     // We deliberately do NOT impose a reproducible tie-break in parallel: parallel
     // execution is non-deterministic anyway (bucketed, lock-retry), so it would only
     // add cost (length+timestamp comparisons) for no real reproducibility gain.
+    // The sort itself is stable either way (std::stable_sort, incl. the par overload,
+    // is required by the standard to preserve the relative order of equal elements) --
+    // running it in parallel only speeds up the sort, it does not change this guarantee.
     auto length_comp = [](const std::pair<Edge, FT>& a, const std::pair<Edge, FT>& b) {
       return a.second < b.second;
     };
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    std::stable_sort(std::execution::par, short_edges_with_length.begin(), short_edges_with_length.end(), length_comp);
+#else
     std::stable_sort(short_edges_with_length.begin(), short_edges_with_length.end(), length_comp);
+#endif
 
     std::vector<ElementType> short_edges;
     short_edges.reserve(short_edges_with_length.size());
