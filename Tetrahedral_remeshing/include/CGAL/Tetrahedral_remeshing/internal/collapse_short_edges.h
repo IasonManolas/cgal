@@ -1081,6 +1081,87 @@ bool is_cells_set_manifold(const C3t3&,
   return true;
 }
 
+/**
+* Does the collapse leave the dihedral angles of the star acceptable?
+*
+* `CollapseTriangulation` answers this only after building a local copy of the
+* star and running the collapse on it, although the answer depends on the
+* geometry alone : the cells that survive are the star minus the ring of the
+* edge, with both extremities moved to the collapse point. Evaluating it here
+* leaves that copy unbuilt whenever it would have been rejected - which is what
+* happens to nearly half of the candidates that reach it.
+*
+* The comparison it performs is reproduced exactly, including the way the
+* midpoint is computed, so that the two agree down to the last bit.
+*/
+template<typename C3t3, typename CellRange>
+bool collapse_keeps_angles_acceptable(const typename C3t3::Edge& edge,
+                                      const C3t3& c3t3,
+                                      const Collapse_type collapse_type,
+                                      const CellRange& star)
+{
+  using Tr = typename C3t3::Triangulation;
+  using Cell_handle = typename Tr::Cell_handle;
+  using Vertex_handle = typename Tr::Vertex_handle;
+  using Point_3 = typename Tr::Point;
+  using Vector_3 = typename Tr::Geom_traits::Vector_3;
+  using Subdomain_index = typename C3t3::Subdomain_index;
+
+  const Dihedral_angle_cosine acceptable_max_cos{0.995}; // 0.995 cos <=> 5.7 degrees
+
+  const Tr& tr = c3t3.triangulation();
+  const Vertex_handle v0 = edge.first->vertex(edge.second);
+  const Vertex_handle v1 = edge.first->vertex(edge.third);
+
+  // same expression as CollapseTriangulation::collapse()
+  Vector_3 new_pos = vec(v0->point());
+  if (collapse_type == TO_MIDPOINT)
+    new_pos = new_pos + 0.5 * Vector_3(point(v0->point()), point(v1->point()));
+  else if (collapse_type == TO_V1)
+    new_pos = vec(point(v1->point()));
+  const auto p_new = point(Point_3(new_pos.x(), new_pos.y(), new_pos.z()));
+
+  boost::container::flat_set<Cell_handle,
+    std::less<Cell_handle>,
+    boost::container::small_vector<Cell_handle, 32> > ring;
+
+  typename Tr::Cell_circulator circ = tr.incident_cells(edge);
+  const typename Tr::Cell_circulator done = circ;
+  do { ring.insert(circ); } while (++circ != done);
+
+  // worst angle before : the ring, plus the star of the vertex that disappears
+  Dihedral_angle_cosine curr_max_cos = max_cos_dihedral_angle_in_range(tr, ring, false);
+
+  boost::container::small_vector<Cell_handle, 64> star_v1;
+  tr.finite_incident_cells(v1, std::back_inserter(star_v1));
+  const Dihedral_angle_cosine cos_v1
+    = max_cos_dihedral_angle_in_range(tr, star_v1, false);
+  if (curr_max_cos < cos_v1)
+    curr_max_cos = cos_v1;
+
+  // worst angle after : the cells of the star that the collapse keeps
+  const auto& gt = tr.geom_traits();
+  for (const Cell_handle c : star)
+  {
+    if (ring.find(c) != ring.end())
+      continue;
+    if (tr.is_infinite(c) || c->subdomain_index() == Subdomain_index())
+      continue;
+
+    auto p_at = [&](const int i)
+    {
+      const Vertex_handle v = c->vertex(i);
+      return (v == v0 || v == v1) ? p_new : point(v->point());
+    };
+    const Dihedral_angle_cosine after
+      = max_cos_dihedral_angle(p_at(0), p_at(1), p_at(2), p_at(3), gt);
+
+    if (curr_max_cos < after && acceptable_max_cos < after)
+      return false;
+  }
+  return true;
+}
+
 template<typename C3t3,
          typename Sizing,
          typename CellSelector,
@@ -1176,6 +1257,9 @@ typename C3t3::Vertex_handle collapse_edge(const typename C3t3::Edge& edge,
       std::inserter(cells_to_insert, cells_to_insert.end()));
 
     if(!is_cells_set_manifold(c3t3, cells_to_insert))
+      return Vertex_handle();
+
+    if(!collapse_keeps_angles_acceptable(edge, c3t3, collapse_type, cells_to_insert))
       return Vertex_handle();
 
     CollapseTriangulation<C3t3> local_tri(edge, cells_to_insert, collapse_type);
