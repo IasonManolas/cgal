@@ -1236,8 +1236,21 @@ template<typename C3T3>
 bool surface_patches_are_compatible(const typename C3T3::Edge& e,
                                     const C3T3& c3t3)
 {
-  const auto patch_v0 = surface_patch_index(e.first->vertex(e.second), c3t3);
-  const auto patch_v1 = surface_patch_index(e.first->vertex(e.third), c3t3);
+  const auto v0 = e.first->vertex(e.second);
+  const auto v1 = e.first->vertex(e.third);
+
+  // a vertex interior to a subdomain touches no facet of the complex, so
+  // surface_patch_index() would walk its whole star only to find nothing
+  if (v0->in_dimension() == 3 || v1->in_dimension() == 3)
+  {
+    CGAL_expensive_assertion(
+         (v0->in_dimension() != 3 || surface_patch_index(v0, c3t3) == std::nullopt)
+      && (v1->in_dimension() != 3 || surface_patch_index(v1, c3t3) == std::nullopt));
+    return true;
+  }
+
+  const auto patch_v0 = surface_patch_index(v0, c3t3);
+  const auto patch_v1 = surface_patch_index(v1, c3t3);
 
   return patch_v0 == std::nullopt
       || patch_v1 == std::nullopt
