@@ -688,12 +688,19 @@ public:
   Complex_edge_vertex_smooth_operation(std::shared_ptr<typename BaseClass::Context> context)
       : BaseClass(context) {}
 
-  Element_range get_elements(const C3t3& c3t3) const override
+    // no admission test : every scanned element is a candidate, the operation
+  // itself decides whether it applies
+  std::optional<typename Base_operation::Priority_type>
+  predicate(const typename Base_operation::Scan_type&, const C3t3&) const override
+  { return typename Base_operation::Priority_type(0); }
+
+  Element_range elements(const C3t3& c3t3) const override
   {
     perform_global_preprocessing(c3t3);
     return c3t3.triangulation().finite_vertex_handles();
   }
 
+  using Base_operation::execute_operation; // keep the 3-arg overload visible
   bool execute_operation(const Element_type& v, C3t3& c3t3) override
   {
     auto& tr = c3t3.triangulation();
@@ -902,12 +909,19 @@ public:
   Surface_vertex_smooth_operation(std::shared_ptr<typename BaseClass::Context> context)
       : BaseClass(context) {}
 
-  Element_range get_elements(const C3t3& c3t3) const override
+    // no admission test : every scanned element is a candidate, the operation
+  // itself decides whether it applies
+  std::optional<typename Base_operation::Priority_type>
+  predicate(const typename Base_operation::Scan_type&, const C3t3&) const override
+  { return typename Base_operation::Priority_type(0); }
+
+  Element_range elements(const C3t3& c3t3) const override
   {
     perform_global_preprocessing(c3t3);
     return c3t3.triangulation().finite_vertex_handles();
   }
 
+  using Base_operation::execute_operation; // keep the 3-arg overload visible
   bool execute_operation(const Element_type& v, C3t3& c3t3) override
   {
     auto& tr = c3t3.triangulation();
@@ -1116,12 +1130,19 @@ public:
     }
   }
 
-  Element_range get_elements(const C3t3& c3t3) const override
+    // no admission test : every scanned element is a candidate, the operation
+  // itself decides whether it applies
+  std::optional<typename Base_operation::Priority_type>
+  predicate(const typename Base_operation::Scan_type&, const C3t3&) const override
+  { return typename Base_operation::Priority_type(0); }
+
+  Element_range elements(const C3t3& c3t3) const override
   {
     perform_global_preprocessing(c3t3);
     return c3t3.triangulation().finite_vertex_handles();
   }
 
+  using Base_operation::execute_operation; // keep the 3-arg overload visible
   bool execute_operation(const Element_type& v, C3t3& c3t3) override
   {
     auto& tr = c3t3.triangulation();

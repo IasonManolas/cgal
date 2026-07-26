@@ -1985,7 +1985,13 @@ public:
                             Incident_cells_map& incident_cells)
       : BaseClass(cell_selector, visitor, incident_cells) {}
 
-  Element_range get_elements(const C3t3& c3t3) const override
+    // no admission test : every scanned element is a candidate, the operation
+  // itself decides whether it applies
+  std::optional<typename Base_operation::Priority_type>
+  predicate(const typename Base_operation::Scan_type&, const C3t3&) const override
+  { return typename Base_operation::Priority_type(0); }
+
+  Element_range elements(const C3t3& c3t3) const override
   {
     for (auto c : c3t3.cells_in_complex())
       c->reset_cache_validity();//we will use sliver_value
@@ -1996,6 +2002,7 @@ public:
     return inside_edges;
   }
 
+  using Base_operation::execute_operation; // keep the 3-arg overload visible
   bool execute_operation(const Element_type& vp, C3t3& c3t3) override
   {
     Cells_vector& o_inc_vh = inc_cells[vp.first];
@@ -2053,7 +2060,13 @@ public:
   Boundary_edge_flip_operation(CellSelector& cell_selector, Visitor& visitor, Incident_cells_map& incident_cells)
       : BaseClass(cell_selector, visitor, incident_cells) {}
 
-  Element_range get_elements(const C3t3& c3t3) const override
+    // no admission test : every scanned element is a candidate, the operation
+  // itself decides whether it applies
+  std::optional<typename Base_operation::Priority_type>
+  predicate(const typename Base_operation::Scan_type&, const C3t3&) const override
+  { return typename Base_operation::Priority_type(0); }
+
+  Element_range elements(const C3t3& c3t3) const override
   {
     std::vector<Edge> boundary_edges;
     boost::unordered_map<Vertex_handle, std::unordered_set<Subdomain_index>> vertices_subdomain_indices;
@@ -2078,6 +2091,7 @@ public:
     return candidate_edges_for_flip;
   }
 
+  using Base_operation::execute_operation; // keep the 3-arg overload visible
   bool execute_operation(const Element_type& vp, C3t3& c3t3) override
   {
     const Vertex_handle vh0 = vp.first;

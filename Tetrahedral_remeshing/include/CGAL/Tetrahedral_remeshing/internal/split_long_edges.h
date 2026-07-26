@@ -339,11 +339,11 @@ template<typename C3t3,
          typename CellSelector,
          typename Visitor>
 class Edge_split_operation
-    : public Elementary_operation<C3t3,
-                                 std::pair<typename C3t3::Triangulation::Vertex_handle,
-                                           typename C3t3::Triangulation::Vertex_handle>,
-                                 std::vector<std::pair<typename C3t3::Triangulation::Vertex_handle,
-                                                       typename C3t3::Triangulation::Vertex_handle>>>
+    : public Elementary_operation<
+          C3t3,
+          std::pair<typename C3t3::Triangulation::Vertex_handle,
+                    typename C3t3::Triangulation::Vertex_handle>,
+          decltype(std::declval<const typename C3t3::Triangulation&>().finite_edges())>
 {
 public:
   using Tr = typename C3t3::Triangulation;
@@ -358,11 +358,11 @@ public:
   // cells, so by the time the executor reaches a later candidate its Cell_handle
   // may point at a different cell. Vertices are never removed by a split, so the
   // vertex pair stays valid and is re-resolved to the current edge via is_edge().
-  using Long_edges = std::vector<Edge_vv>;
-  using Base_operation = Elementary_operation<C3t3, Edge_vv, Long_edges>;
+  using Base_operation = Elementary_operation<
+      C3t3, Edge_vv, decltype(std::declval<const Tr&>().finite_edges())>;
   using Element_type = typename Base_operation::Element_type;
   static_assert(std::is_same_v<Element_type, Edge_vv>, "Element_type must be Edge_vv");
-  using ElementSource = typename Base_operation::Element_range;
+  using Element_range = typename Base_operation::Element_range;
 
 private:
   const SizingFunction& m_sizing;
@@ -386,54 +386,27 @@ public:
       , m_protect_boundaries(protect_boundaries)
       , m_visitor(visitor) {}
 
-  ElementSource get_elements(const C3t3& c3t3) const override
+  Element_range elements(const C3t3& c3t3) const override
   {
-    struct Long_edge_with_length
-    {
-      Edge edge;
-      FT sqlength;
-    };
-    std::vector<Long_edge_with_length> long_edges_with_lengths;
-    const Tr& tr = c3t3.triangulation();
-
-    for (Edge e : tr.finite_edges())
-    {
-      auto [splittable, boundary] = can_be_split(e, c3t3, m_protect_boundaries, m_cell_selector);
-      if (!splittable)
-        continue;
-
-      const std::optional<FT> sqlen = is_too_long(e, boundary, m_sizing, c3t3, m_cell_selector);
-      if (sqlen != std::nullopt)
-        long_edges_with_lengths.push_back(Long_edge_with_length{e, sqlen.value()});
-    }
-
-    // longest first; stable to match the original bimap's ordering
-    std::stable_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(),
-                     [](const Long_edge_with_length& a, const Long_edge_with_length& b) {
-                       return a.sqlength > b.sqlength;
-                     });
-
-#ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
-    {
-      std::ofstream ofs("long_edges.polylines.txt");
-      for (const auto& le : long_edges_with_lengths)
-        ofs << "2 " << point(le.edge.first->point())
-            << " " << point(le.edge.second->point()) << std::endl;
-    }
-    m_can_be_split_ofs.open("can_be_split_edges.polylines.txt");
-    m_split_failed_ofs.open("split_failed.polylines.txt");
-    m_midpoints_ofs.open("midpoints.off");
-    m_midpoints_ofs << "OFF" << std::endl;
-    m_midpoints_ofs << long_edges_with_lengths.size() << " 0 0" << std::endl;
-#endif
-
-    Long_edges long_edges;
-    long_edges.reserve(long_edges_with_lengths.size());
-    for(const auto& ef : long_edges_with_lengths)
-      long_edges.push_back(make_vertex_pair(ef.edge));
-    return long_edges;
+    return c3t3.triangulation().finite_edges();
   }
 
+  std::optional<FT> predicate(const Edge& e, const C3t3& c3t3) const override
+  {
+    auto [splittable, boundary]
+      = can_be_split(e, c3t3, m_protect_boundaries, m_cell_selector);
+    if (!splittable)
+      return std::nullopt;
+
+    return is_too_long(e, boundary, m_sizing, c3t3, m_cell_selector);
+  }
+
+  Edge_vv to_element(const Edge& e) const override { return make_vertex_pair(e); }
+
+  bool requires_ordered_processing() const override { return true; }
+  bool process_smallest_first() const override { return false; } // longest first
+
+  using Base_operation::execute_operation; // keep the 3-arg overload visible
   bool execute_operation(const Element_type& element, C3t3& c3t3) override
   {
     Tr& tr = c3t3.triangulation();
