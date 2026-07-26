@@ -1206,30 +1206,41 @@ auto can_be_collapsed(const typename C3T3::Edge& e,
   {
     bool can_be_collapsed;
     bool on_boundary;
+    /// whether `surface_patches_are_compatible()` still has to be checked
+    bool check_surface_patches;
   };
 
   const bool in_cx = c3t3.is_in_complex(e);
   if(in_cx && protect_boundaries)
-    return Collapsible{false, true /*boundary*/};
+    return Collapsible{false, true /*boundary*/, false};
 
   const bool boundary = is_boundary(c3t3, e, cell_selector);
   if(boundary && protect_boundaries)
-    return Collapsible{false, boundary};
+    return Collapsible{false, boundary, false};
 
   if(!is_selected(e, c3t3.triangulation(), cell_selector))
-    return Collapsible{false, boundary};
-
-  if(!boundary && !in_cx)
-  {
-    auto patch_v0 = surface_patch_index(e.first->vertex(e.second), c3t3);
-    auto patch_v1 = surface_patch_index(e.first->vertex(e.third), c3t3);
-
-    if(patch_v0 != std::nullopt && patch_v1 != std::nullopt && patch_v0 != patch_v1)
-      return Collapsible{false, boundary};
-  }
+    return Collapsible{false, boundary, false};
 
 //   if(!is_internal(e, c3t3, cell_selector))
-  return Collapsible {true, boundary};
+  return Collapsible {true, boundary, !boundary && !in_cx};
+}
+
+/**
+* Two extremities lying on different surface patches must not be merged.
+*
+* Kept apart from `can_be_collapsed()` because it walks both vertex stars :
+* it is worth evaluating only once an edge has passed the cheaper tests.
+*/
+template<typename C3T3>
+bool surface_patches_are_compatible(const typename C3T3::Edge& e,
+                                    const C3T3& c3t3)
+{
+  const auto patch_v0 = surface_patch_index(e.first->vertex(e.second), c3t3);
+  const auto patch_v1 = surface_patch_index(e.first->vertex(e.third), c3t3);
+
+  return patch_v0 == std::nullopt
+      || patch_v1 == std::nullopt
+      || patch_v0 == patch_v1;
 }
 
 template<typename C3t3,
@@ -1290,12 +1301,22 @@ public:
 
   std::optional<FT> predicate(const Edge& e, const C3t3& c3t3) const override
   {
-    auto [collapsible, boundary]
+    auto [collapsible, boundary, check_surface_patches]
       = can_be_collapsed(e, c3t3, m_protect_boundaries, m_cell_selector);
     if (!collapsible)
       return std::nullopt;
 
-    return is_too_short(e, boundary, m_sizing, c3t3, m_cell_selector);
+    // the length test discards most edges, and is cheaper than walking the
+    // two vertex stars that the surface patch test needs
+    const auto too_short
+      = is_too_short(e, boundary, m_sizing, c3t3, m_cell_selector);
+    if (too_short == std::nullopt)
+      return std::nullopt;
+
+    if (check_surface_patches && !surface_patches_are_compatible(e, c3t3))
+      return std::nullopt;
+
+    return too_short;
   }
 
   Vertex_handle execute_operation(const Element_type& edge, C3t3& c3t3) override
