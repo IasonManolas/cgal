@@ -1667,23 +1667,28 @@ squared_lower_size_bound(const typename C3t3::Edge& e,
   using FT = typename Tr::Geom_traits::FT;
   using Vertex_handle = typename Tr::Vertex_handle;
 
-  const Vertex_handle u = e.first->vertex(e.second);
-  const Vertex_handle v = e.first->vertex(e.third);
-
-  const FT size_at_u = sizing(point(u->point()), u->in_dimension(), u->index());
-  const FT size_at_v = sizing(point(v->point()), v->in_dimension(), v->index());
-
-  // if e is on the boundary AND sizing at the boundary is set to 0,
-  // we take the minimum size of the incident cells
-  if ( (size_at_u == 0 || size_at_v == 0) && is_boundary(c3t3, e, cell_selector))
+  // `is_boundary()` is tested first : `size_at_u` and `size_at_v` are only
+  // needed for boundary edges, and each of them costs a sizing field query
+  if (is_boundary(c3t3, e, cell_selector))
   {
+    const Vertex_handle u = e.first->vertex(e.second);
+    const Vertex_handle v = e.first->vertex(e.third);
+
+    const FT size_at_u = sizing(point(u->point()), u->in_dimension(), u->index());
+    const FT size_at_v = sizing(point(v->point()), v->in_dimension(), v->index());
+
+    // if sizing at the boundary is set to 0,
+    // we take the minimum size of the incident cells
+    if (size_at_u == 0 || size_at_v == 0)
+    {
 #ifdef CGAL_MIN_SIZING_IN_IS_TOO_SHORT
-    FT size_at_uv = min_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
+      FT size_at_uv = min_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
 #else
-    FT size_at_uv = average_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
+      FT size_at_uv = average_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
 #endif
-    CGAL_assertion(size_at_uv > 0);
-    return CGAL::square(FT(4) / FT(5) * size_at_uv);
+      CGAL_assertion(size_at_uv > 0);
+      return CGAL::square(FT(4) / FT(5) * size_at_uv);
+    }
   }
 
   const auto mwi = midpoint_with_info(e, boundary_edge, c3t3);
