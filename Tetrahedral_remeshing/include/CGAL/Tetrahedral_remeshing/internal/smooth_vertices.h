@@ -133,6 +133,8 @@ public:
 #endif
   }
 
+  bool in_flip_smooth_steps() const { return m_flip_smooth_steps; }
+
   void start_flip_smooth_steps(const C3t3& c3t3)
   {
     CGAL_assertion(!m_flip_smooth_steps);

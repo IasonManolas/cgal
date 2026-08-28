@@ -422,6 +422,9 @@ bool build_triangulation_impl(Tr& tr,
 
   bool success = true;
   Incident_cells_map incident_cells_map;
+  // every cell brings its four facets, and each key is a triple of vertex
+  // handles : growing the map means hashing all of them again
+  incident_cells_map.reserve(4 * finite_cells.size());
 
   // id to vertex_handle
   // index 0 is for infinite vertex; 1 to n for points in `points`

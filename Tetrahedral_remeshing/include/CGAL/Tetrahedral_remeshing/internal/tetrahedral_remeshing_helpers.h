@@ -16,6 +16,15 @@
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
 #include <utility>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <vector>
+#include <algorithm>
+#include <tuple>
+#include <cmath>
+#include <limits>
+#include <iostream>
+#include <cstdlib>
+#include <cstdint>
 #include <array>
 #include <iterator>
 #include <unordered_set>
@@ -2098,6 +2107,263 @@ namespace internal
     put(cell_selector, c, selected);
   }
 }
+
+namespace internal {
+
+// ---------------------------------------------------------------------------
+// Z-order (Morton) keys, for giving a work list a spatially coherent
+// processing order.
+//
+// Where a newly created cell or vertex lands in the Compact_container is
+// decided by *when* it is created, not by where it is in space: the container
+// hands out slots in allocation order. So the order in which a phase walks its
+// work list is also the memory layout every later phase has to traverse. A
+// work list sorted on a global scalar (edge length, say) is spatially random,
+// and the mesh it builds is scattered across hundreds of megabytes.
+//
+// Sorting a tie-class of the work list by Morton key instead costs one sort
+// key per element and makes consecutive operations touch nearby memory.
+inline std::uint64_t morton_spread(std::uint64_t v)
+{
+  v &= 0x1fffffull;                       // keep 21 bits
+  v = (v | (v << 32)) & 0x1f00000000ffffull;
+  v = (v | (v << 16)) & 0x1f0000ff0000ffull;
+  v = (v | (v <<  8)) & 0x100f00f00f00f00full;
+  v = (v | (v <<  4)) & 0x10c30c30c30c30c3ull;
+  v = (v | (v <<  2)) & 0x1249249249249249ull;
+  return v;
+}
+
+inline std::uint64_t morton_key(std::uint32_t x, std::uint32_t y, std::uint32_t z)
+{
+  return morton_spread(x) | (morton_spread(y) << 1) | (morton_spread(z) << 2);
+}
+
+// Quantizes a coordinate to 21 bits over [lo, hi].
+inline std::uint32_t morton_quantize(double v, double lo, double inv_span)
+{
+  const double t = (v - lo) * inv_span;
+  const double c = t < 0. ? 0. : (t > 1. ? 1. : t);
+  return static_cast<std::uint32_t>(c * 2097151.0);
+}
+
+// ---------------------------------------------------------------------------
+// Spatial reordering of the triangulation's containers.
+//
+// Compact_container hands out slots in *allocation* order, and nothing in the
+// pipeline ever allocates in spatial order: `read_MEDIT` inserts in file
+// order, split allocates in edge-length order, and collapse/flip recycle
+// whatever the free list happens to hold. The result is that a cell's four
+// neighbours sit at essentially random addresses -- measured on bear f=0.5,
+// only 3% of cell->neighbour pairs are within 4 KB of each other after a run.
+//
+// The cost of that is not small. Feeding the *same* mesh back through the
+// remesher once in its natural container order and once Z-ordered (identical
+// instruction counts, 117.07G vs 117.09G) gives:
+//
+//     order      cycles    L3-miss stalls   L3 load misses   wall 1t   wall 4t
+//     natural   105.08G     22.02G (21.0%)      125.5M        31.57s    13.51s
+//     Z-order    94.72G     15.15G (16.0%)       87.1M        28.25s    11.89s
+//
+// -- 10% of all cycles at one thread, 12% at four, for zero extra work.
+//
+// This rebuilds the TDS with vertices and cells emitted in Morton order, which
+// is what `copy_tds` does except for the iteration order. It is O(n) and runs
+// once, during setup.
+//
+// Returns the old-handle -> new-handle vertex map; callers holding vertex
+// handles (the c3t3's complex edges and corners) must remap through it.
+//
+// `old_holder` receives the pre-sort triangulation. It is an out-parameter
+// rather than a local because the returned map is keyed by the *old* handles:
+// letting the old containers die inside this function would leave every key
+// dangling before the caller has finished remapping through them.
+template<typename Tr, typename VMap>
+bool spatial_sort_triangulation(Tr& tr, VMap& V, Tr& old_holder)
+{
+  using Vertex_handle = typename Tr::Vertex_handle;
+  using Cell_handle   = typename Tr::Cell_handle;
+
+  const int dim = tr.dimension();
+  if (dim != 3 || tr.number_of_vertices() == 0) return false;
+
+  auto cp = tr.geom_traits().construct_point_3_object();
+
+  // ---- collect and key the vertices ------------------------------------
+  std::vector<Vertex_handle> vs;
+  vs.reserve(tr.number_of_vertices() + 1);
+  for (auto v = tr.tds().vertices_begin(); v != tr.tds().vertices_end(); ++v)
+    vs.push_back(v);
+
+  double lo[3] = { (std::numeric_limits<double>::max)(),
+                   (std::numeric_limits<double>::max)(),
+                   (std::numeric_limits<double>::max)() };
+  double hi[3] = { -lo[0], -lo[0], -lo[0] };
+  const std::size_t nv = vs.size();
+  std::vector<std::array<double, 3>> vp(nv);
+  for (std::size_t i = 0; i < nv; ++i)
+  {
+    if (tr.is_infinite(vs[i])) { vp[i] = { 0., 0., 0. }; continue; }
+    const auto p = cp(vs[i]->point());
+    vp[i] = { CGAL::to_double(p.x()), CGAL::to_double(p.y()), CGAL::to_double(p.z()) };
+    for (int k = 0; k < 3; ++k)
+    {
+      lo[k] = (std::min)(lo[k], vp[i][k]);
+      hi[k] = (std::max)(hi[k], vp[i][k]);
+    }
+  }
+  double inv[3];
+  for (int k = 0; k < 3; ++k) inv[k] = (hi[k] > lo[k]) ? 1.0 / (hi[k] - lo[k]) : 0.0;
+
+  auto key_of = [&](const std::array<double, 3>& p) {
+    return morton_key(morton_quantize(p[0], lo[0], inv[0]),
+                      morton_quantize(p[1], lo[1], inv[1]),
+                      morton_quantize(p[2], lo[2], inv[2]));
+  };
+
+  // The infinite vertex has no position; keep it first so its slot is stable.
+  std::vector<std::size_t> vorder(nv);
+  for (std::size_t i = 0; i < nv; ++i) vorder[i] = i;
+  std::vector<std::uint64_t> vkey(nv);
+  for (std::size_t i = 0; i < nv; ++i)
+    vkey[i] = tr.is_infinite(vs[i]) ? 0u : key_of(vp[i]);
+  std::stable_sort(vorder.begin(), vorder.end(),
+                   [&](std::size_t a, std::size_t b) { return vkey[a] < vkey[b]; });
+
+  // ---- collect and key the cells ---------------------------------------
+  std::vector<Cell_handle> cs;
+  cs.reserve(tr.number_of_cells());
+  for (auto c = tr.tds().cells_begin(); c != tr.tds().cells_end(); ++c)
+    cs.push_back(c);
+
+  const std::size_t nc = cs.size();
+  std::vector<std::uint64_t> ckey(nc);
+  std::vector<std::size_t> corder(nc);
+  for (std::size_t i = 0; i < nc; ++i)
+  {
+    corder[i] = i;
+    std::array<double, 3> b = { 0., 0., 0. };
+    int n = 0;
+    for (int j = 0; j < 4; ++j)
+    {
+      const Vertex_handle v = cs[i]->vertex(j);
+      if (v == Vertex_handle() || tr.is_infinite(v)) continue;
+      const auto p = cp(v->point());
+      b[0] += CGAL::to_double(p.x()); b[1] += CGAL::to_double(p.y()); b[2] += CGAL::to_double(p.z());
+      ++n;
+    }
+    if (n == 0) { ckey[i] = 0; continue; }
+    for (int k = 0; k < 3; ++k) b[k] /= n;
+    ckey[i] = key_of(b);
+  }
+  std::stable_sort(corder.begin(), corder.end(),
+                   [&](std::size_t a, std::size_t b) { return ckey[a] < ckey[b]; });
+
+  // ---- rebuild ----------------------------------------------------------
+  Tr out(tr.geom_traits());
+  auto& dst = out.tds();
+  dst.clear();
+  dst.set_dimension(dim);
+
+  V.clear();
+  V.reserve(nv);
+  for (std::size_t i = 0; i < nv; ++i)
+  {
+    const Vertex_handle v = vs[vorder[i]];
+    V[v] = dst.create_vertex(*v);
+  }
+
+  boost::unordered_flat_map<Cell_handle, Cell_handle, boost::hash<Cell_handle>> C;
+  C.reserve(nc);
+  for (std::size_t i = 0; i < nc; ++i)
+  {
+    const Cell_handle c = cs[corder[i]];
+    C[c] = dst.create_cell(*c);
+  }
+  for (std::size_t i = 0; i < nc; ++i)
+  {
+    const Cell_handle c = cs[i];
+    const Cell_handle n = C[c];
+    for (int j = 0; j < 4; ++j)
+    {
+      n->set_vertex(j, V[c->vertex(j)]);
+      n->set_neighbor(j, C[c->neighbor(j)]);
+    }
+  }
+  for (std::size_t i = 0; i < nv; ++i)
+    V[vs[i]]->set_cell(C[vs[i]->cell()]);
+
+  out.set_infinite_vertex(V[tr.infinite_vertex()]);
+  tr.swap(out);
+  old_holder.swap(out);
+  return true;
+}
+
+// Same, for a c3t3: the complex's cell and facet membership lives *in* the
+// cells and survives the rebuild, but its complex edges and corners are keyed
+// by vertex handle and have to be re-registered against the new handles.
+template<typename C3t3>
+bool spatial_sort_c3t3(C3t3& c3t3)
+{
+  using Tr = typename C3t3::Triangulation;
+  using Vertex_handle = typename Tr::Vertex_handle;
+  using Curve_index   = typename C3t3::Curve_index;
+  using Corner_index  = typename C3t3::Corner_index;
+
+  Tr& tr = c3t3.triangulation();
+  if (tr.dimension() != 3 || tr.number_of_vertices() == 0) return false;
+
+  std::vector<std::tuple<Vertex_handle, Vertex_handle, Curve_index>> edges;
+  edges.reserve(c3t3.number_of_edges_in_complex());
+  for (const auto& e : c3t3.edges_in_complex())
+    edges.emplace_back(e.first->vertex(e.second), e.first->vertex(e.third),
+                       c3t3.curve_index(e));
+
+  std::vector<std::pair<Vertex_handle, Corner_index>> corners;
+  corners.reserve(c3t3.number_of_corners());
+  for (const Vertex_handle v : c3t3.vertices_in_complex())
+    corners.emplace_back(v, c3t3.corner_index(v));
+
+  for (const auto& e : edges) c3t3.remove_from_complex(std::get<0>(e), std::get<1>(e));
+  for (const auto& c : corners) c3t3.remove_from_complex(c.first);
+
+  boost::unordered_flat_map<Vertex_handle, Vertex_handle, boost::hash<Vertex_handle>> V;
+  Tr old_holder;                       // keeps V's keys alive through the remap
+  if (!spatial_sort_triangulation(tr, V, old_holder)) return false;
+
+  for (const auto& e : edges)
+    c3t3.add_to_complex(V[std::get<0>(e)], V[std::get<1>(e)], std::get<2>(e));
+  for (const auto& c : corners)
+    c3t3.add_to_complex(V[c.first], c.second);
+  return true;
+}
+
+// On by default (mode 2); CGAL_TR_SPATIAL_SORT=0 turns it off.
+//
+// Accepted on the full acceptance set at n=4 (~/logs/sacc, 288 runs): every arm
+// of every config faster, -27.7%/-22.5% on the two largest sequential cases and
+// -14.4%/-12.3% at four threads, 2-3% on the two configs small enough to fit in
+// L3. Quality equal or better everywhere except two sub-2000-cell meshes whose
+// run-to-run spread exceeds the shift.
+//   1 : sort once, during setup
+//   2 : also re-sort after every split, because split allocates the cells it
+//       creates in edge-length order and so undoes the setup sort on any mesh
+//       the run has to grow. Restricted to the split/collapse/flip/smooth
+//       iterations: once start_flip_smooth_steps() has run, the smoothing
+//       context keeps state indexed by a smoothing id that a re-sort would
+//       renumber.
+inline int spatial_sort_mode()
+{
+  static const int m = [] {
+    const char* e = std::getenv("CGAL_TR_SPATIAL_SORT");
+    return e ? std::atoi(e) : 2;
+  }();
+  return m;
+}
+
+inline bool spatial_sort_enabled() { return spatial_sort_mode() >= 1; }
+
+} // namespace internal
 
 namespace debug
 {

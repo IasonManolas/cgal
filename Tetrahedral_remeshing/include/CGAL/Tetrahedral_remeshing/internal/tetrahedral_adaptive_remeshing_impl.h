@@ -122,6 +122,13 @@ public:
   {
     m_c3t3.triangulation().swap(tr);
 
+    // Rebuild the triangulation's containers in Morton order before remeshing
+    // starts: the input's allocation order is arbitrary, and every phase after
+    // this point walks incident-cell stars, so the layout decides how many of
+    // those walks miss. See spatial_sort_c3t3().
+    if (Tetrahedral_remeshing::internal::spatial_sort_enabled())
+      Tetrahedral_remeshing::internal::spatial_sort_c3t3(m_c3t3);
+
     init_c3t3(vcmap, ecmap, fcmap);
     m_vertex_smoother.init(m_c3t3);
 
@@ -153,6 +160,13 @@ public:
   {
     m_c3t3.swap(c3t3);
 
+    // Rebuild the triangulation's containers in Morton order before remeshing
+    // starts: the input's allocation order is arbitrary, and every phase after
+    // this point walks incident-cell stars, so the layout decides how many of
+    // those walks miss. See spatial_sort_c3t3().
+    if (Tetrahedral_remeshing::internal::spatial_sort_enabled())
+      Tetrahedral_remeshing::internal::spatial_sort_c3t3(m_c3t3);
+
     init_c3t3(vcmap, ecmap, fcmap);
     m_vertex_smoother.init(m_c3t3);
 
@@ -173,6 +187,10 @@ public:
     CGAL_assertion(check_vertex_dimensions());
     split_long_edges(m_c3t3, m_sizing, m_protect_boundaries,
                      m_cell_selector, m_visitor);
+
+    if (Tetrahedral_remeshing::internal::spatial_sort_mode() >= 2
+        && !m_vertex_smoother.in_flip_smooth_steps())
+      Tetrahedral_remeshing::internal::spatial_sort_c3t3(m_c3t3);
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
     CGAL_assertion(tr().tds().is_valid(true));
@@ -407,9 +425,10 @@ private:
       if (get(ecmap, CGAL::Tetrahedral_remeshing::make_vertex_pair(e))
           || get(ecmap, CGAL::Tetrahedral_remeshing::make_inv_vertex_pair(e))
           || (input_is_c3t3() && m_c3t3.is_in_complex(e))
+          //non-manifold edges
           || nb_incident_subdomains(e, m_c3t3) > 2
           || nb_incident_surface_patches(e, m_c3t3) > 1
-          || nb_incident_complex_facets(e, m_c3t3) > 2)//non-manifold edges
+          || nb_incident_complex_facets(e, m_c3t3) > 2)
       {
         const bool in_complex = m_c3t3.is_in_complex(e);
         typename C3t3::Curve_index curve_id = in_complex
@@ -655,6 +674,7 @@ public:
     }
 
     postprocess(); //peel off boundary slivers
+
 
     finalize();
     //Warning : triangulation() is now empty
