@@ -32,6 +32,8 @@
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/property_maps.h>
 
+#include <boost/container/small_vector.hpp>
+
 #include <vector>
 #include <array>
 
@@ -99,6 +101,10 @@ private:
   using Kd_tree = typename Neighbor_search::Tree;
   using Distance = typename Neighbor_search::Distance;
   using Splitter = typename Neighbor_search::Splitter;
+
+  // holds the neighbors of a single query : `nb_neighbors()` never exceeds 30,
+  // so the buffer stays on the stack
+  using Neighbor_vector = boost::container::small_vector<Point_with_info, 30>;
 
 #ifndef DOXYGEN_RUNNING
 public:
@@ -236,7 +242,7 @@ public:
                            dist);
 
     FT max_size = 0.;
-    std::vector<Point_with_info> neighbors;
+    Neighbor_vector neighbors;
 
     for (const auto& neighbor : search)
     {
@@ -263,7 +269,7 @@ private:
    */
   FT interpolate_on_n_vertices(
     const Point_3& p,
-    const std::vector<Point_with_info>& vertices) const;
+    const Neighbor_vector& vertices) const;
 
   template<typename ECMap, typename FCMap, typename CellSelector>
   FT average_edge_length_around(const Vertex_handle v, const Tr& tr,
@@ -366,7 +372,7 @@ typename Adaptive_remeshing_sizing_field<Tr>::FT
 Adaptive_remeshing_sizing_field<Tr>::
 interpolate_on_n_vertices(
   const Point_3& p,
-  const std::vector<Point_with_info>& points_with_info) const
+  const Neighbor_vector& points_with_info) const
 {
   // Interpolate value using values at vertices
   const auto sqd = GT().compute_squared_distance_3_object();

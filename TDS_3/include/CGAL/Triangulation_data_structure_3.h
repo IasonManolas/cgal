@@ -903,10 +903,26 @@ private:
                 Cell_handle c = cell_stack.top();
                 cell_stack.pop();
 
+#ifndef CGAL_TR_NO_PREFETCH_STAR
+                // next->tds_data() below is a load DEPENDENT on c->neighbor(i),
+                // so the four neighbours of a popped cell otherwise serialise
+                // into four full memory latencies. The neighbour handles all
+                // live in c, which is already hot; issuing their addresses up
+                // front lets the four cache misses overlap instead.
+                Cell_handle nb_[4];
+                for (int i_ = 0; i_ < 4; ++i_) {
+                        nb_[i_] = c->neighbor(i_);
+                        __builtin_prefetch(&*nb_[i_]);
+                }
+#endif
                 for (int i=0; i<4; ++i) {
                         if (c->vertex(i) == v)
                                 continue;
+#ifndef CGAL_TR_NO_PREFETCH_STAR
+                        Cell_handle next = nb_[i];
+#else
                         Cell_handle next = c->neighbor(i);
+#endif
                         if (c < next)
                                 *it.second++ = Facet(c, i); // Incident facet.
                         if (! next->tds_data().is_clear())

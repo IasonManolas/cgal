@@ -16,6 +16,15 @@
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
 #include <utility>
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <vector>
+#include <algorithm>
+#include <tuple>
+#include <cmath>
+#include <limits>
+#include <iostream>
+#include <cstdlib>
+#include <cstdint>
 #include <array>
 #include <iterator>
 #include <unordered_set>
@@ -1151,6 +1160,88 @@ std::size_t nb_incident_complex_facets(const typename C3t3::Edge& e,
   return count;
 }
 
+// Fused form of init_c3t3()'s edge test
+//     nb_incident_subdomains(e, c3t3) > 2
+//  || nb_incident_surface_patches(e, c3t3) > 1
+//  || nb_incident_complex_facets(e, c3t3) > 2
+//
+// Those three helpers walk the edge's ring three times (one cell circulation,
+// two facet circulations) and the first two each heap-allocate an
+// unordered_set per edge -- on bear that is ~1M allocations and ~1.4M ring
+// walks, all serial, inside the once-per-run setup that the acceptance-set fit
+// charges as the F = 0.623 s intercept.
+//
+// This walks the ring twice (the two facet passes fuse into one) and keeps the
+// index sets in stack vectors: an edge is incident to a handful of subdomains
+// and patches in every mesh in the acceptance set, so the linear scan beats a
+// hash set, and small_vector only heap-allocates in the pathological case.
+// The three terms form a disjunction, so evaluating the complex-facet count
+// before the patch count inside the shared walk cannot change the answer; each
+// term still bails the moment it is decided.
+template<typename C3t3>
+bool edge_needs_complex_init(const typename C3t3::Edge& e, const C3t3& c3t3)
+{
+  typedef typename C3t3::Subdomain_index      Subdomain_index;
+  typedef typename C3t3::Surface_patch_index  Surface_patch_index;
+  typedef typename C3t3::Triangulation::Cell_circulator  Cell_circulator;
+  typedef typename C3t3::Triangulation::Facet_circulator Facet_circulator;
+
+  // nb_incident_subdomains(e) > 2
+  {
+    boost::container::small_vector<Subdomain_index, 8> subdomains;
+    Cell_circulator circ = c3t3.triangulation().incident_cells(e);
+    Cell_circulator end = circ;
+    do
+    {
+      const Subdomain_index si = circ->subdomain_index();
+      if (std::find(subdomains.begin(), subdomains.end(), si) == subdomains.end())
+      {
+        subdomains.push_back(si);
+        if (subdomains.size() > 2)
+          return true;
+      }
+    } while (++circ != end);
+  }
+
+  // nb_incident_surface_patches(e) > 1  ||  nb_incident_complex_facets(e) > 2
+  {
+    boost::container::small_vector<Surface_patch_index, 8> patches;
+    std::size_t n_complex_facets = 0;
+    Facet_circulator circ = c3t3.triangulation().incident_facets(e);
+    Facet_circulator end = circ;
+    do
+    {
+      const typename C3t3::Facet& f = *circ;
+      if (c3t3.is_in_complex(f))
+      {
+        if (++n_complex_facets > 2)
+          return true;
+        const Surface_patch_index pi = c3t3.surface_patch_index(f);
+        if (std::find(patches.begin(), patches.end(), pi) == patches.end())
+        {
+          patches.push_back(pi);
+          if (patches.size() > 1)
+            return true;
+        }
+      }
+    } while (++circ != end);
+  }
+
+  return false;
+}
+
+// Runtime toggle so both arms live in one binary and can be interleaved ABBA
+// inside a single thermal state, per the measurement protocol.
+inline bool fused_init_edge_test()
+{
+  static const bool on = []
+    {
+      const char* const e = std::getenv("CGAL_TR_FUSED_INIT_EDGE");
+      return !(e != nullptr && *e == '0');
+    }();
+  return on;
+}
+
 template<typename C3t3>
 bool is_feature(const typename C3t3::Vertex_handle v,
                 const typename C3t3::Vertex_handle neighbor,
@@ -2098,6 +2189,10 @@ namespace internal
     put(cell_selector, c, selected);
   }
 }
+
+namespace internal {
+
+} // namespace internal
 
 namespace debug
 {

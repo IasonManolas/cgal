@@ -407,9 +407,13 @@ private:
       if (get(ecmap, CGAL::Tetrahedral_remeshing::make_vertex_pair(e))
           || get(ecmap, CGAL::Tetrahedral_remeshing::make_inv_vertex_pair(e))
           || (input_is_c3t3() && m_c3t3.is_in_complex(e))
-          || nb_incident_subdomains(e, m_c3t3) > 2
-          || nb_incident_surface_patches(e, m_c3t3) > 1
-          || nb_incident_complex_facets(e, m_c3t3) > 2)//non-manifold edges
+          //non-manifold edges -- see edge_needs_complex_init() for why the
+          //three ring walks are fused into two
+          || (fused_init_edge_test()
+              ? edge_needs_complex_init(e, m_c3t3)
+              : (nb_incident_subdomains(e, m_c3t3) > 2
+                 || nb_incident_surface_patches(e, m_c3t3) > 1
+                 || nb_incident_complex_facets(e, m_c3t3) > 2)))
       {
         const bool in_complex = m_c3t3.is_in_complex(e);
         typename C3t3::Curve_index curve_id = in_complex
@@ -655,6 +659,7 @@ public:
     }
 
     postprocess(); //peel off boundary slivers
+
 
     finalize();
     //Warning : triangulation() is now empty
