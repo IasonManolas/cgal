@@ -28,6 +28,7 @@
 #include <tbb/concurrent_unordered_map.h>
 #endif
 
+#include <cstdlib>
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -1987,6 +1988,54 @@ protected:
       : m_cell_selector(cell_selector)
       , m_visitor(visitor)
       , inc_cells(incident_cells) {}
+
+  /**
+  * Locks everything a flip of the edge `(v0, v1)` may write, and leaves the
+  * two vertex stars in `inc0` and `inc1`. Used by the parallel executor only.
+  *
+  * The two stars are not the whole write footprint. A flip re-stitches the
+  * region it rebuilds to the cells around it, which means writing the
+  * neighbour array of every cell across an outer facet of the stars. Such a
+  * mirror cell has three of its four vertices in the stars -- the facet it
+  * shares -- and a fourth, its apex, outside them. `try_lock_cell()` on the
+  * star cells locks the stars' own vertices, so without the second loop below
+  * those apexes are written unlocked, and another thread walking the same
+  * region reads storage that is being rewritten. That is the 2026-08-31
+  * SIGSEGV (#30).
+  *
+  * `CGAL_TR_FLIP_HALO_LOCK=0` restores the unlocked behaviour. It exists so
+  * the cost of this fix can be measured against the code it replaces, in one
+  * binary; it is not a supported setting, because it crashes.
+  */
+  bool lock_flip_zone(const typename C3t3::Triangulation& tr,
+                      const Vertex_handle v0, const Vertex_handle v1,
+                      Cells_vector& inc0, Cells_vector& inc1) const
+  {
+    if (!tr.try_lock_and_get_incident_cells(v0, inc0)
+     || !tr.try_lock_and_get_incident_cells(v1, inc1))
+      return false;
+
+    if (!flip_halo_lock_enabled())
+      return true;
+
+    for (const Cells_vector* cells : { &inc0, &inc1 })
+      for (const Cell_handle c : *cells)
+        for (int i = 0; i < 4; ++i)
+          if (!tr.try_lock_cell(c->neighbor(i)))
+            return false;
+
+    return true;
+  }
+
+  static bool flip_halo_lock_enabled()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_FLIP_HALO_LOCK");
+        return (e == nullptr) || (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
 };
 
 // Flip of internal (non-boundary) edges. Mirrors the former flip_all_edges():
@@ -2058,10 +2107,9 @@ public:
   */
   bool lock_zone(const Element_type& vp, const C3t3& c3t3) const
   {
-    const typename C3t3::Triangulation& tr = c3t3.triangulation();
     Cells_vector inc_first, inc_second;
-    if (!tr.try_lock_and_get_incident_cells(vp.first, inc_first)
-     || !tr.try_lock_and_get_incident_cells(vp.second, inc_second))
+    if (!BaseClass::lock_flip_zone(c3t3.triangulation(), vp.first, vp.second,
+                                   inc_first, inc_second))
       return false;
 
     inc_cells[vp.first] = inc_first;
@@ -2183,10 +2231,9 @@ public:
   // Same zone as the internal flip: the two vertex stars. See the comment there.
   bool lock_zone(const Element_type& vp, const C3t3& c3t3) const
   {
-    const typename C3t3::Triangulation& tr = c3t3.triangulation();
     Cells_vector inc_first, inc_second;
-    if (!tr.try_lock_and_get_incident_cells(vp.first, inc_first)
-     || !tr.try_lock_and_get_incident_cells(vp.second, inc_second))
+    if (!BaseClass::lock_flip_zone(c3t3.triangulation(), vp.first, vp.second,
+                                   inc_first, inc_second))
       return false;
 
     inc_cells[vp.first] = inc_first;

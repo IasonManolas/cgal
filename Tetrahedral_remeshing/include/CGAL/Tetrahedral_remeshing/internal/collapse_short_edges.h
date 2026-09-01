@@ -1614,9 +1614,35 @@ public:
     if (is_gone(e))
       return true;
 
+    // Both vertices are held now, so the only thing that can still have
+    // changed is whether their slots are live: a collapse that merged one of
+    // them away before we took the locks. is_used() reads the slot's tag in
+    // O(1) and without a lock, where is_vertex() would take the container's
+    // block-list mutex and scan every block. A freed slot means the vertex is
+    // gone for good, so this is a skip, not a retry -- retrying would spin
+    // forever on a vertex that is never coming back.
+    const auto& vertices = tr.tds().vertices();
+    if (!vertices.is_used(e.first) || !vertices.is_used(e.second))
+      return true;
+
     std::vector<Cell_handle> inc_cells_0, inc_cells_1;
-    return tr.try_lock_and_get_incident_cells(e.first, inc_cells_0)
-        && tr.try_lock_and_get_incident_cells(e.second, inc_cells_1);
+    if (!tr.try_lock_and_get_incident_cells(e.first, inc_cells_0)
+     || !tr.try_lock_and_get_incident_cells(e.second, inc_cells_1))
+      return false;
+
+    // The two stars are not the whole write footprint. Collapsing re-stitches
+    // the region it removes to the cells around it, and in doing so calls
+    // set_cell() on the vertices of those neighbouring cells -- including the
+    // one vertex of each that lies outside the stars. A thread that does not
+    // hold that vertex can therefore have its v->cell() rewritten underneath
+    // it, and the next star walk follows a cell that is being recycled.
+    for (const std::vector<Cell_handle>* cells : { &inc_cells_0, &inc_cells_1 })
+      for (const Cell_handle c : *cells)
+        for (int i = 0; i < 4; ++i)
+          if (!tr.try_lock_cell(c->neighbor(i)))
+            return false;
+
+    return true;
   }
 
   bool is_gone(const Edge_vv& e) const
