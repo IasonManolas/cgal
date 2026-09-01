@@ -1993,6 +1993,16 @@ protected:
       , m_visitor(visitor)
       , inc_cells(incident_cells) {}
 
+public:
+  // Where the element sits, for the spatial grouping the parallel executor
+  // does. One endpoint is enough: the two are one edge apart, far closer than
+  // a grid cell.
+  typename Tr::Geom_traits::Point_3
+  point_on_element(const std::pair<Vertex_handle, Vertex_handle>& vp) const
+  {
+    return typename Tr::Geom_traits().construct_point_3_object()(vp.first->point());
+  }
+
   /**
   * Locks everything a flip of the edge `(v0, v1)` may write, and leaves the
   * two vertex stars in `inc0` and `inc1`. Used by the parallel executor only.

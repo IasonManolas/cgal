@@ -547,6 +547,16 @@ protected:
 
   // in flip-smooth steps, this function also checks that it improves
   // dihedral angles
+public:
+  // Where the element sits, for the spatial grouping the parallel executor does.
+  template<typename Vertex_handle>
+  auto point_on_element(const Vertex_handle& v) const
+  {
+    return point(v->point());
+  }
+
+protected:
+
   template<typename CellRange, typename Tr>
   bool check_inversion_and_move(const typename Tr::Vertex_handle v,
                                 const typename Tr::Geom_traits::Point_3& final_pos,

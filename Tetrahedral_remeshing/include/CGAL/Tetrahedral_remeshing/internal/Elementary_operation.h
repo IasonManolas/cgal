@@ -16,6 +16,8 @@
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
 #include <CGAL/tags.h>
+#include <CGAL/Bbox_3.h>
+#include <CGAL/number_utils.h>
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/blocked_range.h>
@@ -30,10 +32,12 @@
 #include <algorithm>
 #include <atomic>
 #include <iterator>
-#include <random>
 #include <string>
 #include <thread>
+#include <cmath>
+#include <functional>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
@@ -159,8 +163,9 @@ using Concurrency_selected_container_t =
 *
 * `requires_ordered_processing == true` drains a concurrent queue in the order
 * `get_elements()` produced, so that threads still take the most-wanted
-* elements first. `false` shuffles instead, to spread the threads over the
-* triangulation and keep lock conflicts down.
+* elements first. `false` groups them by a coarse spatial grid instead, so
+* that threads work in different regions of the triangulation and lock
+* conflicts stay down.
 */
 #ifdef CGAL_LINKED_WITH_TBB
 template <typename Operation>
@@ -242,16 +247,65 @@ private:
                       });
   }
 
+  /**
+  * Groups the elements by the cell of a coarse spatial grid and runs one
+  * bucket per task, each bucket in order. Elements in the same bucket are
+  * close together, so a thread that has just locked one zone is likely to
+  * find the next one adjacent to it rather than contended, and two threads
+  * are usually working in different regions. This replaced a shuffle, which
+  * spread the threads out by chance rather than by construction.
+  */
   static void run_unordered(std::vector<Element_type>& candidates,
                             Operation& op, C3t3& c3t3)
   {
-    std::mt19937 gen(std::random_device{}());
-    std::shuffle(candidates.begin(), candidates.end(), gen);
+    const CGAL::Bbox_3 bb = c3t3.bbox();
+    const double min_sq_dim
+      = (std::min)(CGAL::square(bb.xmax() - bb.xmin()),
+        (std::min)(CGAL::square(bb.ymax() - bb.ymin()),
+                   CGAL::square(bb.zmax() - bb.zmin())));
+    const double cell_size = 0.5 * CGAL::approximate_sqrt(min_sq_dim);
+    if (cell_size <= 0.)
+    {
+      // degenerate bounding box: nothing to group by
+      for (const Element_type& element : candidates)
+        apply_one(element, op, c3t3);
+      return;
+    }
+    const double inv_cell_size = 1. / cell_size;
 
-    tbb::parallel_for_each(candidates,
-                           [&](const Element_type& element)
+    struct Grid_cell_index
+    {
+      int i, j, k;
+      bool operator==(const Grid_cell_index& other) const
+      { return i == other.i && j == other.j && k == other.k; }
+    };
+    struct Grid_cell_index_hash
+    {
+      std::size_t operator()(const Grid_cell_index& ci) const
+      {
+        return ((std::hash<int>()(ci.i) ^ (std::hash<int>()(ci.j) << 1)) >> 1)
+             ^ (std::hash<int>()(ci.k) << 1);
+      }
+    };
+
+    std::unordered_map<Grid_cell_index, std::vector<Element_type>,
+                       Grid_cell_index_hash> buckets;
+    for (const Element_type& element : candidates)
+    {
+      const auto p = op.point_on_element(element);
+      buckets[Grid_cell_index{
+                static_cast<int>(std::floor(p.x() * inv_cell_size)),
+                static_cast<int>(std::floor(p.y() * inv_cell_size)),
+                static_cast<int>(std::floor(p.z() * inv_cell_size))}]
+        .push_back(element);
+    }
+
+    tbb::parallel_for_each(buckets.begin(), buckets.end(),
+                           [&](const std::pair<const Grid_cell_index,
+                                               std::vector<Element_type>>& bucket)
                            {
-                             apply_one(element, op, c3t3);
+                             for (const Element_type& element : bucket.second)
+                               apply_one(element, op, c3t3);
                            });
   }
 };
