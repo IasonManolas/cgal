@@ -39,6 +39,7 @@
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/concurrent_unordered_set.h>
+#include <tbb/concurrent_priority_queue.h>
 #include <tbb/concurrent_queue.h>
 #include <tbb/parallel_for.h>
 #include <tbb/task_arena.h>
@@ -1472,24 +1473,34 @@ auto can_be_collapsed(const typename C3T3::Edge& e,
 * Edges are keyed by their vertex pair, not by the cell handle they were
 * found through.
 */
+/**
+* What the parallel collapse keeps instead of the sequential work list.
+*
+* A collapse merges two vertices, and the one that goes takes with it every
+* candidate that named it. Recording the *vertices* rather than the edges is
+* what makes the re-queue safe: an edge is destroyed and re-created as its
+* neighbourhood changes, but a vertex that has been merged away never comes
+* back, so this set only ever vetoes candidates that really are gone.
+*/
 template<typename VertexHandle>
-class Destroyed_edges
+class Deleted_vertices
 {
-  using Edge_vv = std::pair<VertexHandle, VertexHandle>;
-  tbb::concurrent_unordered_set<Edge_vv, boost::hash<Edge_vv> > m_edges;
+  tbb::concurrent_unordered_set<VertexHandle, boost::hash<VertexHandle> > m_vertices;
 
 public:
-  void insert(const Edge_vv& e) { m_edges.insert(e); }
-  bool contains(const Edge_vv& e) const { return m_edges.find(e) != m_edges.end(); }
+  void insert(VertexHandle v) { m_vertices.insert(v); }
+  bool contains(VertexHandle v) const { return m_vertices.find(v) != m_vertices.end(); }
 };
 
-// `collapse_edge()` reports a destroyed edge as a live Tr::Edge; it is stored
-// by its vertex pair, which is what the candidates were snapshotted as.
-template<typename Edge, typename VertexHandle>
-void remove_from_bimap(const Edge& e, Destroyed_edges<VertexHandle>& destroyed)
-{
-  destroyed.insert(make_vertex_pair(e));
-}
+/**
+* `collapse_edge()` reports the edges it destroys so that a work list can drop
+* them. The parallel collapse has no work list to keep up to date -- it finds
+* out what is gone from `Deleted_vertices` -- so the reports go nowhere.
+*/
+struct No_work_list {};
+
+template<typename Edge>
+void remove_from_bimap(const Edge&, No_work_list&) {}
 #endif // CGAL_LINKED_WITH_TBB
 
 // The short edges left to collapse, shortest first. Edges are compared by
@@ -1537,7 +1548,7 @@ private:
   Visitor& m_visitor;
 
 #ifdef CGAL_LINKED_WITH_TBB
-  Destroyed_edges<Vertex_handle> m_destroyed_edges; // parallel path only
+  Deleted_vertices<Vertex_handle> m_deleted_vertices; // parallel path only
 #endif
 
 public:
@@ -1585,13 +1596,13 @@ public:
   * `Tr::Edge`s. An `Edge` names its edge through a cell handle, and a collapse
   * running on another thread may already have destroyed that cell, so
   * resolving one would follow recycled storage. Vertices survive until a
-  * collapse merges them away, and every edge a collapse destroys is recorded
-  * in `m_destroyed_edges` before the vertex goes -- so a pair that is not in
-  * that set still names two live vertices.
+  * collapse merges them away, and every merged-away vertex is recorded in
+  * `m_deleted_vertices` -- so a pair neither of whose vertices is in that set
+  * still names two live vertices.
   */
   bool lock_zone(const Edge_vv& e, const C3t3& c3t3) const
   {
-    if (m_destroyed_edges.contains(e))
+    if (is_gone(e))
       return true; // nothing to lock; execute_operation_vv() will skip it
 
     const Tr& tr = c3t3.triangulation();
@@ -1599,8 +1610,8 @@ public:
       return false;
 
     // Re-checked now that both vertices are held: another thread may have
-    // destroyed the edge between the test above and the locks.
-    if (m_destroyed_edges.contains(e))
+    // merged one of them away between the test above and the locks.
+    if (is_gone(e))
       return true;
 
     std::vector<Cell_handle> inc_cells_0, inc_cells_1;
@@ -1608,9 +1619,26 @@ public:
         && tr.try_lock_and_get_incident_cells(e.second, inc_cells_1);
   }
 
-  bool execute_operation_vv(const Edge_vv& e, C3t3& c3t3)
+  bool is_gone(const Edge_vv& e) const
   {
-    if (m_destroyed_edges.contains(e))
+    return m_deleted_vertices.contains(e.first)
+        || m_deleted_vertices.contains(e.second);
+  }
+
+  /**
+  * Collapses `e`, and reports through `new_candidates` the edges that have
+  * become short because of it. This is what the sequential path does by
+  * updating its bimap in place: without it the parallel collapse stops at the
+  * edges that were short when the snapshot was taken and leaves the mesh
+  * coarsened less far than the sequential one.
+  *
+  * The edges reported are incident to the vertex the collapse kept, so they
+  * lie in the zone this thread holds while it reads them.
+  */
+  template<typename OutputIterator>
+  bool execute_operation_vv(const Edge_vv& e, C3t3& c3t3, OutputIterator new_candidates)
+  {
+    if (is_gone(e))
       return false;
 
     Cell_handle cell;
@@ -1618,10 +1646,31 @@ public:
     if (!c3t3.triangulation().tds().is_edge(e.first, e.second, cell, i0, i1))
       return false;
 
-    const Vertex_handle vh = collapse_edge(Edge(cell, i0, i1), c3t3, m_sizing,
-                                           m_protect_boundaries, m_cell_selector,
-                                           m_destroyed_edges, m_visitor);
-    return vh != Vertex_handle();
+    No_work_list no_work_list;
+    const Vertex_handle vkept = collapse_edge(Edge(cell, i0, i1), c3t3, m_sizing,
+                                              m_protect_boundaries, m_cell_selector,
+                                              no_work_list, m_visitor);
+    if (vkept == Vertex_handle())
+      return false;
+
+    // the collapse merged the two endpoints; the one that is not kept is gone
+    m_deleted_vertices.insert(vkept == e.first ? e.second : e.first);
+
+    std::vector<Edge> incident;
+    c3t3.triangulation().finite_incident_edges(vkept, std::back_inserter(incident));
+    for (const Edge& ei : incident)
+    {
+      const auto [collapsible, boundary]
+        = can_be_collapsed(ei, c3t3, m_protect_boundaries, m_cell_selector);
+      if (!collapsible)
+        continue;
+
+      const std::optional<FT> sqlen
+        = is_too_short(ei, boundary, m_sizing, c3t3, m_cell_selector);
+      if (sqlen != std::nullopt)
+        *new_candidates++ = std::make_pair(sqlen.value(), make_vertex_pair(ei));
+    }
+    return true;
   }
 
   // shortest edge first is the point of the ordering the bimap keeps
@@ -1733,6 +1782,15 @@ class Elementary_operation_execution_parallel<
   using Operation = Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor>;
   using Short_edges = typename Operation::Short_edges;
   using Edge_vv = typename Operation::Edge_vv;
+  using FT = typename Operation::FT;
+
+  // an edge and its squared length, so the queue can keep the shortest on top
+  using Candidate = std::pair<FT, Edge_vv>;
+  struct Longer_first
+  {
+    bool operator()(const Candidate& a, const Candidate& b) const
+    { return a.first > b.first; }
+  };
 
 public:
   bool execute(Operation& op, C3t3& c3t3) const
@@ -1741,37 +1799,45 @@ public:
     if (short_edges.empty())
       return false;
 
-    // the right view is ordered by length, so this snapshot is shortest first
-    std::vector<Edge_vv> candidates;
-    candidates.reserve(short_edges.size());
-    for (auto it = short_edges.right.begin(); it != short_edges.right.end(); ++it)
-      candidates.push_back(make_vertex_pair(it->second));
+    // Shortest first, and it must stay so as the collapses themselves shorten
+    // further edges, so this is a priority queue rather than the plain queue
+    // the other ordered operation uses.
+    tbb::concurrent_priority_queue<Candidate, Longer_first> queue;
+    for (auto it = short_edges.left.begin(); it != short_edges.left.end(); ++it)
+      queue.push(Candidate(it->second, make_vertex_pair(it->first)));
+
+    const std::size_t nb_candidates = queue.size();
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
     CGAL::Real_timer timer;
     timer.start();
 #endif
 
-    tbb::concurrent_queue<Edge_vv> queue(candidates.begin(), candidates.end());
     tbb::parallel_for(0, tbb::this_task_arena::max_concurrency(),
                       [&](int)
                       {
-                        Edge_vv e;
-                        while (queue.try_pop(e))
+                        std::vector<Candidate> requeued;
+                        Candidate candidate;
+                        while (queue.try_pop(candidate))
                         {
+                          const Edge_vv& e = candidate.second;
                           while (!op.lock_zone(e, c3t3))
                           {
                             c3t3.triangulation().unlock_all_elements();
                             std::this_thread::yield();
                           }
-                          op.execute_operation_vv(e, c3t3);
+                          requeued.clear();
+                          op.execute_operation_vv(e, c3t3, std::back_inserter(requeued));
                           c3t3.triangulation().unlock_all_elements();
+
+                          for (const Candidate& c : requeued)
+                            queue.push(c);
                         }
                       });
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
     timer.stop();
-    std::cout << op.operation_name() << ": " << candidates.size()
+    std::cout << op.operation_name() << ": " << nb_candidates
               << " candidates (" << timer.time() << " sec, parallel)." << std::endl;
 #endif
     return true;
