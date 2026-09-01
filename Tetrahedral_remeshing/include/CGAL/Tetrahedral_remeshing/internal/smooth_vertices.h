@@ -561,6 +561,14 @@ protected:
     const typename Tr::Point backup = v->point();//backup v's position
     const typename Tr::Geom_traits::Point_3 pv = point(backup);
 
+    // The lock on `v` covers the grid cell v is in *now*. Moving it is what
+    // this function does, so the destination has to be held too, or every
+    // write from the first set_point() on -- including the restore -- lands
+    // outside the zone this thread owns. Failing to take it is not an error:
+    // the vertex simply is not moved this round.
+    if (!tr.try_lock_point(final_pos))
+      return false;
+
     bool valid_orientation = false;
     bool angles_improved = true;
     double frac = 1.0;
@@ -573,7 +581,18 @@ protected:
     bool valid_try = true;
     do
     {
-      v->set_point(typename Tr::Point(pv + frac * move));
+      // The move is retried at half the step until the orientations hold, so
+      // the intermediate positions land between pv and final_pos and can fall
+      // in a grid cell that neither end covers. Each one is taken before it
+      // is written.
+      const typename Tr::Geom_traits::Point_3 try_pos = pv + frac * move;
+      if (!tr.try_lock_point(try_pos))
+      {
+        v->set_point(backup);
+        return false;
+      }
+      CGAL_TR_PROBE_VERTEX_WRITE(tr, v, "smooth: set_point (move)");
+      v->set_point(typename Tr::Point(try_pos));
 
       valid_try = true;
       valid_orientation = true;
@@ -615,7 +634,10 @@ protected:
     bool valid_move = valid_orientation && angles_improved;
 
     if(!valid_move)
+    {
+      CGAL_TR_PROBE_VERTEX_WRITE(tr, v, "smooth: set_point (restore)");
       v->set_point(backup);
+    }
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
     else

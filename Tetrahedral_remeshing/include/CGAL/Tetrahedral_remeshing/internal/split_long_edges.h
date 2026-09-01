@@ -225,6 +225,7 @@ typename C3t3::Vertex_handle split_edge(const typename C3t3::Edge& e,
   }
 
   // insert midpoint
+  CGAL_TR_PROBE_CELL_WRITE(tr, e.first, "split: insert_in_edge");
   Vertex_handle new_v = tr.tds().insert_in_edge(e);
   new_v->set_point(typename Tr::Point(m));
   new_v->set_dimension(dimension);

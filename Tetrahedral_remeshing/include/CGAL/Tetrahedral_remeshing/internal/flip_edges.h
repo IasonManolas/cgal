@@ -285,6 +285,8 @@ Sliver_removal_result flip_3_to_2(typename C3t3::Edge& edge,
   */
 
   //Update cells
+  CGAL_TR_PROBE_CELL_WRITE(tr, ch0, "flip: set_vertex ch0");
+  CGAL_TR_PROBE_CELL_WRITE(tr, ch1, "flip: set_vertex ch1");
   ch0->set_vertex(vh0_id, vh2);
   ch1->set_vertex(vh1_id, vh3);
 
@@ -325,6 +327,7 @@ Sliver_removal_result flip_3_to_2(typename C3t3::Edge& edge,
   // Update c3t3
   update_c3t3_facets(c3t3, cells_to_update, outer_mirror_facets);
 
+  CGAL_TR_PROBE_CELL_WRITE(tr, cell_to_remove, "flip: delete_cell (2to3)");
   treat_before_delete(cell_to_remove, cell_selector, c3t3);
   tr.tds().delete_cell(cell_to_remove);
 
@@ -912,6 +915,7 @@ Sliver_removal_result flip_n_to_m(C3t3& c3t3,
   //Update_existing cells
   for (const Facet& fi : facets_for_updated_cells)
   {
+    CGAL_TR_PROBE_CELL_WRITE(tr, fi.first, "flip: set_vertex fi");
     fi.first->set_vertex(fi.second, vh);
     cells_to_update.push_back(fi.first);
   }

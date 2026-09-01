@@ -34,9 +34,6 @@
 
 #include <CGAL/SMDS_3/tet_soup_to_c3t3.h>
 #include <CGAL/utility.h>
-#include <map>
-#include <mutex>
-#include <string>
 #include <CGAL/Tetrahedral_remeshing/internal/Elementary_operation.h>
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 
@@ -60,100 +57,6 @@ namespace Tetrahedral_remeshing
 namespace internal
 {
 
-// ---------------------------------------------------------------------------
-// Lock-ownership probe for the parallel collapse.  Diagnostic only, built with
-// -DCGAL_TR_COLLAPSE_LOCK_PROBE.
-//
-// Every unlocked read in the parallel path rests on one invariant:
-//
-//     a worker may only write a cell while it holds locks on ALL FOUR of that
-//     cell's vertices, and may only write a vertex while it holds that vertex.
-//
-// If that is false somewhere, then holding a zone does not freeze it, and a
-// walk over a star is reading storage another worker is rewriting -- which is
-// what the crash in try_lock_and_get_incident_cells shows.
-//
-// This tests the invariant from the WRITE side, so it is timing independent:
-// it fires on the first run that executes an offending write, whether or not
-// a reader happened to be in the window.  It reports rather than aborts, so
-// one run enumerates every offending site.
-// ---------------------------------------------------------------------------
-#ifdef CGAL_TR_COLLAPSE_LOCK_PROBE
-struct Tr_probe_counts
-{
-  std::size_t total = 0, unlocked = 0, infinite = 0;
-};
-
-// The table lives inside the object that prints it, so it cannot be destroyed
-// before the print.
-struct Tr_probe_table
-{
-  std::mutex mutex;
-  std::map<std::string, Tr_probe_counts> sites;
-
-  ~Tr_probe_table()
-  {
-    std::cerr << "\n[collapse-lock] site summary  (total / unlocked / infinite)\n";
-    for (const auto& [site, c] : sites)
-      std::cerr << "[collapse-lock]   " << c.total << " / " << c.unlocked
-                << " / " << c.infinite << "   " << site << "\n";
-    std::cerr.flush();
-  }
-};
-
-inline Tr_probe_table& tr_probe_table()
-{
-  static Tr_probe_table t;
-  return t;
-}
-
-inline void tr_probe_count(const char* site, bool unlocked, bool infinite)
-{
-  Tr_probe_table& t = tr_probe_table();
-  std::lock_guard<std::mutex> guard(t.mutex);
-  Tr_probe_counts& c = t.sites[site];
-  ++c.total;
-  if (unlocked) ++c.unlocked;
-  if (infinite) ++c.infinite;
-}
-
-template<typename Tr, typename Vertex_handle>
-void tr_probe_vertex_write(const Tr& tr, Vertex_handle v, const char* site)
-{
-  auto* lds = tr.get_lock_data_structure();
-  if (lds == nullptr || v == Vertex_handle())
-    return;
-  // The infinite vertex is one object shared by the whole triangulation and
-  // has no position, so no spatial lock can stand for it.
-  const bool inf = tr.is_infinite(v);
-  tr_probe_count(site, !inf && !lds->is_locked_by_this_thread(v->point()), inf);
-}
-
-template<typename Tr, typename Cell_handle>
-void tr_probe_cell_write(const Tr& tr, Cell_handle c, const char* site)
-{
-  auto* lds = tr.get_lock_data_structure();
-  if (lds == nullptr || c == Cell_handle())
-    return;
-  int unlocked = 0, infinite = 0;
-  for (int i = 0; i < 4; ++i)
-  {
-    const auto v = c->vertex(i);
-    if (v == decltype(v)())
-      continue;
-    if (tr.is_infinite(v))          { ++infinite; continue; }
-    if (!lds->is_locked_by_this_thread(v->point())) ++unlocked;
-  }
-  tr_probe_count(site, unlocked > 0, infinite > 0);
-}
-#define CGAL_TR_PROBE_VERTEX_WRITE(tr, v, site) \
-  ::CGAL::Tetrahedral_remeshing::internal::tr_probe_vertex_write((tr), (v), (site))
-#define CGAL_TR_PROBE_CELL_WRITE(tr, c, site) \
-  ::CGAL::Tetrahedral_remeshing::internal::tr_probe_cell_write((tr), (c), (site))
-#else
-#define CGAL_TR_PROBE_VERTEX_WRITE(tr, v, site) CGAL_USE(tr)
-#define CGAL_TR_PROBE_CELL_WRITE(tr, c, site)   CGAL_USE(tr)
-#endif
 
 enum Edge_type     { FEATURE, BOUNDARY, INSIDE, MIXTE,
                      NO_COLLAPSE, INVALID, IMAGINARY, MIXTE_IMAGINARY, HULL_EDGE };
