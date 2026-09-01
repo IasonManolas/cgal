@@ -35,7 +35,9 @@
 #include <string>
 #include <thread>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
+#include <random>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -255,9 +257,42 @@ private:
   * are usually working in different regions. This replaced a shuffle, which
   * spread the threads out by chance rather than by construction.
   */
+  /**
+  * Both arms live in one binary, selected at run time, so that comparing them
+  * compares the grouping and not two different compilations (POLICY 0.2).
+  * Unset means grouped; `CGAL_TR_BUCKET_UNORDERED=0` restores the shuffle.
+  */
+  static bool bucket_unordered_enabled()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_BUCKET_UNORDERED");
+        return (e == nullptr) || (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  // The shuffle this replaced: spread the threads over the triangulation by
+  // chance rather than by construction.
+  static void run_unordered_shuffled(std::vector<Element_type>& candidates,
+                                     Operation& op, C3t3& c3t3)
+  {
+    std::mt19937 gen(std::random_device{}());
+    std::shuffle(candidates.begin(), candidates.end(), gen);
+
+    tbb::parallel_for_each(candidates,
+                           [&](const Element_type& element)
+                           {
+                             apply_one(element, op, c3t3);
+                           });
+  }
+
   static void run_unordered(std::vector<Element_type>& candidates,
                             Operation& op, C3t3& c3t3)
   {
+    if (!bucket_unordered_enabled())
+      return run_unordered_shuffled(candidates, op, c3t3);
+
     const CGAL::Bbox_3 bb = c3t3.bbox();
     const double min_sq_dim
       = (std::min)(CGAL::square(bb.xmax() - bb.xmin()),
