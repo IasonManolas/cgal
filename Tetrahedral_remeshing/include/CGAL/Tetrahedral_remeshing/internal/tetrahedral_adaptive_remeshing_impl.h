@@ -33,7 +33,9 @@
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 
+#include <memory>
 #include <optional>
+#include <type_traits>
 #include <boost/container/small_vector.hpp>
 
 namespace CGAL
@@ -89,6 +91,13 @@ class Adaptive_remesher
 
   typedef Vertex_smoothing_context<C3t3, SizingFunction, CellSelector> SmoothingContext;
 
+  typedef typename Tr::Concurrency_tag Concurrency_tag;
+
+  // The executor to run an elementary operation with. Sequential unless the
+  // triangulation was instantiated with CGAL::Parallel_tag.
+  template<typename Operation>
+  using Executor = Elementary_operation_executor<Operation, Concurrency_tag>;
+
 private:
   C3t3 m_c3t3;
   const SizingFunction& m_sizing;
@@ -100,6 +109,31 @@ private:
   C3t3* m_c3t3_pbackup;
   std::vector<Vertex_handle> m_far_points;
   Triangulation* m_tr_pbackup; //backup to re-swap triangulations when done
+
+#ifdef CGAL_LINKED_WITH_TBB
+  // Owned by the remesher, and handed to the triangulation for the duration of
+  // the remeshing, so that the grid matches this triangulation's bounding box
+  // and dies with it. Empty under Sequential_tag.
+  std::optional<typename Tr::Lock_data_structure> m_lock_ds;
+#endif
+
+  /**
+  * Gives the triangulation the lock grid the parallel executors need. Called
+  * once the c3t3 is in place, since the grid is sized from its bounding box.
+  */
+  void init_lock_data_structure()
+  {
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      if (m_c3t3.triangulation().get_lock_data_structure() == nullptr)
+      {
+        m_lock_ds.emplace(m_c3t3.bbox(), 8 /*grid size, as in Mesh_3*/);
+        m_c3t3.triangulation().set_lock_data_structure(std::addressof(*m_lock_ds));
+      }
+    }
+#endif
+  }
 
 public:
   Adaptive_remesher(Triangulation& tr
@@ -123,6 +157,7 @@ public:
     m_c3t3.triangulation().swap(tr);
 
     init_c3t3(vcmap, ecmap, fcmap);
+    init_lock_data_structure();
     m_smoothing_context = std::make_shared<SmoothingContext>(
       m_c3t3, m_sizing, m_cell_selector, m_protect_boundaries, smooth_constrained_edges);
 
@@ -154,6 +189,7 @@ public:
     m_c3t3.swap(c3t3);
 
     init_c3t3(vcmap, ecmap, fcmap);
+    init_lock_data_structure();
     m_smoothing_context = std::make_shared<SmoothingContext>(
       m_c3t3, m_sizing, m_cell_selector, m_protect_boundaries, smooth_constrained_edges);
 
@@ -174,7 +210,7 @@ public:
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_split_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeSplitOp;
     EdgeSplitOp split_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
-    Elementary_operation_execution_sequential<EdgeSplitOp> executor;
+    Executor<EdgeSplitOp> executor;
     executor.execute(split_op, m_c3t3);
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
@@ -200,7 +236,7 @@ public:
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeCollapseOp;
     EdgeCollapseOp collapse_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
-    Elementary_operation_execution_sequential<EdgeCollapseOp> executor;
+    Executor<EdgeCollapseOp> executor;
     executor.execute(collapse_op, m_c3t3);
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
@@ -228,13 +264,13 @@ public:
     typename InternalFlipOp::Incident_cells_map inc_cells;
 
     InternalFlipOp internal_flip_op(m_cell_selector, m_visitor, inc_cells);
-    Elementary_operation_execution_sequential<InternalFlipOp> internal_executor;
+    Executor<InternalFlipOp> internal_executor;
     internal_executor.execute(internal_flip_op, m_c3t3);
 
     if (!m_protect_boundaries)
     {
       BoundaryFlipOp boundary_flip_op(m_cell_selector, m_visitor, inc_cells);
-      Elementary_operation_execution_sequential<BoundaryFlipOp> boundary_executor;
+      Executor<BoundaryFlipOp> boundary_executor;
       boundary_executor.execute(boundary_flip_op, m_c3t3);
     }
 
@@ -265,18 +301,18 @@ public:
       if (m_smoothing_context->m_smooth_constrained_edges)
       {
         Complex_edge_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
-        Elementary_operation_execution_sequential<decltype(op)> executor;
+        Executor<decltype(op)> executor;
         executor.execute(op, m_c3t3);
       }
       {
         Surface_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
-        Elementary_operation_execution_sequential<decltype(op)> executor;
+        Executor<decltype(op)> executor;
         executor.execute(op, m_c3t3);
       }
     }
     {
       Internal_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
-      Elementary_operation_execution_sequential<decltype(op)> executor;
+      Executor<decltype(op)> executor;
       executor.execute(op, m_c3t3);
     }
 
@@ -344,6 +380,13 @@ public:
 
   void finalize()
   {
+#ifdef CGAL_LINKED_WITH_TBB
+    // The grid dies with the remesher. Take it back before the triangulation
+    // is swapped out, so the caller's does not leave holding a stale pointer.
+    if (m_lock_ds.has_value())
+      m_c3t3.triangulation().set_lock_data_structure(nullptr);
+#endif
+
     if (input_is_c3t3())
     {
       //reset far points dimension

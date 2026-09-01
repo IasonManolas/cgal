@@ -15,7 +15,26 @@
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
+#include <CGAL/tags.h>
+
+#ifdef CGAL_LINKED_WITH_TBB
+#include <tbb/blocked_range.h>
+#include <tbb/concurrent_queue.h>
+#include <tbb/concurrent_unordered_map.h>
+#include <tbb/concurrent_unordered_set.h>
+#include <tbb/parallel_for.h>
+#include <tbb/parallel_for_each.h>
+#include <tbb/task_arena.h>
+#endif
+
+#include <algorithm>
+#include <atomic>
+#include <iterator>
+#include <random>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <vector>
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
 #include <CGAL/Real_timer.h>
@@ -90,6 +109,175 @@ public:
     return true;
   }
 };
+
+/**
+* Picks a container type from the triangulation's concurrency tag:
+* `SequentialContainer` when remeshing sequentially, `ConcurrentContainer`
+* when remeshing in parallel. The sequential type is spelled out at every use
+* site, so that making an operation parallelizable cannot silently change the
+* container the sequential path uses.
+*/
+template <typename ConcurrencyTag,
+          typename SequentialContainer,
+          typename ConcurrentContainer>
+struct Concurrency_selected_container
+{
+  using type = SequentialContainer;
+};
+
+#ifdef CGAL_LINKED_WITH_TBB
+template <typename SequentialContainer, typename ConcurrentContainer>
+struct Concurrency_selected_container<CGAL::Parallel_tag,
+                                      SequentialContainer,
+                                      ConcurrentContainer>
+{
+  using type = ConcurrentContainer;
+};
+#endif
+
+template <typename ConcurrencyTag,
+          typename SequentialContainer,
+          typename ConcurrentContainer>
+using Concurrency_selected_container_t =
+  typename Concurrency_selected_container<ConcurrencyTag,
+                                          SequentialContainer,
+                                          ConcurrentContainer>::type;
+
+/**
+* The parallel counterpart of `Elementary_operation_execution_sequential`.
+*
+* An operation is parallelizable when, in addition to the `Elementary_operation`
+* interface, it provides
+*   - `bool lock_zone(const Element_type&, const C3t3&) const`, which locks
+*     every element `execute_operation()` may touch, and
+*   - `static constexpr bool requires_ordered_processing`, which says whether
+*     the order of `get_elements()` carries meaning.
+*
+* Neither is a virtual of `Elementary_operation`: this class is a template, so
+* they are found on the concrete operation. The sequential path never names
+* them, and is therefore unaffected by parallelism being available.
+*
+* `requires_ordered_processing == true` drains a concurrent queue in the order
+* `get_elements()` produced, so that threads still take the most-wanted
+* elements first. `false` shuffles instead, to spread the threads over the
+* triangulation and keep lock conflicts down.
+*/
+#ifdef CGAL_LINKED_WITH_TBB
+template <typename Operation>
+class Elementary_operation_execution_parallel
+{
+public:
+  using C3t3 = typename Operation::C3t3;
+  using Element_type = typename Operation::Element_type;
+  using Element_range = typename Operation::Element_range;
+
+  bool execute(Operation& op, C3t3& c3t3) const
+  {
+    std::vector<Element_type> candidates = collect(op, c3t3);
+    if (candidates.empty())
+      return false;
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+    CGAL::Real_timer timer;
+    timer.start();
+    const std::size_t nb_candidates = candidates.size();
+#endif
+
+    if constexpr (Operation::requires_ordered_processing)
+      run_ordered(candidates, op, c3t3);
+    else
+      run_unordered(candidates, op, c3t3);
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+    timer.stop();
+    std::cout << op.operation_name() << ": " << nb_candidates
+              << " candidates (" << timer.time() << " sec, parallel)."
+              << std::endl;
+#endif
+    return true;
+  }
+
+private:
+  static std::vector<Element_type> collect(const Operation& op, const C3t3& c3t3)
+  {
+    Element_range range = op.get_elements(c3t3);
+    if constexpr (std::is_same_v<Element_range, std::vector<Element_type>>)
+      return std::move(range);
+    else
+    {
+      std::vector<Element_type> candidates;
+      candidates.reserve(std::distance(range.begin(), range.end()));
+      std::copy(range.begin(), range.end(), std::back_inserter(candidates));
+      return candidates;
+    }
+  }
+
+  /**
+  * Locks the zone of `element`, retrying until it succeeds, then runs the
+  * operation and releases the zone. The retry is unbounded on purpose: a
+  * failed lock means another thread holds part of this zone, and every zone
+  * is released as soon as its operation ends, so the wait is finite.
+  */
+  static void apply_one(const Element_type& element, Operation& op, C3t3& c3t3)
+  {
+    while (!op.lock_zone(element, c3t3))
+    {
+      c3t3.triangulation().unlock_all_elements();
+      std::this_thread::yield();
+    }
+    op.execute_operation(element, c3t3);
+    c3t3.triangulation().unlock_all_elements();
+  }
+
+  static void run_ordered(std::vector<Element_type>& candidates,
+                          Operation& op, C3t3& c3t3)
+  {
+    tbb::concurrent_queue<Element_type> queue(candidates.begin(), candidates.end());
+    tbb::parallel_for(0, tbb::this_task_arena::max_concurrency(),
+                      [&](int)
+                      {
+                        Element_type element;
+                        while (queue.try_pop(element))
+                          apply_one(element, op, c3t3);
+                      });
+  }
+
+  static void run_unordered(std::vector<Element_type>& candidates,
+                            Operation& op, C3t3& c3t3)
+  {
+    std::mt19937 gen(std::random_device{}());
+    std::shuffle(candidates.begin(), candidates.end(), gen);
+
+    tbb::parallel_for_each(candidates,
+                           [&](const Element_type& element)
+                           {
+                             apply_one(element, op, c3t3);
+                           });
+  }
+};
+#endif // CGAL_LINKED_WITH_TBB
+
+/**
+* Selects the execution strategy from the triangulation's concurrency tag.
+* `Elementary_operation_executor<Op, Tag>` is the executor to instantiate.
+*/
+template <typename Operation, typename ConcurrencyTag>
+struct Elementary_operation_executor_selector
+{
+  using type = Elementary_operation_execution_sequential<Operation>;
+};
+
+#ifdef CGAL_LINKED_WITH_TBB
+template <typename Operation>
+struct Elementary_operation_executor_selector<Operation, CGAL::Parallel_tag>
+{
+  using type = Elementary_operation_execution_parallel<Operation>;
+};
+#endif
+
+template <typename Operation, typename ConcurrencyTag>
+using Elementary_operation_executor =
+  typename Elementary_operation_executor_selector<Operation, ConcurrencyTag>::type;
 
 } // namespace internal
 } // namespace Tetrahedral_remeshing

@@ -708,6 +708,20 @@ public:
     return BaseClass::check_inversion_and_move(v, new_pos, inc_cells, tr, m_context->m_total_move);
   }
 
+  /**
+  * Smoothing moves `v` and re-checks the orientation of the cells incident to
+  * it, so its star is the whole write zone. Only used by the parallel
+  * executor.
+  */
+  bool lock_zone(const Element_type& v, const C3t3& c3t3) const
+  {
+    std::vector<Cell_handle> inc_cells;
+    return c3t3.triangulation().try_lock_and_get_incident_cells(v, inc_cells);
+  }
+
+  // vertices are independent of one another: shuffling spreads the threads out
+  static constexpr bool requires_ordered_processing = false;
+
   std::string operation_name() const override { return "Vertex Smooth (Complex Edge Vertices)"; }
 
   void perform_global_preprocessing(const C3t3& c3t3) const
@@ -1004,6 +1018,20 @@ public:
     return result;
   }
 
+  /**
+  * Smoothing moves `v` and re-checks the orientation of the cells incident to
+  * it, so its star is the whole write zone. Only used by the parallel
+  * executor.
+  */
+  bool lock_zone(const Element_type& v, const C3t3& c3t3) const
+  {
+    std::vector<Cell_handle> inc_cells;
+    return c3t3.triangulation().try_lock_and_get_incident_cells(v, inc_cells);
+  }
+
+  // vertices are independent of one another: shuffling spreads the threads out
+  static constexpr bool requires_ordered_processing = false;
+
   std::string operation_name() const override { return "Vertex Smooth (Surface Vertices)"; }
 };
 
@@ -1110,6 +1138,20 @@ public:
     }
     return false;
   }
+
+  /**
+  * Smoothing moves `v` and re-checks the orientation of the cells incident to
+  * it, so its star is the whole write zone. Only used by the parallel
+  * executor.
+  */
+  bool lock_zone(const Element_type& v, const C3t3& c3t3) const
+  {
+    std::vector<Cell_handle> inc_cells;
+    return c3t3.triangulation().try_lock_and_get_incident_cells(v, inc_cells);
+  }
+
+  // vertices are independent of one another: shuffling spreads the threads out
+  static constexpr bool requires_ordered_processing = false;
 
   std::string operation_name() const override { return "Vertex Smooth (Internal Vertices)"; }
 };
