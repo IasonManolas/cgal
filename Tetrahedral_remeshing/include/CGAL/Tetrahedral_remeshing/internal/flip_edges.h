@@ -24,6 +24,10 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/functional/hash.hpp>
 
+#ifdef CGAL_LINKED_WITH_TBB
+#include <tbb/concurrent_unordered_map.h>
+#endif
+
 #include <unordered_map>
 #include <unordered_set>
 #include <algorithm>
@@ -1251,14 +1255,12 @@ void collect_subdomains_on_boundary(const C3t3& c3t3,
   }
 }
 
-template<typename C3T3, typename CellSelector>
+template<typename C3T3, typename CellSelector, typename BoundaryValencesMap>
 void collectBoundaryEdgesAndComputeVerticesValences(
   const C3T3& c3t3,
   const CellSelector& cell_selector,
   std::vector<typename C3T3::Edge>& boundary_edges,
-  boost::unordered_map<typename C3T3::Vertex_handle,
-                       boost::unordered_map<typename C3T3::Surface_patch_index, unsigned int> >&
-      boundary_vertices_valences,
+  BoundaryValencesMap& boundary_vertices_valences,
   boost::unordered_map<typename C3T3::Vertex_handle, std::unordered_set<typename C3T3::Subdomain_index> >&
       vertices_subdomain_indices)
 {
@@ -1958,7 +1960,19 @@ protected:
   using Edge          = typename Tr::Edge;
   using Facet         = typename Tr::Facet;
   using Cells_vector  = boost::container::small_vector<Cell_handle, 64>;
+  using Concurrency_tag = typename Tr::Concurrency_tag;
+
+  // The cache is written by every thread that flips, so it must tolerate
+  // concurrent insertion when remeshing in parallel. Each *value* is only ever
+  // touched by the thread holding the lock zone of the vertex it belongs to.
+#ifdef CGAL_LINKED_WITH_TBB
+  using Incident_cells_map = Concurrency_selected_container_t<
+      Concurrency_tag,
+      std::unordered_map<Vertex_handle, Cells_vector>,
+      tbb::concurrent_unordered_map<Vertex_handle, Cells_vector> >;
+#else
   using Incident_cells_map = std::unordered_map<Vertex_handle, Cells_vector>;
+#endif
 
   CellSelector& m_cell_selector;
   Visitor& m_visitor;
@@ -2035,6 +2049,29 @@ public:
     return (res == VALID_FLIP);
   }
 
+  /**
+  * A flip rewrites the cells around the edge, which are exactly the cells
+  * shared by the stars of its two vertices. Locking both stars therefore
+  * covers everything `execute_operation()` writes, including the two cache
+  * entries it fills here while the zone is held. Only used by the parallel
+  * executor.
+  */
+  bool lock_zone(const Element_type& vp, const C3t3& c3t3) const
+  {
+    const typename C3t3::Triangulation& tr = c3t3.triangulation();
+    Cells_vector inc_first, inc_second;
+    if (!tr.try_lock_and_get_incident_cells(vp.first, inc_first)
+     || !tr.try_lock_and_get_incident_cells(vp.second, inc_second))
+      return false;
+
+    inc_cells[vp.first] = inc_first;
+    inc_cells[vp.second] = inc_second;
+    return true;
+  }
+
+  // no edge is preferred over another: shuffling spreads the threads out
+  static constexpr bool requires_ordered_processing = false;
+
   std::string operation_name() const override { return "Flip edges (internal)"; }
 };
 
@@ -2062,7 +2099,20 @@ class Boundary_edge_flip_operation
   using Surface_patch_index = typename C3t3::Surface_patch_index;
   using Spi_map = boost::unordered_map<Surface_patch_index, unsigned int>;
 
-  mutable boost::unordered_map<Vertex_handle, Spi_map> m_boundary_vertices_valences;
+  // Filled once by get_elements() for every boundary vertex. A flip then
+  // decrements two valences and increments two others; all four vertices lie
+  // in the stars locked by lock_zone(), so only the map's structure needs to
+  // be safe against concurrent insertion.
+#ifdef CGAL_LINKED_WITH_TBB
+  using Boundary_valences_map = Concurrency_selected_container_t<
+      typename BaseClass::Concurrency_tag,
+      boost::unordered_map<Vertex_handle, Spi_map>,
+      tbb::concurrent_unordered_map<Vertex_handle, Spi_map> >;
+#else
+  using Boundary_valences_map = boost::unordered_map<Vertex_handle, Spi_map>;
+#endif
+
+  mutable Boundary_valences_map m_boundary_vertices_valences;
 
 public:
   using Incident_cells_map = typename BaseClass::Incident_cells_map;
@@ -2129,6 +2179,22 @@ public:
                               MIN_ANGLE_BASED,
                               m_visitor);
   }
+
+  // Same zone as the internal flip: the two vertex stars. See the comment there.
+  bool lock_zone(const Element_type& vp, const C3t3& c3t3) const
+  {
+    const typename C3t3::Triangulation& tr = c3t3.triangulation();
+    Cells_vector inc_first, inc_second;
+    if (!tr.try_lock_and_get_incident_cells(vp.first, inc_first)
+     || !tr.try_lock_and_get_incident_cells(vp.second, inc_second))
+      return false;
+
+    inc_cells[vp.first] = inc_first;
+    inc_cells[vp.second] = inc_second;
+    return true;
+  }
+
+  static constexpr bool requires_ordered_processing = false;
 
   std::string operation_name() const override { return "Flip edges (boundary)"; }
 };

@@ -473,6 +473,21 @@ public:
     return true;
   }
 
+  /**
+  * Splitting `element` rewrites the cells incident to its two vertices, so
+  * both stars must be held. Only used by the parallel executor.
+  */
+  bool lock_zone(const Element_type& element, const C3t3& c3t3) const
+  {
+    const Tr& tr = c3t3.triangulation();
+    std::vector<Cell_handle> inc_cells_first, inc_cells_second;
+    return tr.try_lock_and_get_incident_cells(element.first, inc_cells_first)
+        && tr.try_lock_and_get_incident_cells(element.second, inc_cells_second);
+  }
+
+  // longest edge first is the point of the ordering built in get_elements()
+  static constexpr bool requires_ordered_processing = true;
+
   std::string operation_name() const override { return "Split long edges"; }
 };
 
