@@ -15,6 +15,8 @@
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
+#include <cstddef>
+
 #include <CGAL/Simplicial_mesh_vertex_base_3.h>
 
 namespace CGAL {
@@ -54,6 +56,21 @@ public:
 
 public:
   using Vb::Vb; // constructors
+
+  /**
+  * Scratch index used by the smoothing phase to address its per-vertex arrays.
+  *
+  * It is transient: it is (re)assigned at the start of every smoothing phase
+  * and means nothing outside one. It is not serialized, not copied with any
+  * meaning, and no other phase may rely on it. It lives here rather than in a
+  * map keyed on Vertex_handle because that map was rebuilt every phase and
+  * read O(4C) times, and hashing a compact-container iterator is not free.
+  */
+  std::size_t smoothing_id() const { return m_smoothing_id; }
+  void set_smoothing_id(const std::size_t i) { m_smoothing_id = i; }
+
+private:
+  std::size_t m_smoothing_id = 0;
 };
 
 } // namespace Tetrahedral_remeshing

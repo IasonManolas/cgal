@@ -222,8 +222,24 @@ public:
     m_flip_smooth_steps = true;
   }
 
+  /**
+  * `CGAL_TR_VERTEX_STORED_ID=1` reads the index off the vertex instead of a
+  * map keyed on Vertex_handle. Off by default.
+  */
+  static bool use_vertex_stored_id()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_VERTEX_STORED_ID");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
   std::size_t vertex_id(const Vertex_handle v) const
   {
+    if (use_vertex_stored_id())
+      return v->smoothing_id();
     CGAL_expensive_assertion(m_vertex_id.find(v) != m_vertex_id.end());
     return m_vertex_id.at(v);
   }
@@ -524,11 +540,17 @@ private:
     // because no vertices are inserted nor removed anymore
     if(m_flip_smooth_steps)
       return;
-    m_vertex_id.clear();
     std::size_t id = 0;
-    for (const Vertex_handle v : tr.finite_vertex_handles())
+    if (use_vertex_stored_id())
     {
-      m_vertex_id[v] = id++;
+      for (const Vertex_handle v : tr.finite_vertex_handles())
+        v->set_smoothing_id(id++);
+    }
+    else
+    {
+      m_vertex_id.clear();
+      for (const Vertex_handle v : tr.finite_vertex_handles())
+        m_vertex_id[v] = id++;
     }
   }
 };
