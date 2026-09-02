@@ -126,30 +126,16 @@ public:
   * work with each; smoothing moves vertices but never changes connectivity,
   * so the edge set is the same for both and there is no reason to enumerate
   * it twice. Filled in phase order, so the accumulation into m_moves adds in
-  * the same sequence as before -- these are floating-point sums.
-  * `CGAL_TR_SHARE_SMOOTH_SCAN=1` uses it; off by default.
+  * the same sequence as a fresh walk would -- these are floating-point sums.
   */
   std::vector<typename Tr::Edge> m_finite_edges{};
 
-  static bool share_smooth_scan()
-  {
-    static const bool enabled = []
-      {
-        const char* const e = std::getenv("CGAL_TR_SHARE_SMOOTH_SCAN");
-        return (e != nullptr) && (std::atoi(e) != 0);
-      }();
-    return enabled;
-  }
-
-  /** The edges to walk in a preprocessing pass: the cache, or a fresh walk. */
+  /** The edges to walk in a preprocessing pass, collected on first use. */
   const std::vector<typename Tr::Edge>& finite_edges(const C3t3& c3t3)
   {
-    if (!share_smooth_scan() || m_finite_edges.empty())
-    {
-      m_finite_edges.clear();
+    if (m_finite_edges.empty())
       for (const typename Tr::Edge& e : c3t3.triangulation().finite_edges())
         m_finite_edges.push_back(e);
-    }
     return m_finite_edges;
   }
 
