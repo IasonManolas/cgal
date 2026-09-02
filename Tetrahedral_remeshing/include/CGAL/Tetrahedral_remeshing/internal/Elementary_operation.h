@@ -236,31 +236,23 @@ private:
     c3t3.triangulation().unlock_all_elements();
   }
 
-  static void run_ordered(std::vector<Element_type>& candidates,
-                          Operation& op, C3t3& c3t3)
-  {
-    tbb::concurrent_queue<Element_type> queue(candidates.begin(), candidates.end());
-    tbb::parallel_for(0, tbb::this_task_arena::max_concurrency(),
-                      [&](int)
-                      {
-                        Element_type element;
-                        while (queue.try_pop(element))
-                          apply_one(element, op, c3t3);
-                      });
-  }
-
   /**
-  * Groups the elements by the cell of a coarse spatial grid and runs one
-  * bucket per task, each bucket in order. Elements in the same bucket are
-  * close together, so a thread that has just locked one zone is likely to
-  * find the next one adjacent to it rather than contended, and two threads
-  * are usually working in different regions. This replaced a shuffle, which
-  * spread the threads out by chance rather than by construction.
+  * `CGAL_TR_BUCKET_ORDERED=1` groups the ordered elements too. It is off by
+  * default and is a different trade from the unordered case: draining one
+  * queue keeps the order `get_elements()` produced -- longest edge first for
+  * split -- across all threads, whereas grouping keeps it only WITHIN a
+  * bucket, and buckets run concurrently. So this buys the same locality at
+  * the cost of the global ordering, and only measurement says whether that is
+  * worth it.
+  *
+  * Only split reaches this. Collapse has its own executor: its work list
+  * changes as it runs and is drained from a priority queue that the collapses
+  * themselves push back into, which grouping cannot express.
   */
   /**
   * Both arms live in one binary, selected at run time, so that comparing them
-  * compares the grouping and not two different compilations (POLICY 0.2).
-  * Unset means grouped; `CGAL_TR_BUCKET_UNORDERED=0` restores the shuffle.
+  * compares the grouping and not two compilations (POLICY 0.2). Unset means
+  * grouped; `CGAL_TR_BUCKET_UNORDERED=0` restores the shuffle.
   */
   static bool bucket_unordered_enabled()
   {
@@ -272,8 +264,98 @@ private:
     return enabled;
   }
 
-  // The shuffle this replaced: spread the threads over the triangulation by
-  // chance rather than by construction.
+  static bool bucket_ordered_enabled()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_BUCKET_ORDERED");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  static void run_ordered(std::vector<Element_type>& candidates,
+                          Operation& op, C3t3& c3t3)
+  {
+    if (bucket_ordered_enabled())
+    {
+      Buckets buckets = bucket_by_grid(candidates, op, c3t3);
+      if (!buckets.empty())
+        return run_buckets(buckets, op, c3t3);
+    }
+
+    tbb::concurrent_queue<Element_type> queue(candidates.begin(), candidates.end());
+    tbb::parallel_for(0, tbb::this_task_arena::max_concurrency(),
+                      [&](int)
+                      {
+                        Element_type element;
+                        while (queue.try_pop(element))
+                          apply_one(element, op, c3t3);
+                      });
+  }
+
+  struct Grid_cell_index
+  {
+    int i, j, k;
+    bool operator==(const Grid_cell_index& o) const
+    { return i == o.i && j == o.j && k == o.k; }
+  };
+  struct Grid_cell_index_hash
+  {
+    std::size_t operator()(const Grid_cell_index& ci) const
+    {
+      return ((std::hash<int>()(ci.i) ^ (std::hash<int>()(ci.j) << 1)) >> 1)
+           ^ (std::hash<int>()(ci.k) << 1);
+    }
+  };
+  using Buckets = std::unordered_map<Grid_cell_index, std::vector<Element_type>,
+                                     Grid_cell_index_hash>;
+
+  /**
+  * Groups the elements by the cell of a coarse grid, keeping each bucket in
+  * the order the elements arrived. Returns an empty map if the bounding box
+  * is degenerate, which the callers read as "do not group".
+  */
+  static Buckets bucket_by_grid(const std::vector<Element_type>& candidates,
+                                const Operation& op, const C3t3& c3t3)
+  {
+    const CGAL::Bbox_3 bb = c3t3.bbox();
+    const double min_sq_dim
+      = (std::min)(CGAL::square(bb.xmax() - bb.xmin()),
+        (std::min)(CGAL::square(bb.ymax() - bb.ymin()),
+                   CGAL::square(bb.zmax() - bb.zmin())));
+    const double cell_size = 0.5 * CGAL::approximate_sqrt(min_sq_dim);
+
+    Buckets buckets;
+    if (cell_size <= 0.)
+      return buckets;
+
+    const double inv_cell_size = 1. / cell_size;
+    for (const Element_type& element : candidates)
+    {
+      const auto p = op.point_on_element(element);
+      buckets[Grid_cell_index{
+                static_cast<int>(std::floor(p.x() * inv_cell_size)),
+                static_cast<int>(std::floor(p.y() * inv_cell_size)),
+                static_cast<int>(std::floor(p.z() * inv_cell_size))}]
+        .push_back(element);
+    }
+    return buckets;
+  }
+
+  static void run_buckets(Buckets& buckets, Operation& op, C3t3& c3t3)
+  {
+    tbb::parallel_for_each(buckets.begin(), buckets.end(),
+                           [&](const std::pair<const Grid_cell_index,
+                                               std::vector<Element_type>>& bucket)
+                           {
+                             for (const Element_type& element : bucket.second)
+                               apply_one(element, op, c3t3);
+                           });
+  }
+
+  // The shuffle the grouping replaced: spread the threads over the
+  // triangulation by chance rather than by construction.
   static void run_unordered_shuffled(std::vector<Element_type>& candidates,
                                      Operation& op, C3t3& c3t3)
   {
@@ -287,61 +369,23 @@ private:
                            });
   }
 
+  /**
+  * Groups the elements by grid cell and runs one bucket per task. Elements in
+  * a bucket are close together, so a thread that has just locked one zone is
+  * likely to find the next adjacent rather than contended, and two threads are
+  * usually working in different regions.
+  */
   static void run_unordered(std::vector<Element_type>& candidates,
                             Operation& op, C3t3& c3t3)
   {
     if (!bucket_unordered_enabled())
       return run_unordered_shuffled(candidates, op, c3t3);
 
-    const CGAL::Bbox_3 bb = c3t3.bbox();
-    const double min_sq_dim
-      = (std::min)(CGAL::square(bb.xmax() - bb.xmin()),
-        (std::min)(CGAL::square(bb.ymax() - bb.ymin()),
-                   CGAL::square(bb.zmax() - bb.zmin())));
-    const double cell_size = 0.5 * CGAL::approximate_sqrt(min_sq_dim);
-    if (cell_size <= 0.)
-    {
-      // degenerate bounding box: nothing to group by
-      for (const Element_type& element : candidates)
-        apply_one(element, op, c3t3);
-      return;
-    }
-    const double inv_cell_size = 1. / cell_size;
+    Buckets buckets = bucket_by_grid(candidates, op, c3t3);
+    if (buckets.empty()) // degenerate bounding box
+      return run_unordered_shuffled(candidates, op, c3t3);
 
-    struct Grid_cell_index
-    {
-      int i, j, k;
-      bool operator==(const Grid_cell_index& other) const
-      { return i == other.i && j == other.j && k == other.k; }
-    };
-    struct Grid_cell_index_hash
-    {
-      std::size_t operator()(const Grid_cell_index& ci) const
-      {
-        return ((std::hash<int>()(ci.i) ^ (std::hash<int>()(ci.j) << 1)) >> 1)
-             ^ (std::hash<int>()(ci.k) << 1);
-      }
-    };
-
-    std::unordered_map<Grid_cell_index, std::vector<Element_type>,
-                       Grid_cell_index_hash> buckets;
-    for (const Element_type& element : candidates)
-    {
-      const auto p = op.point_on_element(element);
-      buckets[Grid_cell_index{
-                static_cast<int>(std::floor(p.x() * inv_cell_size)),
-                static_cast<int>(std::floor(p.y() * inv_cell_size)),
-                static_cast<int>(std::floor(p.z() * inv_cell_size))}]
-        .push_back(element);
-    }
-
-    tbb::parallel_for_each(buckets.begin(), buckets.end(),
-                           [&](const std::pair<const Grid_cell_index,
-                                               std::vector<Element_type>>& bucket)
-                           {
-                             for (const Element_type& element : bucket.second)
-                               apply_one(element, op, c3t3);
-                           });
+    run_buckets(buckets, op, c3t3);
   }
 };
 #endif // CGAL_LINKED_WITH_TBB

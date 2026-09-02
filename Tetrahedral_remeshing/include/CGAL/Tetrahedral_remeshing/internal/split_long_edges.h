@@ -486,6 +486,14 @@ public:
         && tr.try_lock_and_get_incident_cells(element.second, inc_cells_second);
   }
 
+  // Where the element sits, for the spatial grouping the parallel executor
+  // can do. One endpoint is enough: the two are one edge apart, far closer
+  // than a grid cell.
+  typename Tr::Geom_traits::Point_3 point_on_element(const Element_type& e) const
+  {
+    return typename Tr::Geom_traits().construct_point_3_object()(e.first->point());
+  }
+
   // longest edge first is the point of the ordering built in get_elements()
   static constexpr bool requires_ordered_processing = true;
 
