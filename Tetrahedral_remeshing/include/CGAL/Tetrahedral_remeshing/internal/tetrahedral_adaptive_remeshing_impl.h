@@ -33,6 +33,7 @@
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <type_traits>
@@ -118,6 +119,27 @@ private:
 #endif
 
   /**
+  * Cells per axis in the spatial lock grid. 8 is the Mesh_3 default, and is
+  * very coarse here: the grid spans the whole bounding box, so a zone covers
+  * a large part of the triangulation and two threads working far apart can
+  * still contend. A finer grid costs more grid cells to lock per zone and
+  * makes a moving vertex cross cells more often, which is why it is a
+  * measurable trade rather than an obvious win.
+  * `CGAL_TR_LOCK_GRID_SIZE` selects it at run time so both arms live in one
+  * binary (POLICY 0.2).
+  */
+  static int lock_grid_size()
+  {
+    static const int n = []
+      {
+        const char* const e = std::getenv("CGAL_TR_LOCK_GRID_SIZE");
+        const int v = (e == nullptr) ? 0 : std::atoi(e);
+        return (v > 0) ? v : 8;
+      }();
+    return n;
+  }
+
+  /**
   * Gives the triangulation the lock grid the parallel executors need. Called
   * once the c3t3 is in place, since the grid is sized from its bounding box.
   */
@@ -128,7 +150,7 @@ private:
     {
       if (m_c3t3.triangulation().get_lock_data_structure() == nullptr)
       {
-        m_lock_ds.emplace(m_c3t3.bbox(), 8 /*grid size, as in Mesh_3*/);
+        m_lock_ds.emplace(m_c3t3.bbox(), lock_grid_size());
         m_c3t3.triangulation().set_lock_data_structure(std::addressof(*m_lock_ds));
       }
     }
