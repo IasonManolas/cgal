@@ -138,11 +138,49 @@ public:
   */
   std::vector<typename Tr::Edge> m_complex_edges{};
 
+  /**
+  * `CGAL_TR_PARALLEL_SMOOTH_SCAN=1` collects the edges with a parallel cell
+  * scan instead of walking `finite_edges()` on one thread. Off by default: the
+  * scan visits every cell and runs an ownership test per edge, which is more
+  * total work traded against running on every thread -- the same trade that
+  * lost for candidate collection (R8+R20, -0.655%), asked again here where the
+  * walk feeds two preprocessing passes rather than one.
+  */
+  static bool parallel_smooth_scan()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_PARALLEL_SMOOTH_SCAN");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
   /** Collects the finite edges, and the complex subset with them. */
   void ensure_edges(const C3t3& c3t3)
   {
     if (!m_finite_edges.empty())
       return;
+
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      if (parallel_smooth_scan())
+      {
+        m_finite_edges = parallel_collect_finite_edges<typename Tr::Edge>(
+          c3t3.triangulation(),
+          [](const typename Tr::Edge& e, std::vector<typename Tr::Edge>& out)
+          { out.push_back(e); });
+        // the complex subset stays serial: it is small, and it must keep the
+        // order the passes accumulate in
+        for (const typename Tr::Edge& e : m_finite_edges)
+          if (c3t3.is_in_complex(e))
+            m_complex_edges.push_back(e);
+        return;
+      }
+    }
+#endif
+
     for (const typename Tr::Edge& e : c3t3.triangulation().finite_edges())
     {
       m_finite_edges.push_back(e);
@@ -622,6 +660,77 @@ protected:
   // in flip-smooth steps, this function also checks that it improves
   // dihedral angles
 public:
+  /**
+  * `CGAL_TR_PARALLEL_SMOOTH_MOVES=1` accumulates the per-vertex moves on every
+  * thread instead of one. Off by default.
+  *
+  * The accumulation is a scatter-add: each edge adds into the slots of its two
+  * vertices, and two edges sharing a vertex collide. Each thread therefore
+  * gets its own copy of the move vector and they are summed afterwards, which
+  * costs nbv * sizeof(Move) per thread.
+  *
+  * This CHANGES THE RESULT. The sums are floating point, so adding them in a
+  * different order gives a different answer -- a valid one, but not the same
+  * one. The sequential build is untouched (the toggle is off there and the
+  * arm is not compiled into it), but the two arms of the A/B do not produce
+  * identical meshes, and the quality gates rather than a byte comparison are
+  * what has to carry the correctness argument.
+  */
+  static bool parallel_smooth_moves()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_PARALLEL_SMOOTH_MOVES");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  /**
+  * Runs `per_edge(e, moves)` over every cached finite edge, on one thread or
+  * on all of them. `per_edge` may only touch the move vector it is handed.
+  */
+  template<typename C3t3_, typename Move_, typename PerEdge>
+  static void accumulate_moves(const C3t3_& c3t3,
+                               const std::vector<typename C3t3_::Edge>& edges,
+                               std::vector<Move_>& moves,
+                               PerEdge per_edge)
+  {
+#ifdef CGAL_LINKED_WITH_TBB
+    using Tr_ = typename C3t3_::Triangulation;
+    if constexpr (std::is_convertible_v<typename Tr_::Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      if (parallel_smooth_moves())
+      {
+        const Move_ zero = moves.empty() ? Move_{} : moves[0];
+        tbb::enumerable_thread_specific<std::vector<Move_> > tl(
+          [&] { return std::vector<Move_>(moves.size(), zero); });
+
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, edges.size()),
+          [&](const tbb::blocked_range<std::size_t>& r)
+          {
+            std::vector<Move_>& local = tl.local();
+            for (std::size_t i = r.begin(); i != r.end(); ++i)
+              per_edge(edges[i], local);
+          });
+
+        tl.combine_each([&](const std::vector<Move_>& local)
+        {
+          for (std::size_t i = 0; i < moves.size(); ++i)
+          {
+            moves[i].move += local[i].move;
+            moves[i].mass += local[i].mass;
+            moves[i].neighbors += local[i].neighbors;
+          }
+        });
+        return;
+      }
+    }
+#endif
+    for (const typename C3t3_::Edge& e : edges)
+      per_edge(e, moves);
+  }
+
   // Where the element sits, for the spatial grouping the parallel executor does.
   template<typename Vertex_handle>
   auto point_on_element(const Vertex_handle& v) const
@@ -920,40 +1029,41 @@ private:
     const Move default_move{CGAL::NULL_VECTOR, 0/*neighbors*/, 0./*mass*/};
     moves.assign(nbv, default_move);
 
-    for (const Edge& e : m_context->finite_edges(c3t3))
-    {
-      if (!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector))
+    BaseClass::accumulate_moves(c3t3, m_context->finite_edges(c3t3), moves,
+      [&](const Edge& e, std::vector<typename BaseClass::Context::Move>& out)
       {
-        const Vertex_handle vh0 = e.first->vertex(e.second);
-        const Vertex_handle vh1 = e.first->vertex(e.third);
-
-        const std::size_t& i0 = m_context->vertex_id(vh0);
-        const std::size_t& i1 = m_context->vertex_id(vh1);
-
-        const bool vh0_moving = !is_on_feature(vh0) && m_context->is_free(i0);
-        const bool vh1_moving = !is_on_feature(vh1) && m_context->is_free(i1);
-
-        if (!vh0_moving && !vh1_moving)
-          continue;
-
-        const Point_3& p0 = point(vh0->point());
-        const Point_3& p1 = point(vh1->point());
-        const FT density = BaseClass::density_along_segment(e, c3t3, true);
-
-        if (vh0_moving)
+        if (!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector))
         {
-          moves[i0].move += density * Vector_3(p0, p1);
-          moves[i0].mass += density;
-          ++moves[i0].neighbors;
+          const Vertex_handle vh0 = e.first->vertex(e.second);
+          const Vertex_handle vh1 = e.first->vertex(e.third);
+
+          const std::size_t& i0 = m_context->vertex_id(vh0);
+          const std::size_t& i1 = m_context->vertex_id(vh1);
+
+          const bool vh0_moving = !is_on_feature(vh0) && m_context->is_free(i0);
+          const bool vh1_moving = !is_on_feature(vh1) && m_context->is_free(i1);
+
+          if (!vh0_moving && !vh1_moving)
+            return;
+
+          const Point_3& p0 = point(vh0->point());
+          const Point_3& p1 = point(vh1->point());
+          const FT density = BaseClass::density_along_segment(e, c3t3, true);
+
+          if (vh0_moving)
+          {
+            out[i0].move += density * Vector_3(p0, p1);
+            out[i0].mass += density;
+            ++out[i0].neighbors;
+          }
+          if (vh1_moving)
+          {
+            out[i1].move += density * Vector_3(p1, p0);
+            out[i1].mass += density;
+            ++out[i1].neighbors;
+          }
         }
-        if (vh1_moving)
-        {
-          moves[i1].move += density * Vector_3(p1, p0);
-          moves[i1].mass += density;
-          ++moves[i1].neighbors;
-        }
-      }
-    }
+      });
   }
 
   std::optional<Point_3> project(const Surface_patch_index& si, const Point_3& gi)

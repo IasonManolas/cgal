@@ -33,6 +33,7 @@
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -354,8 +355,65 @@ public:
 #endif
   }
 
+  /**
+  * `CGAL_TR_PARALLEL_RESOLUTION=1` answers the same question with a parallel
+  * cell scan and an atomic early exit. Off by default.
+  *
+  * The serial loop stops at the FIRST edge that is still too long or too
+  * short, so when the answer is "not yet" it usually costs very little -- and
+  * that is the common case until the last iteration. The parallel arm cannot
+  * stop as promptly: threads already inside a block run on. So this trades a
+  * cheap early exit for parallelism that only pays on the one iteration where
+  * the answer is "yes" and every edge must be examined.
+  */
+  static bool parallel_resolution_enabled()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_PARALLEL_RESOLUTION");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
   bool resolution_reached()
   {
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      if (parallel_resolution_enabled())
+      {
+        std::atomic<bool> done{true};
+        const std::vector<Edge> edges
+          = parallel_collect_finite_edges<Edge>(
+              tr(),
+              [](const Edge& e, std::vector<Edge>& out) { out.push_back(e); });
+
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, edges.size()),
+          [&](const tbb::blocked_range<std::size_t>& r)
+          {
+            if (!done.load(std::memory_order_relaxed))
+              return; // another thread already found one; do not start a block
+            for (std::size_t i = r.begin(); i != r.end(); ++i)
+            {
+              const Edge& e = edges[i];
+              const bool boundary =
+                m_c3t3.is_in_complex(e) || is_boundary(m_c3t3, e, m_cell_selector);
+              if (m_protect_boundaries && boundary)
+                continue;
+              if (is_too_long(e, boundary, m_sizing, m_c3t3, m_cell_selector)
+               || is_too_short(e, boundary, m_sizing, m_c3t3, m_cell_selector))
+              {
+                done.store(false, std::memory_order_relaxed);
+                return;
+              }
+            }
+          });
+        return done.load();
+      }
+    }
+#endif
+
     for (const Edge& e : tr().finite_edges())
     {
       // skip protected edges
