@@ -249,6 +249,16 @@ private:
   * changes as it runs and is drained from a priority queue that the collapses
   * themselves push back into, which grouping cannot express.
   */
+  static bool kd_ordered_enabled()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_KD_ORDERED");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
   static bool bucket_ordered_enabled()
   {
     static const bool enabled = []
@@ -262,6 +272,18 @@ private:
   static void run_ordered(std::vector<Element_type>& candidates,
                           Operation& op, C3t3& c3t3)
   {
+    // R2 measured grouping the ordered elements by a uniform grid: -7.170%,
+    // because grouping keeps the order only WITHIN a bucket and split depends
+    // on the global longest-first order. `CGAL_TR_KD_ORDERED=1` asks whether
+    // equal-count buckets change that answer -- they fixed the unordered case
+    // -- or whether the loss is the lost ordering rather than the lopsided
+    // buckets. Both off by default.
+    if (kd_ordered_enabled())
+    {
+      std::vector<std::vector<Element_type> > parts = kd_partition(candidates, op);
+      return run_parts(parts, op, c3t3);
+    }
+
     if (bucket_ordered_enabled())
     {
       Buckets buckets = bucket_by_grid(candidates, op, c3t3);

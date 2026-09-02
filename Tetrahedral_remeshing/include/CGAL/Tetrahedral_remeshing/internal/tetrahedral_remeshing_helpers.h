@@ -999,21 +999,51 @@ bool is_boundary_edge(const typename C3t3::Edge& e,
   return result;
 }
 
+inline bool small_vector_facets_enabled()
+{
+  static const bool enabled = []
+    {
+      const char* const e = std::getenv("CGAL_TR_SMALL_VECTOR_FACETS");
+      return (e != nullptr) && (std::atoi(e) != 0);
+    }();
+  return enabled;
+}
+
 template<typename C3t3, typename CellSelector>
 bool is_boundary_vertex(const typename C3t3::Vertex_handle& v,
                         const C3t3& c3t3,
                         CellSelector cell_selector)
 {
   typedef typename C3t3::Facet Facet;
-  std::vector<Facet> facets;
-  c3t3.triangulation().incident_facets(v, std::back_inserter(facets));
+  // The incident facets of one vertex are few, so the vector that holds them
+  // is a heap allocation per call for nothing. `CGAL_TR_SMALL_VECTOR_FACETS=1`
+  // keeps them inline instead. Off by default; both paths are the same loop.
+  boost::container::small_vector<Facet, 64> small_facets;
+  std::vector<Facet> heap_facets;
+  const bool inline_storage = small_vector_facets_enabled();
+  if (inline_storage)
+    c3t3.triangulation().incident_facets(v, std::back_inserter(small_facets));
+  else
+    c3t3.triangulation().incident_facets(v, std::back_inserter(heap_facets));
 
-  for(const Facet& f : facets)
+  const auto examine = [&](const Facet& f) -> bool
   {
     if (c3t3.is_in_complex(f))
       return true;
     if (get(cell_selector, f.first) ^ get(cell_selector, f.first->neighbor(f.second)))
       return true;
+    return false;
+  };
+
+  if (inline_storage)
+  {
+    for (const Facet& f : small_facets)
+      if (examine(f)) return true;
+  }
+  else
+  {
+    for (const Facet& f : heap_facets)
+      if (examine(f)) return true;
   }
   return false;
 }
