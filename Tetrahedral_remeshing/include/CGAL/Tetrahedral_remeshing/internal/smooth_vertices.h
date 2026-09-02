@@ -135,19 +135,8 @@ public:
   * view of `finite_edges()`, so walking it re-scans every finite edge to keep
   * the few that are in the complex. Since the edges are being collected
   * anyway, the subset costs one `is_in_complex` per edge and no extra pass.
-  * `CGAL_TR_CACHE_COMPLEX_EDGES=1` uses it; off by default.
   */
   std::vector<typename Tr::Edge> m_complex_edges{};
-
-  static bool cache_complex_edges()
-  {
-    static const bool enabled = []
-      {
-        const char* const e = std::getenv("CGAL_TR_CACHE_COMPLEX_EDGES");
-        return (e != nullptr) && (std::atoi(e) != 0);
-      }();
-    return enabled;
-  }
 
   /** Collects the finite edges, and the complex subset with them. */
   void ensure_edges(const C3t3& c3t3)
@@ -157,7 +146,7 @@ public:
     for (const typename Tr::Edge& e : c3t3.triangulation().finite_edges())
     {
       m_finite_edges.push_back(e);
-      if (cache_complex_edges() && c3t3.is_in_complex(e))
+      if (c3t3.is_in_complex(e))
         m_complex_edges.push_back(e);
     }
   }
@@ -830,20 +819,7 @@ public:
     moves.assign(nbv, default_move);
 
     //collect neighbors
-    const auto complex_edge_range = [&]() -> std::vector<Edge>
-    {
-      if (!m_context->cache_complex_edges())
-      {
-        std::vector<Edge> all;
-        for (const Edge& e : c3t3.edges_in_complex())
-          all.push_back(e);
-        return all;
-      }
-      return {}; // the cache is used directly below
-    }();
-    const std::vector<Edge>& complex_edges
-      = m_context->cache_complex_edges() ? m_context->complex_edges(c3t3)
-                                         : complex_edge_range;
+    const std::vector<Edge>& complex_edges = m_context->complex_edges(c3t3);
 
     for (const Edge& e : complex_edges)
     {

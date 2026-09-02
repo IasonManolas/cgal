@@ -38,7 +38,6 @@
 #include <iterator>
 #include <cstdlib>
 #include <functional>
-#include <random>
 #include <type_traits>
 #include <unordered_map>
 #include <vector>
@@ -250,21 +249,6 @@ private:
   * changes as it runs and is drained from a priority queue that the collapses
   * themselves push back into, which grouping cannot express.
   */
-  /**
-  * Both arms live in one binary, selected at run time, so that comparing them
-  * compares the grouping and not two compilations (POLICY 0.2). Unset means
-  * grouped; `CGAL_TR_BUCKET_UNORDERED=0` restores the shuffle.
-  */
-  static bool bucket_unordered_enabled()
-  {
-    static const bool enabled = []
-      {
-        const char* const e = std::getenv("CGAL_TR_BUCKET_UNORDERED");
-        return (e == nullptr) || (std::atoi(e) != 0);
-      }();
-    return enabled;
-  }
-
   static bool bucket_ordered_enabled()
   {
     static const bool enabled = []
@@ -342,28 +326,6 @@ private:
         .push_back(element);
     }
     return buckets;
-  }
-
-  /**
-  * `CGAL_TR_KD_BUCKETS=1` partitions the elements into equal-count buckets by
-  * recursive median split instead of by a uniform grid. Off by default.
-  *
-  * The uniform grid groups by *position*, so on a mesh whose density is uneven
-  * the buckets are lopsided: one bucket can hold most of the elements, and
-  * since a bucket is one task, that bucket serializes the phase while the
-  * other threads sit idle. Splitting at the median instead makes every bucket
-  * hold the same NUMBER of elements, which is what the threads actually have
-  * to chew through, while keeping them spatially compact because each split is
-  * along a coordinate.
-  */
-  static bool kd_buckets_enabled()
-  {
-    static const bool enabled = []
-      {
-        const char* const e = std::getenv("CGAL_TR_KD_BUCKETS");
-        return (e != nullptr) && (std::atoi(e) != 0);
-      }();
-    return enabled;
   }
 
   /**
@@ -462,44 +424,21 @@ private:
                            });
   }
 
-  // The shuffle the grouping replaced: spread the threads over the
-  // triangulation by chance rather than by construction.
-  static void run_unordered_shuffled(std::vector<Element_type>& candidates,
-                                     Operation& op, C3t3& c3t3)
-  {
-    std::mt19937 gen(std::random_device{}());
-    std::shuffle(candidates.begin(), candidates.end(), gen);
-
-    tbb::parallel_for_each(candidates,
-                           [&](const Element_type& element)
-                           {
-                             apply_one(element, op, c3t3);
-                           });
-  }
-
   /**
-  * Groups the elements by grid cell and runs one bucket per task. Elements in
-  * a bucket are close together, so a thread that has just locked one zone is
-  * likely to find the next adjacent rather than contended, and two threads are
-  * usually working in different regions.
+  * Partitions the elements into equal-count buckets and runs one per task.
+  * Elements in a bucket are close together, so a thread that has just locked
+  * one zone tends to find the next adjacent rather than contended, and two
+  * threads are usually working in different regions. Buckets hold equal
+  * COUNTS rather than equal volumes, which is what keeps the threads busy for
+  * the same length of time: grouping by position instead was measured and
+  * superseded, because an unevenly dense mesh gave one oversized bucket that
+  * serialized the phase.
   */
   static void run_unordered(std::vector<Element_type>& candidates,
                             Operation& op, C3t3& c3t3)
   {
-    if (!bucket_unordered_enabled())
-      return run_unordered_shuffled(candidates, op, c3t3);
-
-    if (kd_buckets_enabled())
-    {
-      std::vector<std::vector<Element_type> > parts = kd_partition(candidates, op);
-      return run_parts(parts, op, c3t3);
-    }
-
-    Buckets buckets = bucket_by_grid(candidates, op, c3t3);
-    if (buckets.empty()) // degenerate bounding box
-      return run_unordered_shuffled(candidates, op, c3t3);
-
-    run_buckets(buckets, op, c3t3);
+    std::vector<std::vector<Element_type> > parts = kd_partition(candidates, op);
+    run_parts(parts, op, c3t3);
   }
 };
 #endif // CGAL_LINKED_WITH_TBB
