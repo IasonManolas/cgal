@@ -32,6 +32,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <unordered_map>
+#include <cstdlib>
 #include <vector>
 #include <cmath>
 #include <list>
@@ -119,6 +120,41 @@ public:
   std::vector<Move> m_moves{};
   FT m_total_move{0};
 
+  /**
+  * The finite edges, collected once per smoothing phase. Both the surface and
+  * the internal preprocessing pass walk every finite edge, doing different
+  * work with each; smoothing moves vertices but never changes connectivity,
+  * so the edge set is the same for both and there is no reason to enumerate
+  * it twice. Filled in phase order, so the accumulation into m_moves adds in
+  * the same sequence as before -- these are floating-point sums.
+  * `CGAL_TR_SHARE_SMOOTH_SCAN=1` uses it; off by default.
+  */
+  std::vector<typename Tr::Edge> m_finite_edges{};
+
+  static bool share_smooth_scan()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_SHARE_SMOOTH_SCAN");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  /** The edges to walk in a preprocessing pass: the cache, or a fresh walk. */
+  const std::vector<typename Tr::Edge>& finite_edges(const C3t3& c3t3)
+  {
+    if (!share_smooth_scan() || m_finite_edges.empty())
+    {
+      m_finite_edges.clear();
+      for (const typename Tr::Edge& e : c3t3.triangulation().finite_edges())
+        m_finite_edges.push_back(e);
+    }
+    return m_finite_edges;
+  }
+
+  void clear_finite_edges() { m_finite_edges.clear(); }
+
   Vertex_smoothing_context(C3t3& c3t3,
                            const SizingFunction& sizing,
                            const CellSelector& cell_selector,
@@ -148,6 +184,11 @@ public:
 
   void refresh(C3t3& c3t3)
   {
+    // Split, collapse and flip ran since the last smoothing phase, so the edge
+    // set the cache holds is stale. Dropped here rather than in the passes,
+    // which must share one enumeration between them.
+    clear_finite_edges();
+
     if (!m_protect_boundaries)
     {
       collect_vertices_surface_indices(c3t3);
@@ -844,7 +885,7 @@ private:
     const Move default_move{CGAL::NULL_VECTOR, 0/*neighbors*/, 0./*mass*/};
     moves.assign(nbv, default_move);
 
-    for (const Edge& e : tr.finite_edges())
+    for (const Edge& e : m_context->finite_edges(c3t3))
     {
       if (!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector))
       {
@@ -1109,7 +1150,7 @@ public:
     moves.assign(nbv, default_move);
     /*for dim 3 vertices, start counting neighbors directly from 0*/
 
-    for (const Edge& e : tr.finite_edges())
+    for (const Edge& e : m_context->finite_edges(c3t3))
     {
       if (is_outside(e, c3t3, m_context->m_cell_selector))
         continue;
