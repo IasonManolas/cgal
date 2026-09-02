@@ -130,16 +130,52 @@ public:
   */
   std::vector<typename Tr::Edge> m_finite_edges{};
 
+  /**
+  * The complex (1-D feature) edges. `c3t3.edges_in_complex()` is a filtered
+  * view of `finite_edges()`, so walking it re-scans every finite edge to keep
+  * the few that are in the complex. Since the edges are being collected
+  * anyway, the subset costs one `is_in_complex` per edge and no extra pass.
+  * `CGAL_TR_CACHE_COMPLEX_EDGES=1` uses it; off by default.
+  */
+  std::vector<typename Tr::Edge> m_complex_edges{};
+
+  static bool cache_complex_edges()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_CACHE_COMPLEX_EDGES");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  /** Collects the finite edges, and the complex subset with them. */
+  void ensure_edges(const C3t3& c3t3)
+  {
+    if (!m_finite_edges.empty())
+      return;
+    for (const typename Tr::Edge& e : c3t3.triangulation().finite_edges())
+    {
+      m_finite_edges.push_back(e);
+      if (cache_complex_edges() && c3t3.is_in_complex(e))
+        m_complex_edges.push_back(e);
+    }
+  }
+
   /** The edges to walk in a preprocessing pass, collected on first use. */
   const std::vector<typename Tr::Edge>& finite_edges(const C3t3& c3t3)
   {
-    if (m_finite_edges.empty())
-      for (const typename Tr::Edge& e : c3t3.triangulation().finite_edges())
-        m_finite_edges.push_back(e);
+    ensure_edges(c3t3);
     return m_finite_edges;
   }
 
-  void clear_finite_edges() { m_finite_edges.clear(); }
+  const std::vector<typename Tr::Edge>& complex_edges(const C3t3& c3t3)
+  {
+    ensure_edges(c3t3);
+    return m_complex_edges;
+  }
+
+  void clear_finite_edges() { m_finite_edges.clear(); m_complex_edges.clear(); }
 
   Vertex_smoothing_context(C3t3& c3t3,
                            const SizingFunction& sizing,
@@ -794,7 +830,22 @@ public:
     moves.assign(nbv, default_move);
 
     //collect neighbors
-    for (const Edge& e : c3t3.edges_in_complex())
+    const auto complex_edge_range = [&]() -> std::vector<Edge>
+    {
+      if (!m_context->cache_complex_edges())
+      {
+        std::vector<Edge> all;
+        for (const Edge& e : c3t3.edges_in_complex())
+          all.push_back(e);
+        return all;
+      }
+      return {}; // the cache is used directly below
+    }();
+    const std::vector<Edge>& complex_edges
+      = m_context->cache_complex_edges() ? m_context->complex_edges(c3t3)
+                                         : complex_edge_range;
+
+    for (const Edge& e : complex_edges)
     {
       const Vertex_handle vh0 = e.first->vertex(e.second);
       const Vertex_handle vh1 = e.first->vertex(e.third);
