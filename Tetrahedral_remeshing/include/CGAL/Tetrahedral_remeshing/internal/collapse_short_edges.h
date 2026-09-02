@@ -24,6 +24,7 @@
 #include <boost/functional/hash.hpp>
 #include <boost/unordered_set.hpp>
 
+#include <cstdlib>
 #include <vector>
 #include <algorithm>
 #include <unordered_map>
@@ -39,6 +40,7 @@
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/concurrent_unordered_set.h>
+#include <boost/unordered/concurrent_flat_map.hpp>
 #include <tbb/concurrent_priority_queue.h>
 #include <tbb/concurrent_queue.h>
 #include <tbb/parallel_for.h>
@@ -1502,11 +1504,37 @@ auto can_be_collapsed(const typename C3T3::Edge& e,
 template<typename VertexHandle>
 class Deleted_vertices
 {
+  // tbb::concurrent_unordered_set is a split-ordered linked list, so clearing
+  // it walks N scattered nodes and frees them one at a time, on one thread, at
+  // the end of every collapse phase. boost::concurrent_flat_map is open
+  // addressed and frees one contiguous block instead.
+  // `CGAL_TR_FLAT_DELETED=1` selects it; off by default. Both are present so
+  // that the two arms are one binary (POLICY 0.2); only one is ever filled.
   tbb::concurrent_unordered_set<VertexHandle, boost::hash<VertexHandle> > m_vertices;
+  boost::concurrent_flat_map<VertexHandle, bool, boost::hash<VertexHandle> > m_flat;
+
+  static bool use_flat()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_FLAT_DELETED");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
 
 public:
-  void insert(VertexHandle v) { m_vertices.insert(v); }
-  bool contains(VertexHandle v) const { return m_vertices.find(v) != m_vertices.end(); }
+  void insert(VertexHandle v)
+  {
+    if (use_flat()) m_flat.emplace(v, true);
+    else            m_vertices.insert(v);
+  }
+
+  bool contains(VertexHandle v) const
+  {
+    if (use_flat()) return m_flat.contains(v);
+    return m_vertices.find(v) != m_vertices.end();
+  }
 };
 
 /**
