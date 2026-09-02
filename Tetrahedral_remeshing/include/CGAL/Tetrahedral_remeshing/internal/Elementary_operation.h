@@ -35,6 +35,7 @@
 #include <string>
 #include <thread>
 #include <cmath>
+#include <iterator>
 #include <cstdlib>
 #include <functional>
 #include <random>
@@ -343,6 +344,113 @@ private:
     return buckets;
   }
 
+  /**
+  * `CGAL_TR_KD_BUCKETS=1` partitions the elements into equal-count buckets by
+  * recursive median split instead of by a uniform grid. Off by default.
+  *
+  * The uniform grid groups by *position*, so on a mesh whose density is uneven
+  * the buckets are lopsided: one bucket can hold most of the elements, and
+  * since a bucket is one task, that bucket serializes the phase while the
+  * other threads sit idle. Splitting at the median instead makes every bucket
+  * hold the same NUMBER of elements, which is what the threads actually have
+  * to chew through, while keeping them spatially compact because each split is
+  * along a coordinate.
+  */
+  static bool kd_buckets_enabled()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_KD_BUCKETS");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  /**
+  * Splits `range` at the median of its widest extent, recursively, until there
+  * are at least `target` parts. Each part is appended to `out`.
+  */
+  static void kd_split(typename std::vector<Element_type>::iterator first,
+                       typename std::vector<Element_type>::iterator last,
+                       const Operation& op, std::size_t target,
+                       std::vector<std::vector<Element_type> >& out)
+  {
+    const std::size_t n = static_cast<std::size_t>(std::distance(first, last));
+    if (n == 0)
+      return;
+    if (target <= 1 || n < 2)
+    {
+      out.emplace_back(first, last);
+      return;
+    }
+
+    // widest coordinate extent decides the split axis
+    double lo[3] = { HUGE_VAL, HUGE_VAL, HUGE_VAL };
+    double hi[3] = { -HUGE_VAL, -HUGE_VAL, -HUGE_VAL };
+    for (auto it = first; it != last; ++it)
+    {
+      const auto p = op.point_on_element(*it);
+      const double c[3] = { CGAL::to_double(p.x()),
+                            CGAL::to_double(p.y()),
+                            CGAL::to_double(p.z()) };
+      for (int a = 0; a < 3; ++a)
+      {
+        lo[a] = (std::min)(lo[a], c[a]);
+        hi[a] = (std::max)(hi[a], c[a]);
+      }
+    }
+    int axis = 0;
+    for (int a = 1; a < 3; ++a)
+      if (hi[a] - lo[a] > hi[axis] - lo[axis])
+        axis = a;
+
+    if (!(hi[axis] > lo[axis])) // all in one place: nothing to split by
+    {
+      out.emplace_back(first, last);
+      return;
+    }
+
+    const auto coord = [&](const Element_type& e)
+    {
+      const auto p = op.point_on_element(e);
+      return (axis == 0) ? CGAL::to_double(p.x())
+           : (axis == 1) ? CGAL::to_double(p.y())
+                         : CGAL::to_double(p.z());
+    };
+
+    const auto mid = first + static_cast<std::ptrdiff_t>(n / 2);
+    std::nth_element(first, mid, last,
+                     [&](const Element_type& a, const Element_type& b)
+                     { return coord(a) < coord(b); });
+
+    kd_split(first, mid, op, target / 2, out);
+    kd_split(mid, last, op, target - target / 2, out);
+  }
+
+  static std::vector<std::vector<Element_type> >
+  kd_partition(std::vector<Element_type>& candidates, const Operation& op)
+  {
+    // four buckets per thread, so work-stealing has something to steal
+    const std::size_t target =
+      4 * static_cast<std::size_t>((std::max)(1, tbb::this_task_arena::max_concurrency()));
+
+    std::vector<std::vector<Element_type> > parts;
+    parts.reserve(target);
+    kd_split(candidates.begin(), candidates.end(), op, target, parts);
+    return parts;
+  }
+
+  static void run_parts(std::vector<std::vector<Element_type> >& parts,
+                        Operation& op, C3t3& c3t3)
+  {
+    tbb::parallel_for_each(parts.begin(), parts.end(),
+                           [&](const std::vector<Element_type>& part)
+                           {
+                             for (const Element_type& element : part)
+                               apply_one(element, op, c3t3);
+                           });
+  }
+
   static void run_buckets(Buckets& buckets, Operation& op, C3t3& c3t3)
   {
     tbb::parallel_for_each(buckets.begin(), buckets.end(),
@@ -380,6 +488,12 @@ private:
   {
     if (!bucket_unordered_enabled())
       return run_unordered_shuffled(candidates, op, c3t3);
+
+    if (kd_buckets_enabled())
+    {
+      std::vector<std::vector<Element_type> > parts = kd_partition(candidates, op);
+      return run_parts(parts, op, c3t3);
+    }
 
     Buckets buckets = bucket_by_grid(candidates, op, c3t3);
     if (buckets.empty()) // degenerate bounding box
