@@ -397,16 +397,34 @@ public:
     std::vector<Long_edge_with_length> long_edges_with_lengths;
     const Tr& tr = c3t3.triangulation();
 
-    for (Edge e : tr.finite_edges())
+    // The test applied to each edge, shared by the serial walk and the
+    // parallel cell scan so the two collect exactly the same set.
+    const auto keep = [&](const Edge& e, std::vector<Long_edge_with_length>& out)
     {
       auto [splittable, boundary] = can_be_split(e, c3t3, m_protect_boundaries, m_cell_selector);
       if (!splittable)
-        continue;
+        return;
 
       const std::optional<FT> sqlen = is_too_long(e, boundary, m_sizing, c3t3, m_cell_selector);
       if (sqlen != std::nullopt)
-        long_edges_with_lengths.push_back(Long_edge_with_length{e, sqlen.value()});
+        out.push_back(Long_edge_with_length{e, sqlen.value()});
+    };
+
+    bool collected = false;
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      if (parallel_collect_enabled())
+      {
+        long_edges_with_lengths
+          = parallel_collect_finite_edges<Long_edge_with_length>(tr, keep);
+        collected = true; // an empty result is a result, not a fallback
+      }
     }
+#endif
+    if (!collected)
+      for (Edge e : tr.finite_edges())
+        keep(e, long_edges_with_lengths);
 
     // longest first; stable to match the original bimap's ordering
     std::stable_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(),

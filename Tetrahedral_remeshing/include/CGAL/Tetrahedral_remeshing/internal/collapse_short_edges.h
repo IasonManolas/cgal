@@ -1581,8 +1581,41 @@ public:
   Element_range get_elements(const C3t3& c3t3) const override
   {
     Short_edges short_edges;
+    const Tr& tr = c3t3.triangulation();
+
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      if (parallel_collect_enabled())
+      {
+        // The patch cache is deliberately not shared here: it is a plain map,
+        // and the point of this arm is that the threads share nothing.
+        using Edge_with_length = std::pair<Edge, FT>;
+        const std::vector<Edge_with_length> found
+          = parallel_collect_finite_edges<Edge_with_length>(
+              tr,
+              [&](const Edge& e, std::vector<Edge_with_length>& out)
+              {
+                auto [collapsible, boundary]
+                  = can_be_collapsed(e, c3t3, m_protect_boundaries, m_cell_selector);
+                if (!collapsible)
+                  return;
+                const auto sqlen = is_too_short(e, boundary, m_sizing, c3t3, m_cell_selector);
+                if (sqlen != std::nullopt)
+                  out.emplace_back(e, sqlen.value());
+              });
+
+        // The bimap is filled serially: it is the work list, and its order is
+        // what decides what runs next.
+        for (const Edge_with_length& el : found)
+          short_edges.insert(typename Short_edges::value_type(el.first, el.second));
+        return short_edges;
+      }
+    }
+#endif
+
     Vertex_patch_cache<C3t3> patch_cache;
-    for (const Edge& e : c3t3.triangulation().finite_edges())
+    for (const Edge& e : tr.finite_edges())
     {
       auto [collapsible, boundary]
         = can_be_collapsed(e, c3t3, m_protect_boundaries, m_cell_selector, &patch_cache);

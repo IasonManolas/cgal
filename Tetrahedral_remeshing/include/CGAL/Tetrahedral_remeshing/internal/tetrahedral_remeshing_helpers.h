@@ -15,9 +15,17 @@
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
+#include <cstdlib>
 #include <map>
 #include <mutex>
 #include <string>
+#include <vector>
+
+#ifdef CGAL_LINKED_WITH_TBB
+#include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
+#include <tbb/parallel_for.h>
+#endif
 
 #include <utility>
 #include <array>
@@ -47,6 +55,86 @@ namespace Tetrahedral_remeshing
 {
 namespace internal
 {
+
+#ifdef CGAL_LINKED_WITH_TBB
+/**
+* Enumerates the finite edges in parallel by scanning cells instead of walking
+* the `finite_edges()` iterator, and collects whatever the callback appends.
+*
+* Every finite edge is visited exactly once, by its canonical cell -- the one
+* with the smallest handle among the cells around it -- so no shared
+* deduplication structure is needed and the threads never write to the same
+* place. `fn(e, local)` appends to a thread-local vector; the per-thread
+* vectors are concatenated at the end.
+*
+* The triangulation must not be modified during the call. Every use here is
+* candidate collection or preprocessing, which happens before the parallel
+* phase begins.
+*/
+template<typename T, typename Tr, typename Fn>
+std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
+{
+  using Cell_handle = typename Tr::Cell_handle;
+  using Edge = typename Tr::Edge;
+  using Cell_circulator = typename Tr::Cell_circulator;
+
+  std::vector<Cell_handle> cells;
+  cells.reserve(tr.number_of_finite_cells() + 64);
+  for (auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+    cells.push_back(cit);
+
+  static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+  tbb::enumerable_thread_specific<std::vector<T> > tl;
+  tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+    [&](const tbb::blocked_range<std::size_t>& range)
+    {
+      std::vector<T>& local = tl.local();
+      for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
+      {
+        const Cell_handle c = cells[ci];
+        for (int s = 0; s < 6; ++s)
+        {
+          const Edge e(c, edge_slots[s][0], edge_slots[s][1]);
+          if (tr.is_infinite(e))
+            continue;
+          // c owns the edge only if no cell around it has a smaller handle
+          Cell_circulator ccir = tr.incident_cells(e);
+          do { ++ccir; } while (c < Cell_handle(ccir));
+          if (Cell_handle(ccir) != c)
+            continue;
+          fn(e, local);
+        }
+      }
+    });
+
+  std::vector<T> out;
+  std::size_t n = 0;
+  tl.combine_each([&n](const std::vector<T>& v) { n += v.size(); });
+  out.reserve(n);
+  tl.combine_each([&out](const std::vector<T>& v)
+                  { out.insert(out.end(), v.begin(), v.end()); });
+  return out;
+}
+
+/**
+* `CGAL_TR_PARALLEL_COLLECT=1` collects the candidates of an operation with
+* the cell scan above instead of walking `finite_edges()` serially. Off by
+* default: the scan visits every cell and tests ownership per edge, which is
+* more total work than the serial walk, traded against running on every
+* thread. Both arms in one binary (POLICY 0.2).
+*/
+inline bool parallel_collect_enabled()
+{
+  static const bool enabled = []
+    {
+      const char* const e = std::getenv("CGAL_TR_PARALLEL_COLLECT");
+      return (e != nullptr) && (std::atoi(e) != 0);
+    }();
+  return enabled;
+}
+#endif // CGAL_LINKED_WITH_TBB
+
 // ---------------------------------------------------------------------------
 // Lock-ownership probe for the parallel collapse.  Diagnostic only, built with
 // -DCGAL_TR_LOCK_PROBE.
