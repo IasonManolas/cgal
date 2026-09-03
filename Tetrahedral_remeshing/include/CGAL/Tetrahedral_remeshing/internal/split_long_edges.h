@@ -414,12 +414,9 @@ public:
 #ifdef CGAL_LINKED_WITH_TBB
     if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
     {
-      if (parallel_collect_enabled())
-      {
-        long_edges_with_lengths
-          = parallel_collect_finite_edges<Long_edge_with_length>(tr, keep);
-        collected = true; // an empty result is a result, not a fallback
-      }
+      long_edges_with_lengths
+        = parallel_collect_finite_edges<Long_edge_with_length>(tr, keep);
+      collected = true; // an empty result is a result, not a fallback
     }
 #endif
     if (!collected)

@@ -117,22 +117,6 @@ std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
   return out;
 }
 
-/**
-* `CGAL_TR_PARALLEL_COLLECT=1` collects the candidates of an operation with
-* the cell scan above instead of walking `finite_edges()` serially. Off by
-* default: the scan visits every cell and tests ownership per edge, which is
-* more total work than the serial walk, traded against running on every
-* thread. Both arms in one binary (POLICY 0.2).
-*/
-inline bool parallel_collect_enabled()
-{
-  static const bool enabled = []
-    {
-      const char* const e = std::getenv("CGAL_TR_PARALLEL_COLLECT");
-      return (e != nullptr) && (std::atoi(e) != 0);
-    }();
-  return enabled;
-}
 #endif // CGAL_LINKED_WITH_TBB
 
 // ---------------------------------------------------------------------------

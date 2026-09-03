@@ -1592,10 +1592,9 @@ public:
 #ifdef CGAL_LINKED_WITH_TBB
     if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
     {
-      if (parallel_collect_enabled())
       {
         // The patch cache is deliberately not shared here: it is a plain map,
-        // and the point of this arm is that the threads share nothing.
+        // and the threads sharing nothing is the point.
         using Edge_with_length = std::pair<Edge, FT>;
         const std::vector<Edge_with_length> found
           = parallel_collect_finite_edges<Edge_with_length>(
