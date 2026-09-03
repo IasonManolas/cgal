@@ -567,6 +567,15 @@ private:
                                  Operation& op, C3t3& c3t3)
   {
     op.execute_operation(element, c3t3);
+
+    // The ZONE lock is what is elided, not every lock. The operation still
+    // takes locks of its own -- smoothing locks the point it moves the vertex
+    // to, and each intermediate position it tries on the way -- and those are
+    // released here exactly as on the locked path. Without this a thread keeps
+    // every grid cell it ever touched, and once it holds enough of them the
+    // others cannot make progress: measured as a 6.2 second run still going
+    // after 17 minutes.
+    c3t3.triangulation().unlock_all_elements();
   }
 
   static void run_parts(std::vector<std::vector<Element_type> >& parts,
