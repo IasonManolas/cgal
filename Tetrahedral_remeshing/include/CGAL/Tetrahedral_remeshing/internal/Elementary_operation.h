@@ -23,6 +23,9 @@
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_queue.h>
 #include <tbb/concurrent_unordered_map.h>
+#include <boost/container/small_vector.hpp>
+#include <boost/functional/hash.hpp>
+#include <boost/unordered/concurrent_flat_map.hpp>
 #include <tbb/concurrent_unordered_set.h>
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_for_each.h>
@@ -424,16 +427,243 @@ private:
     return parts;
   }
 
+  /**
+  * `CGAL_TR_ELIDE_INTERIOR_LOCKS=1` lets an element whose lock zone cannot be
+  * reached by any other bucket run without taking any lock. Off by default.
+  *
+  * The classification is topological, not geometric. Tag each element's locked
+  * vertices with the bucket that owns them, MIXED if two buckets do. A cell
+  * whose tagged vertices span more than one bucket is shared, so flag all four
+  * of its vertices as boundary-touching. An element is interior when none of
+  * its locked vertices is flagged: every cell around those vertices then
+  * belongs to one bucket, and since a bucket is one task, no other thread can
+  * be inside that zone.
+  *
+  * The argument covers the ONE-RING of the locked vertices, and it is only
+  * valid for an operation whose write footprint is that one-ring. Smoothing
+  * qualifies: it writes the vertex and re-checks the orientation of the cells
+  * incident to it. Flip does NOT -- it re-stitches the mirror cells across the
+  * star's outer facets, which live in the two-ring, which is exactly why
+  * lock_flip_zone() locks the star's neighbours as well. An operation that
+  * does not opt in returns no locked vertices and always takes its locks.
+  */
+  static bool elide_interior_locks()
+  {
+    static const bool enabled = []
+      {
+        const char* const e = std::getenv("CGAL_TR_ELIDE_INTERIOR_LOCKS");
+        return (e != nullptr) && (std::atoi(e) != 0);
+      }();
+    return enabled;
+  }
+
+  using Vertex_handle = typename C3t3::Triangulation::Vertex_handle;
+  using Interior_set = boost::concurrent_flat_map<Vertex_handle, char,
+                                                  boost::hash<Vertex_handle> >;
+
+  /**
+  * Returns the vertices that are safe to work around without locking, or an
+  * empty map if the operation does not support elision or it is switched off.
+  */
+  static Interior_set classify_interior(
+      const std::vector<std::vector<Element_type> >& parts,
+      const Operation& op, const C3t3& c3t3)
+  {
+    Interior_set interior;
+    if (!elide_interior_locks())
+      return interior;
+
+    boost::container::small_vector<Vertex_handle, 2> probe;
+    op.locked_vertices(parts.empty() || parts[0].empty()
+                       ? Element_type() : parts[0][0], probe);
+    if (probe.empty())
+      return interior; // operation does not opt in
+
+    static const std::size_t MIXED = static_cast<std::size_t>(-1);
+    boost::concurrent_flat_map<Vertex_handle, std::size_t,
+                               boost::hash<Vertex_handle> > owner;
+
+    // which bucket owns each locked vertex, MIXED if more than one does
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, parts.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        boost::container::small_vector<Vertex_handle, 2> lv;
+        for (std::size_t b = r.begin(); b != r.end(); ++b)
+          for (const Element_type& e : parts[b])
+          {
+            lv.clear();
+            op.locked_vertices(e, lv);
+            for (const Vertex_handle& v : lv)
+              owner.insert_or_visit(std::make_pair(v, b),
+                [b](std::pair<const Vertex_handle, std::size_t>& kv)
+                { if (kv.second != b) kv.second = MIXED; });
+          }
+      });
+
+    // a cell spanning more than one bucket makes all four of its vertices
+    // boundary-touching; untagged vertices own no element and lock nothing
+    std::vector<typename C3t3::Triangulation::Cell_handle> cells;
+    const auto& tr = c3t3.triangulation();
+    cells.reserve(tr.number_of_finite_cells() + 64);
+    for (auto cit = tr.finite_cells_begin(); cit != tr.finite_cells_end(); ++cit)
+      cells.push_back(cit);
+
+    boost::concurrent_flat_map<Vertex_handle, char,
+                               boost::hash<Vertex_handle> > touching;
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        for (std::size_t ci = r.begin(); ci != r.end(); ++ci)
+        {
+          const auto c = cells[ci];
+          std::size_t first = 0;
+          bool have = false, shared = false;
+          for (int k = 0; k < 4; ++k)
+          {
+            std::size_t b = 0;
+            const bool tagged = owner.cvisit(c->vertex(k),
+              [&b](const std::pair<const Vertex_handle, std::size_t>& kv)
+              { b = kv.second; }) > 0;
+            if (!tagged)
+              continue;
+            if (b == MIXED || (have && b != first)) { shared = true; break; }
+            first = b; have = true;
+          }
+          if (shared)
+            for (int k = 0; k < 4; ++k)
+              touching.insert_or_assign(c->vertex(k), char(1));
+        }
+      });
+
+    owner.cvisit_all([&](const std::pair<const Vertex_handle, std::size_t>& kv)
+    {
+      if (kv.second != MIXED && !touching.contains(kv.first))
+        interior.insert_or_assign(kv.first, char(1));
+    });
+    return interior;
+  }
+
+  /** True when every vertex this element locks is bucket-interior. */
+  static bool is_interior(const Element_type& e, const Operation& op,
+                          const Interior_set& interior)
+  {
+    if (interior.empty())
+      return false;
+    boost::container::small_vector<Vertex_handle, 2> lv;
+    op.locked_vertices(e, lv);
+    if (lv.empty())
+      return false;
+    for (const Vertex_handle& v : lv)
+      if (!interior.contains(v))
+        return false;
+    return true;
+  }
+
+  /**
+  * Runs the element without taking its lock zone. Only for an element the
+  * classification says no other bucket can reach.
+  */
+  static void apply_one_unlocked(const Element_type& element,
+                                 Operation& op, C3t3& c3t3)
+  {
+    op.execute_operation(element, c3t3);
+  }
+
   static void run_parts(std::vector<std::vector<Element_type> >& parts,
                         Operation& op, C3t3& c3t3)
   {
+    const Interior_set interior = classify_interior(parts, op, c3t3);
+#ifdef CGAL_TR_ELISION_CHECK
+    check_interior_classification(parts, op, c3t3, interior);
+#endif
+
     tbb::parallel_for_each(parts.begin(), parts.end(),
                            [&](const std::vector<Element_type>& part)
                            {
                              for (const Element_type& element : part)
-                               apply_one(element, op, c3t3);
+                             {
+                               if (is_interior(element, op, interior))
+                                 apply_one_unlocked(element, op, c3t3);
+                               else
+                                 apply_one(element, op, c3t3);
+                             }
                            });
   }
+
+#ifdef CGAL_TR_ELISION_CHECK
+  /**
+  * Checks the property the elision rests on, independently of how it was
+  * derived. The lock probe cannot do this: for an elided element "no lock
+  * held" is correct by design, so a misclassified element and a correctly
+  * elided one look identical to it.
+  *
+  * For every element classified interior, this walks the ACTUAL zone -- the
+  * cells incident to each of its locked vertices -- and requires that every
+  * vertex of every one of those cells is either untagged (owns no element, so
+  * locks nothing) or owned by this same bucket. If that fails, some other
+  * bucket can reach the zone and running it unlocked is a race.
+  *
+  * Serial and timing independent: it runs before the parallel phase, on a mesh
+  * nobody is modifying, so it fires on the first run that misclassifies rather
+  * than on the first run that collides.
+  */
+  static void check_interior_classification(
+      const std::vector<std::vector<Element_type> >& parts,
+      const Operation& op, const C3t3& c3t3, const Interior_set& interior)
+  {
+    if (interior.empty())
+      return;
+
+    // which bucket each element's locked vertices belong to
+    std::unordered_map<Vertex_handle, std::size_t> bucket_of;
+    boost::container::small_vector<Vertex_handle, 2> lv;
+    for (std::size_t b = 0; b < parts.size(); ++b)
+      for (const Element_type& e : parts[b])
+      {
+        lv.clear();
+        op.locked_vertices(e, lv);
+        for (const Vertex_handle& v : lv)
+          bucket_of.emplace(v, b);
+      }
+
+    std::size_t checked = 0, violations = 0;
+    const auto& tr = c3t3.triangulation();
+    for (std::size_t b = 0; b < parts.size(); ++b)
+      for (const Element_type& e : parts[b])
+      {
+        if (!is_interior(e, op, interior))
+          continue;
+        ++checked;
+        lv.clear();
+        op.locked_vertices(e, lv);
+        for (const Vertex_handle& v : lv)
+        {
+          std::vector<typename C3t3::Triangulation::Cell_handle> star;
+          tr.incident_cells(v, std::back_inserter(star));
+          for (const auto& c : star)
+            for (int k = 0; k < 4; ++k)
+            {
+              const auto it = bucket_of.find(c->vertex(k));
+              if (it != bucket_of.end() && it->second != b)
+              {
+                ++violations;
+                std::cerr << "[elision] VIOLATION: element in bucket " << b
+                          << " classified interior, but a cell of its zone has"
+                             " a vertex owned by bucket " << it->second
+                          << std::endl;
+              }
+            }
+        }
+      }
+    std::size_t total = 0;
+    for (const auto& part : parts) total += part.size();
+    std::cerr << "[elision] " << checked << " of " << total
+              << " elements interior ("
+              << (total ? 100.0 * double(checked) / double(total) : 0.0)
+              << "%), " << violations << " zone violations, "
+              << parts.size() << " buckets" << std::endl;
+  }
+#endif
 
   static void run_buckets(Buckets& buckets, Operation& op, C3t3& c3t3)
   {

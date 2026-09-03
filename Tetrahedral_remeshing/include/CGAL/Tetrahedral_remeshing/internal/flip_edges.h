@@ -2021,6 +2021,17 @@ public:
   * the cost of this fix can be measured against the code it replaces, in one
   * binary; it is not a supported setting, because it crashes.
   */
+  /**
+  * Opts out of lock elision. The classification behind it reasons about the
+  * ONE-RING of an element's locked vertices, and a flip's write footprint is
+  * larger than that: it re-stitches the mirror cells across the star's outer
+  * facets, which lie in the two-ring. That is the same footprint
+  * lock_flip_zone() below exists to cover. Returning nothing means the locks
+  * are always taken.
+  */
+  void locked_vertices(const std::pair<Vertex_handle, Vertex_handle>&,
+                       boost::container::small_vector<Vertex_handle, 2>&) const {}
+
   bool lock_flip_zone(const typename C3t3::Triangulation& tr,
                       const Vertex_handle v0, const Vertex_handle v1,
                       Cells_vector& inc0, Cells_vector& inc1) const

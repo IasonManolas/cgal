@@ -731,6 +731,19 @@ public:
       per_edge(e, moves);
   }
 
+  /**
+  * The vertices whose stars this operation locks -- just the one it moves.
+  * Smoothing writes that vertex and re-checks the orientation of the cells
+  * incident to it, so its write footprint IS the one-ring the elision
+  * classification reasons about, and it can opt in.
+  */
+  template<typename Vertex_handle_>
+  void locked_vertices(const Vertex_handle_& v,
+                       boost::container::small_vector<Vertex_handle_, 2>& out) const
+  {
+    out.push_back(v);
+  }
+
   // Where the element sits, for the spatial grouping the parallel executor does.
   template<typename Vertex_handle>
   auto point_on_element(const Vertex_handle& v) const

@@ -512,6 +512,10 @@ public:
     return typename Tr::Geom_traits().construct_point_3_object()(e.first->point());
   }
 
+  // Opts out of lock elision: returning nothing means "always take the locks".
+  void locked_vertices(const Element_type&,
+                       boost::container::small_vector<Vertex_handle, 2>&) const {}
+
   // longest edge first is the point of the ordering built in get_elements()
   static constexpr bool requires_ordered_processing = true;
 
