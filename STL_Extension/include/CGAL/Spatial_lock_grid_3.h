@@ -58,6 +58,42 @@ public:
     return m_tls_grids.local();
   }
 
+  // Additive, for CGAL_TR_DEDUP_ZONE_LOCKS / CGAL_TR_TLS_GRID_HOIST.
+  // A caller that locks a whole zone resolves many vertices to a handful of
+  // distinct grid cells; these let it compute the indices once, deduplicate
+  // them, and lock each one exactly once. The tls overload additionally lets
+  // it hoist the thread-local-grid lookup out of the per-index loop.
+  // Nothing below changes: grid_index() and try_lock(int) are unchanged and
+  // these only expose what was already protected.
+  template <typename P3>
+  int lock_grid_index(const P3& point) const
+  {
+    return grid_index(point);
+  }
+
+  template <typename P3>
+  std::array<int, 3> lock_grid_indices3(const P3& point) const
+  {
+    return get_grid_indices(point);
+  }
+
+  int num_grid_cells_per_axis() const
+  {
+    return m_num_grid_cells_per_axis;
+  }
+
+  template <bool no_spin = false>
+  bool try_lock_index(int cell_index)
+  {
+    return try_lock<no_spin>(cell_index);
+  }
+
+  template <bool no_spin = false>
+  bool try_lock_index(bool* tls_grid, int cell_index)
+  {
+    return tls_grid[cell_index] || try_lock_cell<no_spin>(cell_index);
+  }
+
   void set_bbox(const Bbox_3 &bbox)
   {
     // Compute resolutions

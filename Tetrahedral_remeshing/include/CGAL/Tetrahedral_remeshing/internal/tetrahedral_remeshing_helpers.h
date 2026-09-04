@@ -37,6 +37,7 @@
 #include <CGAL/Vector_3.h>
 #include <CGAL/utility.h>
 #include <CGAL/SMDS_3/internal/indices_management.h>
+#include <CGAL/Tetrahedral_remeshing/internal/Parallel_tuning.h>
 
 #include <CGAL/IO/File_binary_mesh_3.h>
 
@@ -48,6 +49,9 @@
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <optional>
+#include <atomic>
+#include <algorithm>
+#include <iostream>
 
 namespace CGAL
 {
@@ -55,6 +59,134 @@ namespace Tetrahedral_remeshing
 {
 namespace internal
 {
+
+#ifdef CGAL_LINKED_WITH_TBB
+/**
+* Locks the halo of a zone: the cells adjacent to the cells of the two locked
+* stars `cells0` and `cells1`.
+*
+* Why a halo is needed at all: collapsing and flipping both re-stitch the
+* region they rebuild to the cells around it, and in doing so write the
+* neighbour arrays of those cells and call `set_cell()` on their vertices. A
+* thread that does not hold them can have its `v->cell()` rewritten under it.
+*
+* Three ways to take it, selected at run time so both arms live in one binary
+* (POLICY 0.2):
+*
+*  - default: `try_lock_cell()` on every adjacent cell, which locks all four of
+*    its vertices. This is what the code did before.
+*
+*  - `apex_only` (A1/A2): an adjacent cell shares a FACET with its star cell,
+*    so three of its four vertices belong to that star cell and are already
+*    held; the only one that is not is the apex, the vertex opposite the shared
+*    facet -- and the apex is exactly what the re-stitching writes. So locking
+*    the apex alone is the SAME COVERAGE as locking the cell, at one lock
+*    instead of four. This is an identity given the star locks, not an
+*    approximation; the lock probe checks it holds in the built code.
+*
+*  - `dedup` (A3/A4): the vertices of a halo resolve to a handful of distinct
+*    lock-grid cells -- a whole two-ring usually falls in one to eight of the
+*    grid's cells. Compute each vertex's grid index, keep the distinct ones in
+*    a small vector, and lock each index once. A linear scan of <= 32 ints
+*    beats a hash set at this size. `hoist_tls` additionally looks the
+*    thread-local grid up once instead of once per lock.
+*
+* Returns false as soon as one lock fails, exactly as the loop it replaces; the
+* caller unlocks everything and retries.
+*/
+#ifdef CGAL_TR_ZONE_STATS
+// Phase-0 sizing only. Never in a measurement build: these are process-wide
+// atomics on the hot path.
+struct Zone_stats
+{
+  std::atomic<std::size_t> halo_vertex_locks{0};   // calls the default path makes
+  std::atomic<std::size_t> halo_distinct_indices{0}; // distinct grid cells in them
+  std::atomic<std::size_t> zones_locked{0};
+  std::atomic<std::size_t> zone_attempts{0};       // incl. failed attempts
+  static Zone_stats& get() { static Zone_stats z; return z; }
+  ~Zone_stats()
+  {
+    std::cerr << "[zone] halo vertex-lock calls " << halo_vertex_locks
+              << ", distinct grid cells " << halo_distinct_indices
+              << ", dedup ratio "
+              << (halo_distinct_indices ? double(halo_vertex_locks)/double(halo_distinct_indices) : 0.0)
+              << "\n[zone] zones locked " << zones_locked
+              << ", lock_zone attempts " << zone_attempts
+              << ", retry rate "
+              << (zones_locked ? double(zone_attempts)/double(zones_locked) - 1.0 : 0.0)
+              << std::endl;
+  }
+};
+#endif
+
+/**
+* The thread-local lock-grid handle for this zone, or nullptr when the hoist is
+* off (A4). Passing it into `try_lock_and_get_incident_cells()` and
+* `lock_zone_halo()` pays the `enumerable_thread_specific::local()` lookup once
+* per zone instead of once per vertex of every cell in it -- a star walk alone
+* locks four vertices per cell over ~24 cells, twice.
+*/
+template <typename Tr>
+bool* zone_tls(const Tr& tr)
+{
+  return Parallel_tuning::get().star_tls_hoist ? tr.lock_grid_tls() : nullptr;
+}
+
+template <typename Tr, typename CellsVector>
+bool lock_zone_halo(const Tr& tr,
+                    const CellsVector& cells0,
+                    const CellsVector& cells1,
+                    const bool apex_only)
+{
+  using Cell_handle = typename Tr::Cell_handle;
+  const Parallel_tuning& tuning = Parallel_tuning::get();
+
+  // `Spatial_lock_grid_3::try_lock(i)` is `tls_grid[i] || compare_exchange`,
+  // so a cell this thread already holds costs a thread-local lookup and a bit
+  // test. The lookup is `enumerable_thread_specific::local()`, and it is
+  // repeated for EVERY vertex of EVERY cell of the halo -- hundreds of times
+  // per zone. Hoisting it to once per zone is what these two switches do.
+  //
+  // Measured and REJECTED before this: deduplicating the halo's grid indices
+  // into a small_vector and locking each distinct index once. It is redundant
+  // -- `tls_grid[i]` IS the deduplication, at O(1) -- and the linear scan that
+  // replaced it cost 40-70% on the pilot meshes. The redundancy factor of
+  // 65-148x measured by the zone counters is real and is already free.
+  bool* const tls = tuning.halo_tls_hoist ? tr.lock_grid_tls() : nullptr;
+
+  const auto take = [&](const typename Tr::Vertex_handle& v) -> bool
+  {
+    if (tls == nullptr)
+      return tr.try_lock_vertex(v);
+    const int gi = tr.lock_grid_index(v->point());
+    return (gi < 0) ? true : tr.try_lock_grid_index(tls, gi);
+  };
+
+  for (const CellsVector* cells : { &cells0, &cells1 })
+    for (const Cell_handle c : *cells)
+      for (int i = 0; i < 4; ++i)
+      {
+        const Cell_handle n = c->neighbor(i);
+        if (apex_only)
+        {
+          if (!take(n->vertex(n->index(c))))
+            return false;
+        }
+        else if (tls == nullptr)
+        {
+          if (!tr.try_lock_cell(n))
+            return false;
+        }
+        else
+        {
+          for (int k = 0; k < 4; ++k)
+            if (!take(n->vertex(k)))
+              return false;
+        }
+      }
+  return true;
+}
+#endif // CGAL_LINKED_WITH_TBB
 
 #ifdef CGAL_LINKED_WITH_TBB
 /**
@@ -71,6 +203,53 @@ namespace internal
 * candidate collection or preprocessing, which happens before the parallel
 * phase begins.
 */
+/**
+* The facet counterpart of parallel_collect_finite_edges(): visits every finite
+* facet exactly once from a parallel scan over the cells. A facet is shared by
+* two cells, so the one with the smaller handle owns it -- the same canonical
+* rule the edge version uses, and the reason no facet is emitted twice.
+*/
+template<typename T, typename Tr, typename Fn>
+std::vector<T> parallel_collect_finite_facets(const Tr& tr, Fn fn)
+{
+  using Cell_handle = typename Tr::Cell_handle;
+  using Facet = typename Tr::Facet;
+
+  std::vector<Cell_handle> cells;
+  cells.reserve(tr.number_of_finite_cells() + 64);
+  for (auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+    cells.push_back(cit);
+
+  tbb::enumerable_thread_specific<std::vector<T> > tl;
+  tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+    [&](const tbb::blocked_range<std::size_t>& range)
+    {
+      std::vector<T>& local = tl.local();
+      for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
+      {
+        const Cell_handle c = cells[ci];
+        for (int i = 0; i < 4; ++i)
+        {
+          const Facet f(c, i);
+          if (tr.is_infinite(f))
+            continue;
+          const Cell_handle n = c->neighbor(i);
+          if (!tr.is_infinite(n) && n < c)
+            continue;               // the other side owns it
+          fn(f, local);
+        }
+      }
+    });
+
+  std::vector<T> out;
+  std::size_t n = 0;
+  tl.combine_each([&n](const std::vector<T>& v) { n += v.size(); });
+  out.reserve(n);
+  tl.combine_each([&out](const std::vector<T>& v)
+                  { out.insert(out.end(), v.begin(), v.end()); });
+  return out;
+}
+
 template<typename T, typename Tr, typename Fn>
 std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
 {

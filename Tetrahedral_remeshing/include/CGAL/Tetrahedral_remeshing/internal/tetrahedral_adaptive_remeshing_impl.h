@@ -29,11 +29,14 @@
 #include <CGAL/Tetrahedral_remeshing/internal/smooth_vertices.h>
 #include <CGAL/Tetrahedral_remeshing/internal/peel_slivers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/property_maps.h>
+#include <CGAL/Tetrahedral_remeshing/internal/Parallel_tuning.h>
 
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -141,6 +144,39 @@ private:
   }
 
   /**
+  * `CGAL_TR_LOCK_GRID_PER_STAR=k` (A5) sizes the grid from mesh density
+  * instead of a constant.
+  *
+  * The constant is the problem. 8 cells per axis is the Mesh_3 default and is
+  * very coarse here; 128 was measured (R3) and lost 2.18%, because a two-ring
+  * then spans many grid cells, so both the number of locks per zone and the
+  * chance that a moving vertex leaves its cell explode. Neither number is a
+  * function of the mesh, and the region between them was never sampled.
+  *
+  * What should be roughly constant is not cells-per-axis but how many
+  * star-sized neighbourhoods fit in a grid cell. Choose N so that a grid cell
+  * holds about `k` of them, with a mean star of ~24 cells:
+  *
+  *     N = cbrt(finite_cells / (k * 24)),  clamped to [4, 64]
+  *
+  * At 388k cells and k=8 that is N ~ 12; at 1.2M cells, N ~ 17. Both sit in
+  * the region between the two constants that have been tried.
+  */
+  int chosen_lock_grid_size() const
+  {
+    const int per_star = Tetrahedral_remeshing::internal::Parallel_tuning
+                           ::get().lock_grid_per_star;
+    if (per_star <= 0)
+      return lock_grid_size();
+
+    const double target = static_cast<double>(per_star) * 24.0;
+    const double cells = static_cast<double>(
+      m_c3t3.triangulation().number_of_finite_cells());
+    const int n = static_cast<int>(std::cbrt((std::max)(1.0, cells / target)));
+    return std::clamp(n, 4, 64);
+  }
+
+  /**
   * Gives the triangulation the lock grid the parallel executors need. Called
   * once the c3t3 is in place, since the grid is sized from its bounding box.
   */
@@ -151,7 +187,7 @@ private:
     {
       if (m_c3t3.triangulation().get_lock_data_structure() == nullptr)
       {
-        m_lock_ds.emplace(m_c3t3.bbox(), lock_grid_size());
+        m_lock_ds.emplace(m_c3t3.bbox(), chosen_lock_grid_size());
         m_c3t3.triangulation().set_lock_data_structure(std::addressof(*m_lock_ds));
       }
     }
@@ -228,11 +264,121 @@ public:
     return m_c3t3_pbackup != NULL;
   }
 
+  /**
+  * C1 -- one traversal of the finite edges instead of three.
+  *
+  * Each iteration currently enumerates the edge set three times:
+  *
+  *     if (!resolution_reached())   // walk 1: stop at the first bad edge
+  *     { split();                   // walk 2: collect the too-long edges
+  *       collapse(); }              // walk 3: collect the too-short edges
+  *
+  * and each walk re-runs the same per-edge predicates -- is_in_complex,
+  * is_boundary, is_too_long, is_too_short -- over the same edges. Worse,
+  * resolution_reached() is not an independent question: it is exactly "no edge
+  * is too long or too short", so the first walk looks at the very edges the
+  * next two go back to find, and throws them away.
+  *
+  * This runs all three tests in ONE parallel cell scan. `keep` is applied to
+  * every finite edge exactly once and its three results are separated
+  * afterwards. Split and collapse then consume their slice through
+  * set_precollected() rather than scanning again.
+  *
+  * The resolution test is computed independently of can_be_split/
+  * can_be_collapsed rather than inferred from whether the two lists are empty:
+  * those predicates are strictly narrower (an edge can be too long and not
+  * splittable), so inferring it would change the loop's termination.
+  *
+  * This also makes R9 -- the parallel resolution scan, rejected at -0.49%
+  * because a parallel scan cannot early-exit as promptly as the serial one --
+  * free rather than negative: the scan is no longer optional, so the early
+  * exit it gave up was never worth anything here.
+  */
+  using Edge_with_length = std::pair<Edge, FT>;
+  struct Fused_edges
+  {
+    std::vector<Edge_with_length> too_long;
+    std::vector<Edge_with_length> too_short;
+    bool resolution_reached = true;
+  };
+  Fused_edges m_fused;
+  bool m_fused_valid = false;
+
+  void run_fused_edge_pass()
+  {
+    m_fused.too_long.clear();
+    m_fused.too_short.clear();
+    m_fused.resolution_reached = true;
+    m_fused_valid = false;
+
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
+    {
+      struct Rec { Edge e; FT sqlen; unsigned char kind; }; // 1 long, 2 short
+      std::atomic<bool> resolved{true};
+      const Tr& tr = this->tr();
+
+      const std::vector<Rec> found = parallel_collect_finite_edges<Rec>(
+        tr,
+        [&](const Edge& e, std::vector<Rec>& out)
+        {
+          const bool boundary =
+            m_c3t3.is_in_complex(e) || is_boundary(m_c3t3, e, m_cell_selector);
+          if (!(m_protect_boundaries && boundary))
+          {
+            if (is_too_long(e, boundary, m_sizing, m_c3t3, m_cell_selector)
+             || is_too_short(e, boundary, m_sizing, m_c3t3, m_cell_selector))
+              resolved.store(false, std::memory_order_relaxed);
+          }
+
+          {
+            auto [splittable, b] = can_be_split(e, m_c3t3, m_protect_boundaries, m_cell_selector);
+            if (splittable)
+            {
+              const std::optional<FT> sqlen
+                = is_too_long(e, b, m_sizing, m_c3t3, m_cell_selector);
+              if (sqlen != std::nullopt)
+                out.push_back(Rec{e, sqlen.value(), 1});
+            }
+          }
+          {
+            auto [collapsible, b]
+              = can_be_collapsed(e, m_c3t3, m_protect_boundaries, m_cell_selector);
+            if (collapsible)
+            {
+              const auto sqlen = is_too_short(e, b, m_sizing, m_c3t3, m_cell_selector);
+              if (sqlen != std::nullopt)
+                out.push_back(Rec{e, sqlen.value(), 2});
+            }
+          }
+        });
+
+      for (const Rec& r : found)
+      {
+        if (r.kind == 1) m_fused.too_long.emplace_back(r.e, r.sqlen);
+        else             m_fused.too_short.emplace_back(r.e, r.sqlen);
+      }
+      m_fused.resolution_reached = resolved.load();
+      m_fused_valid = true;
+    }
+#endif
+  }
+
+  bool fused_enabled() const
+  {
+    if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
+      return Tetrahedral_remeshing::internal::Parallel_tuning::get().fused_edge_pass;
+    else
+      return false;
+  }
+
   void split()
   {
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_split_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeSplitOp;
     EdgeSplitOp split_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
+    if (m_fused_valid)
+      split_op.set_precollected(&m_fused.too_long);
     Executor<EdgeSplitOp> executor;
     executor.execute(split_op, m_c3t3);
 
@@ -259,6 +405,8 @@ public:
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeCollapseOp;
     EdgeCollapseOp collapse_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
+    if (m_fused_valid)
+      collapse_op.set_precollected(&m_fused.too_short);
     Executor<EdgeCollapseOp> executor;
     executor.execute(collapse_op, m_c3t3);
 
@@ -770,11 +918,30 @@ public:
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
       std::cout << "# Iteration " << it_nb << " #" << std::endl;
 #endif
-      if (!resolution_reached())
+      // D2: the shared spatial subdivision is rebuilt once per iteration, so
+      // every unordered operation in the iteration uses the same regions.
+#ifdef CGAL_LINKED_WITH_TBB
+      if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
+        if (Tetrahedral_remeshing::internal::Parallel_tuning::get().reuse_partition)
+          Tetrahedral_remeshing::internal::Shared_kd_partition::get().reset();
+#endif
+      bool resolved;
+      if (fused_enabled())
+      {
+        run_fused_edge_pass();
+        resolved = m_fused.resolution_reached;
+      }
+      else
+      {
+        m_fused_valid = false;
+        resolved = resolution_reached();
+      }
+      if (!resolved)
       {
         split();
         collapse();
       }
+      m_fused_valid = false;
       flip();
       smooth();
 
@@ -802,6 +969,11 @@ public:
     {
       ++it_nb;
 
+#ifdef CGAL_LINKED_WITH_TBB
+      if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
+        if (Tetrahedral_remeshing::internal::Parallel_tuning::get().reuse_partition)
+          Tetrahedral_remeshing::internal::Shared_kd_partition::get().reset();
+#endif
       flip();
       smooth();
 

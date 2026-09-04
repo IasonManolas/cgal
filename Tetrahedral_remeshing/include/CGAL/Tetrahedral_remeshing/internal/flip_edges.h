@@ -14,6 +14,7 @@
 #define CGAL_INTERNAL_FLIP_EDGES_H
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
+#include <CGAL/Tetrahedral_remeshing/internal/Parallel_tuning.h>
 
 #include <CGAL/Triangulation_utils_3.h>
 #include <CGAL/utility.h>
@@ -314,9 +315,12 @@ Sliver_removal_result flip_3_to_2(typename C3t3::Edge& edge,
         Facet mirror_facet = mirror_facets[it->second];
 
         //Update neighbor
+        CGAL_TR_PROBE_CELL_WRITE(tr, mirror_facet.first,
+                                 "flip: set_neighbor mirror cell");
         mirror_facet.first->set_neighbor(mirror_facet.second, ch);
         ch->set_neighbor(v, mirror_facet.first);
       }
+      CGAL_TR_PROBE_VERTEX_WRITE(tr, ch->vertex(v), "flip: set_cell apex");
       ch->vertex(v)->set_cell(ch);
 
       inc_cells[ch->vertex(v)].clear();
@@ -961,9 +965,12 @@ Sliver_removal_result flip_n_to_m(C3t3& c3t3,
         Facet facet = facets[it->second];
 
         //Update neighbor
+        CGAL_TR_PROBE_CELL_WRITE(tr, facet.first,
+                                 "flip: set_neighbor mirror cell (boundary)");
         facet.first->set_neighbor(facet.second, ch);
         ch->set_neighbor(v, facet.first);
       }
+      CGAL_TR_PROBE_VERTEX_WRITE(tr, ch->vertex(v), "flip: set_cell apex (boundary)");
       ch->vertex(v)->set_cell(ch);
 
       inc_cells[ch->vertex(v)].clear();
@@ -1279,6 +1286,35 @@ void collectBoundaryEdgesAndComputeVerticesValences(
   boundary_edges.clear();
   boundary_vertices_valences.clear();
 
+  // `CGAL_TR_PARALLEL_BFLIP_SCAN=1` (C5, replay of queue item R6) collects the
+  // boundary edges with a parallel cell scan instead of walking finite_edges()
+  // on one thread. This runs once per iteration, including every extra
+  // flip-and-smooth iteration.
+  //
+  // The valence accumulation below stays serial and is unaffected: it counts,
+  // so it does not depend on the order the edges arrive in. What DOES change
+  // is the order of `boundary_edges`, hence of the flip candidates -- which is
+  // sound only because the boundary flip is an UNORDERED operation. It must
+  // not be copied to split or collapse.
+  bool collected = false;
+#ifdef CGAL_LINKED_WITH_TBB
+  if constexpr (std::is_convertible_v<typename C3T3::Triangulation::Concurrency_tag,
+                                      CGAL::Parallel_tag>)
+  {
+    if (Parallel_tuning::get().parallel_boundary_flip)
+    {
+      boundary_edges = parallel_collect_finite_edges<Edge>(
+        tr,
+        [&](const Edge& e, std::vector<Edge>& out)
+        {
+          if (is_boundary(c3t3, e, cell_selector))
+            out.push_back(e);
+        });
+      collected = true;
+    }
+  }
+#endif
+  if (!collected)
   for (const Edge& e : tr.finite_edges())
   {
     if (is_boundary(c3t3, e, cell_selector))
@@ -1581,6 +1617,10 @@ Sliver_removal_result flip_on_surface(C3T3& c3t3,
     }
 
     //Top cells 2-2 flip
+    CGAL_TR_PROBE_CELL_WRITE(tr, n_ch0_vh3, "flip22: set_neighbor n_ch0_vh3");
+    CGAL_TR_PROBE_CELL_WRITE(tr, n_ch3_vh1, "flip22: set_neighbor n_ch3_vh1");
+    CGAL_TR_PROBE_CELL_WRITE(tr, n_ch1_vh3, "flip22: set_neighbor n_ch1_vh3");
+    CGAL_TR_PROBE_CELL_WRITE(tr, n_ch2_vh1, "flip22: set_neighbor n_ch2_vh1");
     ch3->set_neighbor(ch3->index(vh1), ch0);
     ch3->set_neighbor(ch3->index(vh0), n_ch0_vh3);
     n_ch0_vh3->set_neighbor(n_ch0_vh3->index(ch0), ch3);
@@ -2032,24 +2072,38 @@ public:
   void locked_vertices(const std::pair<Vertex_handle, Vertex_handle>&,
                        boost::container::small_vector<Vertex_handle, 2>&) const {}
 
+  /**
+  * Flip DOES opt in to the grid-based elision modes, unlike R19's.
+  *
+  * It has to stay out of R19's, whose argument covers only the one-ring of the
+  * locked vertices, because a flip re-stitches the mirror cells across the
+  * star's outer facets and those live in the two-ring. The grid-based modes
+  * take no such shortcut: they own whole lock-grid cells, and `zone_ring = 2`
+  * makes the zone walk reach exactly as far as lock_flip_zone() does.
+  */
+  void elision_vertices(const std::pair<Vertex_handle, Vertex_handle>& vp,
+                        boost::container::small_vector<Vertex_handle, 2>& out) const
+  {
+    out.push_back(vp.first);
+    out.push_back(vp.second);
+  }
+
+  static constexpr int zone_ring = 2;
+
   bool lock_flip_zone(const typename C3t3::Triangulation& tr,
                       const Vertex_handle v0, const Vertex_handle v1,
                       Cells_vector& inc0, Cells_vector& inc1) const
   {
-    if (!tr.try_lock_and_get_incident_cells(v0, inc0)
-     || !tr.try_lock_and_get_incident_cells(v1, inc1))
+    bool* const tls = zone_tls(tr);
+    if (!tr.try_lock_and_get_incident_cells(v0, inc0, tls)
+     || !tr.try_lock_and_get_incident_cells(v1, inc1, tls))
       return false;
 
     if (!flip_halo_lock_enabled())
       return true;
 
-    for (const Cells_vector* cells : { &inc0, &inc1 })
-      for (const Cell_handle c : *cells)
-        for (int i = 0; i < 4; ++i)
-          if (!tr.try_lock_cell(c->neighbor(i)))
-            return false;
-
-    return true;
+    return lock_zone_halo(tr, inc0, inc1,
+                          Parallel_tuning::get().apex_only_flip_halo);
   }
 
   static bool flip_halo_lock_enabled()

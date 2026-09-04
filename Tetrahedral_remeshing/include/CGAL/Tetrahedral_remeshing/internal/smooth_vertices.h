@@ -14,6 +14,7 @@
 #define CGAL_INTERNAL_SMOOTH_VERTICES_H
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
+#include <CGAL/Tetrahedral_remeshing/internal/Parallel_tuning.h>
 
 #include <CGAL/Vector_3.h>
 
@@ -244,8 +245,143 @@ public:
       compute_vertices_normals(c3t3);
     }
     reset_vertex_id_map(c3t3.triangulation());
-    reset_free_vertices(c3t3.triangulation());
-    collect_incident_cells(c3t3.triangulation());
+    if (refresh_fused_enabled())
+      reset_free_and_incident_cells_parallel(c3t3.triangulation());
+    else
+    {
+      reset_free_vertices(c3t3.triangulation());
+      collect_incident_cells(c3t3.triangulation());
+    }
+  }
+
+  static bool refresh_fused_enabled()
+  {
+    if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+      return Parallel_tuning::get().parallel_refresh;
+    else
+      return false;
+  }
+
+  /**
+  * C2 -- `CGAL_TR_PARALLEL_REFRESH=1`. One parallel pass in place of two
+  * serial ones.
+  *
+  * reset_free_vertices() and collect_incident_cells() walk THE SAME finite
+  * cells and call vertex_id() on THE SAME four vertices of each, once per
+  * smoothing phase. reset_free_vertices() additionally writes each vertex's
+  * flag once per incident cell -- about 24 times -- with a value that depends
+  * only on that vertex's dimension.
+  *
+  * Fused into: one parallel pass that sets each free flag (idempotently) and
+  * counts incident cells, then an exact-size allocation, then a second
+  * parallel pass that fills. Counting-then-filling rather than merging
+  * per-thread lists, because it also lets m_inc_cells hold exactly as many
+  * cells as the vertex has -- the shipped type is
+  * small_vector<Cell_handle, 64> where the typical incident count is ~24, so
+  * two thirds of ~512 bytes per vertex is constructed and destroyed every
+  * phase for nothing.
+  *
+  * m_free_vertices is std::vector<bool>, which is bit-packed, so concurrent
+  * writes to distinct indices are NOT safe on it; the parallel pass writes a
+  * std::vector<char> and it is copied over afterwards.
+  *
+  * The order of cells within one vertex's list differs from the serial build.
+  * It is only read for orientation tests, which are order-independent; the
+  * sequential path does not take this branch at all.
+  */
+  void reset_free_and_incident_cells_parallel(const Tr& tr)
+  {
+#ifdef CGAL_LINKED_WITH_TBB
+    const std::size_t nbv = tr.number_of_vertices();
+    if (m_flip_smooth_steps)
+    {
+      CGAL_assertion(m_free_vertices.size() == nbv);
+    }
+    else
+    {
+      m_free_vertices.clear();
+      m_free_vertices.resize(nbv, false);
+    }
+    m_inc_cells.clear();
+    m_inc_cells.resize(nbv, Incident_cells_vector{});
+
+    std::vector<Cell_handle> cells;
+    cells.reserve(tr.number_of_finite_cells() + 64);
+    for (const Cell_handle c : tr.finite_cell_handles())
+      cells.push_back(c);
+
+    std::vector<char> freev(nbv, 0);
+    const bool recompute_free = !m_flip_smooth_steps;
+
+    std::vector<std::atomic<unsigned> > counts(nbv);
+    for (std::size_t i = 0; i < nbv; ++i)
+      counts[i].store(0u, std::memory_order_relaxed);
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        for (std::size_t ci = r.begin(); ci != r.end(); ++ci)
+        {
+          const Cell_handle c = cells[ci];
+          if (!is_selected(c))
+            continue;
+          for (auto vi : tr.vertices(c))
+          {
+            const std::size_t idi = vertex_id(vi);
+            if (recompute_free)
+              freev[idi] = free_for_dimension(vi->in_dimension()) ? char(1) : char(0);
+            counts[idi].fetch_add(1u, std::memory_order_relaxed);
+          }
+        }
+      });
+
+    if (recompute_free)
+      for (std::size_t i = 0; i < nbv; ++i)
+        m_free_vertices[i] = (freev[i] != 0);
+
+    for (std::size_t i = 0; i < nbv; ++i)
+      if (m_free_vertices[i])
+        m_inc_cells[i].resize(counts[i].load(std::memory_order_relaxed));
+
+    std::vector<std::atomic<unsigned> > cursor(nbv);
+    for (std::size_t i = 0; i < nbv; ++i)
+      cursor[i].store(0u, std::memory_order_relaxed);
+
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& r)
+      {
+        for (std::size_t ci = r.begin(); ci != r.end(); ++ci)
+        {
+          const Cell_handle c = cells[ci];
+          if (!is_selected(c))
+            continue;
+          for (auto vi : tr.vertices(c))
+          {
+            const std::size_t idi = vertex_id(vi);
+            if (!m_free_vertices[idi])
+              continue;
+            const unsigned slot = cursor[idi].fetch_add(1u, std::memory_order_relaxed);
+            m_inc_cells[idi][slot] = c;
+          }
+        }
+      });
+#else
+    reset_free_vertices(tr);
+    collect_incident_cells(tr);
+#endif
+  }
+
+  bool free_for_dimension(const int dim) const
+  {
+    switch (dim)
+    {
+    case 3:  return true;
+    case 2:  return !m_protect_boundaries;
+    case 1:  return !m_protect_boundaries && m_smooth_constrained_edges;
+    case 0:  return false;
+    default: CGAL_unreachable();
+    }
+    return false;
   }
 
   void start_flip_smooth_steps(const C3t3& c3t3)
@@ -453,8 +589,91 @@ private:
     return str;
   }
 
+  /**
+  * C3 -- `CGAL_TR_PARALLEL_NORMALS=1`.
+  *
+  * The serial version below makes three passes and builds two hash maps: one
+  * walk of all finite facets filling an unordered_map<Facet, Vector_3>, a walk
+  * of THAT map accumulating into a nested map of per-vertex per-patch normals,
+  * and a normalisation walk. The intermediate facet map exists only to carry
+  * the normals from the first pass to the second; every entry is consumed once
+  * and nothing reads it afterwards.
+  *
+  * This version accumulates straight into per-thread partial maps during one
+  * parallel facet scan, merges them, and normalises. The facet map is gone.
+  *
+  * Floating point: these are sums of Vector_3, so the accumulation ORDER
+  * decides the result bit for bit, and it changes here. The sequential path is
+  * untouched -- this branch is only reachable under Parallel_tag -- and the
+  * parallel arm is already not bit-identical to the sequential one (the
+  * residual -5% vertex-count gap at coarse target lengths). The quality floors
+  * are what has to hold, not bit-equality.
+  */
+  void compute_vertices_normals_parallel(const C3t3& c3t3)
+  {
+#ifdef CGAL_LINKED_WITH_TBB
+    m_vertices_normals.clear();
+    typename Tr::Geom_traits gt = c3t3.triangulation().geom_traits();
+    typename Tr::Geom_traits::Construct_opposite_vector_3
+      opp = gt.construct_opposite_vector_3_object();
+    const Tr& tr = c3t3.triangulation();
+
+    tbb::enumerable_thread_specific<Vertices_normals_map> tl;
+    std::vector<char> dummy = parallel_collect_finite_facets<char>(
+      tr,
+      [&](const Facet& trf, std::vector<char>&)
+      {
+        if (!is_boundary(c3t3, trf, m_cell_selector))
+          return;
+        const Facet f = canonical_facet(trf);
+        const Cell_handle c = f.first;
+        const Cell_handle neigh = f.first->neighbor(f.second);
+
+        Vector_3 n = CGAL::Tetrahedral_remeshing::normal(f, tr.geom_traits());
+        if (tr.is_infinite(neigh)
+         || c3t3.subdomain_index(neigh) < c3t3.subdomain_index(c))
+          n = opp(n);
+
+        const Surface_patch_index& surf_i = c3t3.surface_patch_index(f);
+        Vertices_normals_map& local = tl.local();
+        for (const Vertex_handle vi : tr.vertices(f))
+        {
+          auto it = local.find(vi);
+          if (it == local.end() || it->second.find(surf_i) == it->second.end())
+            local[vi][surf_i] = n;
+          else
+            local[vi][surf_i] += n;
+        }
+      });
+    CGAL_USE(dummy);
+
+    tl.combine_each([&](const Vertices_normals_map& part)
+    {
+      for (const auto& [v, patch_normals] : part)
+        for (const auto& [surf_i, n] : patch_normals)
+        {
+          auto it = m_vertices_normals.find(v);
+          if (it == m_vertices_normals.end()
+           || it->second.find(surf_i) == it->second.end())
+            m_vertices_normals[v][surf_i] = n;
+          else
+            m_vertices_normals[v][surf_i] += n;
+        }
+    });
+
+    for (auto& [v, patch_normals] : m_vertices_normals)
+      for (auto& [surf_i, n] : patch_normals)
+        CGAL::Tetrahedral_remeshing::normalize(n, gt);
+    CGAL_USE(c3t3);
+#endif
+  }
+
   void compute_vertices_normals(const C3t3& c3t3)
   {
+    if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+      if (Parallel_tuning::get().parallel_normals)
+        return compute_vertices_normals_parallel(c3t3);
+
     m_vertices_normals.clear();
     typename Tr::Geom_traits gt = c3t3.triangulation().geom_traits();
     typename Tr::Geom_traits::Construct_opposite_vector_3
@@ -553,8 +772,54 @@ private:
 #endif
   }
 
+  /**
+  * C4 -- `CGAL_TR_PARALLEL_SURF_IDX=1`. The sibling of C3 in the same
+  * refresh(), over the same facets: for each boundary facet, its surface patch
+  * index and its three vertices. Kept as a separate switch so its marginal
+  * value over C3 is attributable, which is how R16-on-top-of-R1 was read.
+  */
+  void collect_vertices_surface_indices_parallel(const C3t3& c3t3)
+  {
+#ifdef CGAL_LINKED_WITH_TBB
+    m_vertices_surface_indices.clear();
+    const Tr& tr = c3t3.triangulation();
+    tbb::enumerable_thread_specific<Vertices_surface_indices_map> tl;
+    std::vector<char> dummy = parallel_collect_finite_facets<char>(
+      tr,
+      [&](const Facet& f, std::vector<char>&)
+      {
+        if (!c3t3.is_in_complex(f))
+          return;
+        const Surface_patch_index& surface_index = c3t3.surface_patch_index(f);
+        Vertices_surface_indices_map& local = tl.local();
+        for (const Vertex_handle vi : tr.vertices(f))
+        {
+          std::vector<Surface_patch_index>& v_si = local[vi];
+          if (std::find(v_si.begin(), v_si.end(), surface_index) == v_si.end())
+            v_si.push_back(surface_index);
+        }
+      });
+    CGAL_USE(dummy);
+
+    tl.combine_each([&](const Vertices_surface_indices_map& part)
+    {
+      for (const auto& [v, indices] : part)
+      {
+        std::vector<Surface_patch_index>& all = m_vertices_surface_indices[v];
+        for (const Surface_patch_index& si : indices)
+          if (std::find(all.begin(), all.end(), si) == all.end())
+            all.push_back(si);
+      }
+    });
+#endif
+  }
+
   void collect_vertices_surface_indices(const C3t3& c3t3)
   {
+    if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+      if (Parallel_tuning::get().parallel_surface_indices)
+        return collect_vertices_surface_indices_parallel(c3t3);
+
     m_vertices_surface_indices.clear();
     for (Facet fit : c3t3.facets_in_complex())
     {
@@ -743,6 +1008,22 @@ public:
   {
     out.push_back(v);
   }
+
+  /**
+  * The vertices whose ring defines this element's exclusion zone, for the
+  * grid-based elision modes (B1..B4). Same set as locked_vertices() here;
+  * they are separate hooks because R19's mode reasons about one-rings only and
+  * flip must stay out of that one while opting IN to the grid-based modes.
+  */
+  template <typename Vertex_handle_>
+  void elision_vertices(const Vertex_handle_& v,
+                        boost::container::small_vector<Vertex_handle_, 2>& out) const
+  {
+    out.push_back(v);
+  }
+
+  // Smoothing writes the vertex and re-checks the cells incident to it.
+  static constexpr int zone_ring = 1;
 
   // Where the element sits, for the spatial grouping the parallel executor does.
   template<typename Vertex_handle>
@@ -944,7 +1225,8 @@ public:
   bool lock_zone(const Element_type& v, const C3t3& c3t3) const
   {
     std::vector<Cell_handle> inc_cells;
-    return c3t3.triangulation().try_lock_and_get_incident_cells(v, inc_cells);
+    return c3t3.triangulation().try_lock_and_get_incident_cells(
+             v, inc_cells, zone_tls(c3t3.triangulation()));
   }
 
   // vertices are independent of one another: shuffling spreads the threads out
@@ -1257,7 +1539,8 @@ public:
   bool lock_zone(const Element_type& v, const C3t3& c3t3) const
   {
     std::vector<Cell_handle> inc_cells;
-    return c3t3.triangulation().try_lock_and_get_incident_cells(v, inc_cells);
+    return c3t3.triangulation().try_lock_and_get_incident_cells(
+             v, inc_cells, zone_tls(c3t3.triangulation()));
   }
 
   // vertices are independent of one another: shuffling spreads the threads out
@@ -1378,7 +1661,8 @@ public:
   bool lock_zone(const Element_type& v, const C3t3& c3t3) const
   {
     std::vector<Cell_handle> inc_cells;
-    return c3t3.triangulation().try_lock_and_get_incident_cells(v, inc_cells);
+    return c3t3.triangulation().try_lock_and_get_incident_cells(
+             v, inc_cells, zone_tls(c3t3.triangulation()));
   }
 
   // vertices are independent of one another: shuffling spreads the threads out

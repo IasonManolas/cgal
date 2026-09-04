@@ -171,6 +171,27 @@ public:
   bool try_lock_facet(const Facet&, int = 0) const
   { return true; }
 
+  // Zone-lock helpers (see Spatial_lock_grid_3.h). No-ops here.
+  template <typename P3>
+  int lock_grid_index(const P3&) const
+  { return -1; }
+
+  template <typename P3>
+  std::array<int, 3> lock_grid_indices3(const P3&) const
+  { return {-1, -1, -1}; }
+
+  int lock_grid_num_cells_per_axis() const
+  { return 0; }
+
+  bool try_lock_grid_index(int) const
+  { return true; }
+
+  bool* lock_grid_tls() const
+  { return nullptr; }
+
+  bool try_lock_grid_index(bool*, int) const
+  { return true; }
+
   template <typename P3>
   bool is_point_locked_by_this_thread(const P3&) const
   { return false; }
@@ -298,6 +319,40 @@ public:
     }
 
     return success;
+  }
+
+  // Zone-lock helpers. A caller locking a whole zone maps many vertices onto a
+  // few distinct grid cells; these let it deduplicate the indices and lock
+  // each once, and hoist the thread-local grid lookup out of the loop.
+  template <typename P3>
+  int lock_grid_index(const P3& p) const
+  {
+    return m_lock_ds ? m_lock_ds->lock_grid_index(p) : -1;
+  }
+
+  template <typename P3>
+  std::array<int, 3> lock_grid_indices3(const P3& p) const
+  {
+    return m_lock_ds ? m_lock_ds->lock_grid_indices3(p)
+                     : std::array<int, 3>{-1, -1, -1};
+  }
+
+  int lock_grid_num_cells_per_axis() const
+  { return m_lock_ds ? m_lock_ds->num_grid_cells_per_axis() : 0; }
+
+  bool try_lock_grid_index(int gi) const
+  {
+    return m_lock_ds ? m_lock_ds->try_lock_index(gi) : true;
+  }
+
+  bool* lock_grid_tls() const
+  {
+    return m_lock_ds ? m_lock_ds->get_thread_local_grid() : nullptr;
+  }
+
+  bool try_lock_grid_index(bool* tls, int gi) const
+  {
+    return m_lock_ds ? m_lock_ds->try_lock_index(tls, gi) : true;
   }
 
   template <typename P3>
@@ -2029,8 +2084,27 @@ public:
     _tds.incident_cells_threadsafe(v, cells, filter);
   }
 
+  // Locks a cell through an already-resolved thread-local grid handle, so the
+  // enumerable_thread_specific lookup inside try_lock() is paid once per zone
+  // rather than once per vertex of every cell in it. `tls == nullptr` restores
+  // the original path exactly, and that is what every caller outside
+  // Tetrahedral_remeshing passes.
+  bool try_lock_cell_tls(bool* tls, const Cell_handle& c) const
+  {
+    if(tls == nullptr)
+      return this->try_lock_cell(c);
+    for(int k = 0; k < 4; ++k)
+    {
+      const int gi = this->lock_grid_index(c->vertex(k)->point());
+      if(gi >= 0 && !this->try_lock_grid_index(tls, gi))
+        return false;
+    }
+    return true;
+  }
+
   template <typename IncidentCellsContainer>
-  bool try_lock_and_get_incident_cells(Vertex_handle v, IncidentCellsContainer& cells) const
+  bool try_lock_and_get_incident_cells(Vertex_handle v, IncidentCellsContainer& cells,
+                                       bool* tls = nullptr) const
   {
     static_assert(std::is_same_v<typename IncidentCellsContainer::value_type, Cell_handle>,
                   "the output container must hold Cell_handle");
@@ -2039,7 +2113,7 @@ public:
       return false;
 
     Cell_handle d = v->cell();
-    if(!this->try_lock_cell(d)) // LOCK
+    if(!this->try_lock_cell_tls(tls, d)) // LOCK
       return false;
 
     cells.push_back(d);
@@ -2056,7 +2130,7 @@ public:
           continue;
 
         Cell_handle next = c->neighbor(i);
-        if(!this->try_lock_cell(next)) // LOCK
+        if(!this->try_lock_cell_tls(tls, next)) // LOCK
         {
           for(Cell_handle ch : cells)
           {

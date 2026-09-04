@@ -1584,10 +1584,26 @@ public:
       , m_protect_boundaries(protect_boundaries)
       , m_visitor(visitor) {}
 
+  using Edge_with_length = std::pair<Edge, FT>;
+
+  /** C1: candidates already collected by the fused edge pass, or nullptr. */
+  void set_precollected(const std::vector<Edge_with_length>* p) { m_precollected = p; }
+
   Element_range get_elements(const C3t3& c3t3) const override
   {
     Short_edges short_edges;
     const Tr& tr = c3t3.triangulation();
+
+    // C1: the fused pass already ran can_be_collapsed + is_too_short over
+    // every finite edge, in the same traversal that served split and
+    // resolution_reached(). The bimap is still filled serially -- it is the
+    // work list and its order decides what runs next.
+    if (m_precollected != nullptr)
+    {
+      for (const Edge_with_length& el : *m_precollected)
+        short_edges.insert(typename Short_edges::value_type(el.first, el.second));
+      return short_edges;
+    }
 
 #ifdef CGAL_LINKED_WITH_TBB
     if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
@@ -1694,8 +1710,9 @@ public:
       return false;
 
     std::vector<Cell_handle> inc_cells_0, inc_cells_1;
-    if (!tr.try_lock_and_get_incident_cells(e.first, inc_cells_0)
-     || !tr.try_lock_and_get_incident_cells(e.second, inc_cells_1))
+    bool* const tls = zone_tls(tr);
+    if (!tr.try_lock_and_get_incident_cells(e.first, inc_cells_0, tls)
+     || !tr.try_lock_and_get_incident_cells(e.second, inc_cells_1, tls))
       return false;
 
     // The two stars are not the whole write footprint. Collapsing re-stitches
@@ -1704,11 +1721,9 @@ public:
     // one vertex of each that lies outside the stars. A thread that does not
     // hold that vertex can therefore have its v->cell() rewritten underneath
     // it, and the next star walk follows a cell that is being recycled.
-    for (const std::vector<Cell_handle>* cells : { &inc_cells_0, &inc_cells_1 })
-      for (const Cell_handle c : *cells)
-        for (int i = 0; i < 4; ++i)
-          if (!tr.try_lock_cell(c->neighbor(i)))
-            return false;
+    if (!lock_zone_halo(tr, inc_cells_0, inc_cells_1,
+                        Parallel_tuning::get().apex_only_collapse_halo))
+      return false;
 
     // Self-check: the probe's own premise. If these fire, the probe and the
     // lock are not talking about the same thing, and no other report from it
@@ -1775,6 +1790,10 @@ public:
 
   // shortest edge first is the point of the ordering the bimap keeps
   static constexpr bool requires_ordered_processing = true;
+
+private:
+  const std::vector<Edge_with_length>* m_precollected = nullptr;
+public:
 #endif // CGAL_LINKED_WITH_TBB
 
   /**

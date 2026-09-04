@@ -14,6 +14,10 @@
 #define CGAL_INTERNAL_SPLIT_LONG_EDGES_H
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
+#ifdef CGAL_LINKED_WITH_TBB
+#include <tbb/parallel_sort.h>
+#endif
+#include <CGAL/Tetrahedral_remeshing/internal/Parallel_tuning.h>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/functional/hash.hpp>
@@ -387,6 +391,11 @@ public:
       , m_protect_boundaries(protect_boundaries)
       , m_visitor(visitor) {}
 
+  using Edge_with_length = std::pair<Edge, FT>;
+
+  /** C1: candidates already collected by the fused edge pass, or nullptr. */
+  void set_precollected(const std::vector<Edge_with_length>* p) { m_precollected = p; }
+
   ElementSource get_elements(const C3t3& c3t3) const override
   {
     struct Long_edge_with_length
@@ -411,7 +420,18 @@ public:
     };
 
     bool collected = false;
+    // C1: the fused edge pass has already applied `keep` to every finite edge,
+    // in the same scan that answered resolution_reached() and collected the
+    // collapse candidates. Three traversals of the edge set become one.
+    if (m_precollected != nullptr)
+    {
+      long_edges_with_lengths.reserve(m_precollected->size());
+      for (const auto& el : *m_precollected)
+        long_edges_with_lengths.push_back(Long_edge_with_length{el.first, el.second});
+      collected = true;
+    }
 #ifdef CGAL_LINKED_WITH_TBB
+    if (!collected)
     if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
     {
       long_edges_with_lengths
@@ -423,7 +443,29 @@ public:
       for (Edge e : tr.finite_edges())
         keep(e, long_edges_with_lengths);
 
-    // longest first; stable to match the original bimap's ordering
+    // longest first; stable to match the original bimap's ordering.
+    //
+    // `CGAL_TR_PARALLEL_SORT=1` (C6, replay of queue item R21) sorts in
+    // parallel instead. tbb::parallel_sort is NOT stable, so ties have to be
+    // broken explicitly or the comparator is not a strict weak ordering and
+    // the sort is undefined. The tie-break is the owning cell's address: it is
+    // a total order within a run, which is all a sort needs, and the candidate
+    // ORDER ACROSS RUNS is already non-deterministic on the parallel path
+    // because the collection is a parallel cell scan. Split's dependence is on
+    // longest-FIRST, which both forms preserve exactly; R2 showed what
+    // breaking that costs (-6.4%).
+#ifdef CGAL_LINKED_WITH_TBB
+    if (Parallel_tuning::get().parallel_candidate_sort)
+    {
+      tbb::parallel_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(),
+                         [](const Long_edge_with_length& a, const Long_edge_with_length& b) {
+                           if (a.sqlength != b.sqlength)
+                             return a.sqlength > b.sqlength;
+                           return &*a.edge.first < &*b.edge.first;
+                         });
+    }
+    else
+#endif
     std::stable_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(),
                      [](const Long_edge_with_length& a, const Long_edge_with_length& b) {
                        return a.sqlength > b.sqlength;
@@ -513,10 +555,18 @@ public:
   void locked_vertices(const Element_type&,
                        boost::container::small_vector<Vertex_handle, 2>&) const {}
 
+  void elision_vertices(const Element_type&,
+                        boost::container::small_vector<Vertex_handle, 2>&) const {}
+
+  static constexpr int zone_ring = 1;
+
   // longest edge first is the point of the ordering built in get_elements()
   static constexpr bool requires_ordered_processing = true;
 
   std::string operation_name() const override { return "Split long edges"; }
+
+private:
+  const std::vector<Edge_with_length>* m_precollected = nullptr;
 };
 
 } // internal
