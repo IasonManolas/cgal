@@ -16,6 +16,8 @@
 
 #include <CGAL/license/Triangulation_3.h>
 
+#include <atomic>
+
 #include <CGAL/disable_warnings.h>
 #include <CGAL/basic.h>
 
@@ -272,6 +274,25 @@ public:
   }
 
   // LOCKS
+  //
+  // CGAL_TR_LOCKCOUNT builds a diagnostic binary that counts spatial-lock
+  // calls. It exists because the size of a lock zone in VERTICES is not what
+  // a zone costs: the grid is per cell, and what the program pays is the
+  // number of try_lock calls. Comparing two zones by vertex count was wrong.
+  // Off by default; the counter is not compiled in otherwise.
+#ifdef CGAL_TR_LOCKCOUNT
+  static std::atomic<std::size_t>& tr_lock_calls()
+  { static std::atomic<std::size_t> n{0}; return n; }
+  static std::atomic<std::size_t>& tr_lock_fails()
+  { static std::atomic<std::size_t> n{0}; return n; }
+#  define CGAL_TR_COUNT_LOCK(ok)                                        \
+     do { tr_lock_calls().fetch_add(1, std::memory_order_relaxed);      \
+          if(!(ok)) tr_lock_fails().fetch_add(1, std::memory_order_relaxed); \
+     } while(0)
+#else
+#  define CGAL_TR_COUNT_LOCK(ok) do { (void)(ok); } while(0)
+#endif
+
   template <typename Point_3>
   bool try_lock_point(const Point_3& p, int lock_radius = 0) const
   {
@@ -279,6 +300,7 @@ public:
     if(m_lock_ds)
     {
       locked = m_lock_ds->try_lock(p, lock_radius);
+      CGAL_TR_COUNT_LOCK(locked);
     }
     return locked;
   }
@@ -290,6 +312,7 @@ public:
     if(m_lock_ds)
     {
       locked = m_lock_ds->try_lock(vh->point(), lock_radius);
+      CGAL_TR_COUNT_LOCK(locked);
     }
     return locked;
   }

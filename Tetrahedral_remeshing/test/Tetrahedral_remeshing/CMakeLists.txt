@@ -8,7 +8,7 @@ project(Tetrahedral_remeshing_Tests)
 # CGAL and its components
 find_package(CGAL REQUIRED COMPONENTS ImageIO)
 
-add_compile_definitions(CGAL_TETRAHEDRAL_REMESHING_VERBOSE)
+#add_compile_definitions(CGAL_TETRAHEDRAL_REMESHING_VERBOSE)
 #add_compile_definitions(CGAL_CHECK_EXPENSIVE) #to activate expensive assertions
 
 create_single_source_cgal_program("test_tetrahedral_remeshing.cpp")
@@ -64,3 +64,16 @@ else()
 endif()
 
 
+create_single_source_cgal_program("dump_remeshed.cpp")
+
+find_package(TBB QUIET)
+if(TBB_FOUND)
+  include(CGAL_TBB_support)
+endif()
+
+if(TARGET CGAL::TBB_support)
+  create_single_source_cgal_program("dump_remeshed_parallel.cpp")
+  target_link_libraries(dump_remeshed_parallel PUBLIC CGAL::TBB_support)
+  create_single_source_cgal_program("test_parallel_edge_scan.cpp")
+  target_link_libraries(test_parallel_edge_scan PUBLIC CGAL::TBB_support)
+endif()

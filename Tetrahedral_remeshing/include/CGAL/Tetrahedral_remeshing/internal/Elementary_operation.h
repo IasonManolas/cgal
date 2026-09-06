@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <numeric>
 #include <dlfcn.h>
 #include <iterator>
@@ -335,15 +336,32 @@ private:
 #ifdef CGAL_TR_ZONE_STATS
     ++Zone_stats::get().zones_locked;
     ++Zone_stats::get().zone_attempts;
+    // Time only every 64th failed attempt. Reading a clock on a path taken
+    // millions of times per run would perturb what it measures; counts stay
+    // exact, the nanoseconds are sampled.
+    std::size_t zs_fail = 0;
+    const bool zs_time = ((Zone_stats::get().zone_attempts.load() & 63u) == 0u);
+    const auto zs_t0 = std::chrono::steady_clock::now();
 #endif
     while (!op.lock_zone(element, c3t3))
     {
 #ifdef CGAL_TR_ZONE_STATS
       ++Zone_stats::get().zone_attempts;
+      ++Zone_stats::get().yields;
+      ++zs_fail;
 #endif
       c3t3.triangulation().unlock_all_elements();
       std::this_thread::yield();
     }
+#ifdef CGAL_TR_ZONE_STATS
+    if (zs_time && zs_fail)
+    {
+      Zone_stats::get().ns_sampled += static_cast<std::size_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - zs_t0).count());
+      Zone_stats::get().n_sampled += zs_fail;
+    }
+#endif
     op.execute_operation(element, c3t3);
     c3t3.triangulation().unlock_all_elements();
   }

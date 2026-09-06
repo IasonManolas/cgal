@@ -279,10 +279,18 @@ public:
   * is too long or too short", so the first walk looks at the very edges the
   * next two go back to find, and throws them away.
   *
-  * This runs all three tests in ONE parallel cell scan. `keep` is applied to
-  * every finite edge exactly once and its three results are separated
-  * afterwards. Split and collapse then consume their slice through
-  * set_precollected() rather than scanning again.
+  * MEASURED AND CORRECTED. Fusing all THREE was tried first and is WRONG:
+  * split runs between the second and third traversal and changes the mesh, so
+  * a collapse candidate list computed before split names edges split has since
+  * destroyed and misses the ones it created. It scored -8.55% wall and, more
+  * to the point, BLOCKED on correctness -- 1.92% more cells than the baseline,
+  * with three Tier-A configs past the per-config quality limit. The three
+  * traversals are not redundant with each other; only the first two are, and
+  * that is the whole extent of what can be fused.
+  *
+  * So this fuses resolution_reached() and split's collection, which do see the
+  * same mesh, into ONE parallel cell scan. Collapse keeps its own scan. Three
+  * traversals become two.
   *
   * The resolution test is computed independently of can_be_split/
   * can_be_collapsed rather than inferred from whether the two lists are empty:
@@ -298,7 +306,6 @@ public:
   struct Fused_edges
   {
     std::vector<Edge_with_length> too_long;
-    std::vector<Edge_with_length> too_short;
     bool resolution_reached = true;
   };
   Fused_edges m_fused;
@@ -307,7 +314,6 @@ public:
   void run_fused_edge_pass()
   {
     m_fused.too_long.clear();
-    m_fused.too_short.clear();
     m_fused.resolution_reached = true;
     m_fused_valid = false;
 
@@ -341,23 +347,10 @@ public:
                 out.push_back(Rec{e, sqlen.value(), 1});
             }
           }
-          {
-            auto [collapsible, b]
-              = can_be_collapsed(e, m_c3t3, m_protect_boundaries, m_cell_selector);
-            if (collapsible)
-            {
-              const auto sqlen = is_too_short(e, b, m_sizing, m_c3t3, m_cell_selector);
-              if (sqlen != std::nullopt)
-                out.push_back(Rec{e, sqlen.value(), 2});
-            }
-          }
         });
 
       for (const Rec& r : found)
-      {
-        if (r.kind == 1) m_fused.too_long.emplace_back(r.e, r.sqlen);
-        else             m_fused.too_short.emplace_back(r.e, r.sqlen);
-      }
+        m_fused.too_long.emplace_back(r.e, r.sqlen);
       m_fused.resolution_reached = resolved.load();
       m_fused_valid = true;
     }
@@ -405,8 +398,6 @@ public:
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeCollapseOp;
     EdgeCollapseOp collapse_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
-    if (m_fused_valid)
-      collapse_op.set_precollected(&m_fused.too_short);
     Executor<EdgeCollapseOp> executor;
     executor.execute(collapse_op, m_c3t3);
 

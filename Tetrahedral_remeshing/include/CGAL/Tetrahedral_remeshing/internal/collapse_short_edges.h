@@ -14,6 +14,7 @@
 #define CGAL_INTERNAL_COLLAPSE_SHORT_EDGES_H
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
+#include <chrono>
 
 #include <boost/bimap.hpp>
 #include <boost/bimap/set_of.hpp>
@@ -37,6 +38,9 @@
 #include <CGAL/utility.h>
 #include <CGAL/Tetrahedral_remeshing/internal/Elementary_operation.h>
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
+#include <CGAL/Tetrahedral_remeshing/internal/MVLZ_probe.h>
+#include <atomic>
+#include <iostream>
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <boost/unordered/concurrent_flat_map.hpp>
@@ -1422,6 +1426,46 @@ using Vertex_patch_cache = std::unordered_map<
 // scan over all finite edges in collapse_short_edges() reaches the same
 // vertex once per incident edge, and the scan does not modify the mesh, so
 // the first answer stays valid for the rest of it.
+#ifdef CGAL_TR_DIMSTATS
+// N9's own gate: "count re-queue can_be_collapsed calls and their cache hit
+// rate BEFORE building". Skipped once already, which is why the cache measured
+// as a no-op with no explanation.
+struct Patch_call_stats
+{
+  std::atomic<std::size_t> edges{0}, guard_passed{0}, walks{0}, hits{0};
+  // Could the stored vertex index replace the walk entirely? Only if it is
+  // (a) of the right kind -- it is a bare index whose MEANING depends on
+  // in_dimension() -- and (b) still correct. collapse_short_edges.h contains
+  // no call to set_index() at all, so nothing updates it after a collapse.
+  std::atomic<std::size_t> dim0{0}, dim1{0}, dim2{0}, dim_other{0};
+  std::atomic<std::size_t> idx_match{0}, idx_mismatch{0}, idx_no_patch{0};
+  ~Patch_call_stats()
+  {
+    const std::size_t e = edges.load(), g = guard_passed.load(),
+                      w = walks.load(), h = hits.load();
+    std::cerr << "[patchstats] requeue_edges=" << e
+              << " guard_passed=" << g
+              << " (" << (e ? 100.0 * double(g) / double(e) : 0.0) << "% of edges)"
+              << "  star_walks=" << w << "  cache_hits=" << h
+              << " (" << ((w + h) ? 100.0 * double(h) / double(w + h) : 0.0) << "% hit)"
+              << std::endl;
+    const std::size_t d0 = dim0.load(), d1 = dim1.load(), d2 = dim2.load(),
+                      dx = dim_other.load();
+    std::cerr << "[patchidx] guard-passing endpoints by in_dimension:"
+              << " dim0=" << d0 << " dim1=" << d1 << " dim2=" << d2
+              << " other=" << dx << std::endl;
+    std::cerr << "[patchidx] dim-2 endpoints, stored index vs walked patch:"
+              << " match=" << idx_match.load()
+              << " MISMATCH=" << idx_mismatch.load()
+              << " walk_returned_nothing=" << idx_no_patch.load() << std::endl;
+  }
+};
+inline Patch_call_stats& patch_stats() { static Patch_call_stats s; return s; }
+#  define CGAL_TR_PATCHSTAT(f) (++::CGAL::Tetrahedral_remeshing::internal::patch_stats().f)
+#else
+#  define CGAL_TR_PATCHSTAT(f) ((void)0)
+#endif
+
 template<typename C3T3>
 const std::optional<typename C3T3::Surface_patch_index>&
 cached_surface_patch_index(const typename C3T3::Vertex_handle v,
@@ -1430,8 +1474,9 @@ cached_surface_patch_index(const typename C3T3::Vertex_handle v,
 {
   const auto it = cache.find(v);
   if (it != cache.end())
-    return it->second;
+  { CGAL_TR_PATCHSTAT(hits); return it->second; }
 
+  CGAL_TR_PATCHSTAT(walks);
   return cache.emplace(v, surface_patch_index(v, c3t3)).first->second;
 }
 
@@ -1466,6 +1511,33 @@ auto can_be_collapsed(const typename C3T3::Edge& e,
 
     if(v0->in_dimension() != 3 && v1->in_dimension() != 3)
     {
+      CGAL_TR_PATCHSTAT(guard_passed);
+      CGAL_TR_PATCHSTAT(guard_passed);   // one per endpoint walked below
+#ifdef CGAL_TR_DIMSTATS
+      for (const auto& vv : { v0, v1 })
+      {
+        switch (vv->in_dimension())
+        {
+          case 0: CGAL_TR_PATCHSTAT(dim0); break;
+          case 1: CGAL_TR_PATCHSTAT(dim1); break;
+          case 2: CGAL_TR_PATCHSTAT(dim2); break;
+          default: CGAL_TR_PATCHSTAT(dim_other); break;
+        }
+        if (vv->in_dimension() == 2)
+        {
+          const auto walked = surface_patch_index(vv, c3t3);
+          if (walked == std::nullopt) CGAL_TR_PATCHSTAT(idx_no_patch);
+          else
+          {
+            const auto stored =
+              Mesh_3::internal::get_index<typename C3T3::Surface_patch_index>(vv->index());
+            if (stored == walked.value()) CGAL_TR_PATCHSTAT(idx_match);
+            else                          CGAL_TR_PATCHSTAT(idx_mismatch);
+          }
+        }
+      }
+#endif
+      if (!patch_cache) { CGAL_TR_PATCHSTAT(walks); CGAL_TR_PATCHSTAT(walks); }
       const auto patch_v0 = patch_cache
         ? cached_surface_patch_index(v0, c3t3, *patch_cache)
         : surface_patch_index(v0, c3t3);
@@ -1541,6 +1613,26 @@ using Short_edges_bimap = boost::bimap<
                                     Equal_edges<typename C3t3::Triangulation::Edge> >,
     boost::bimaps::multiset_of<typename C3t3::Triangulation::Geom_traits::FT,
                                std::less<typename C3t3::Triangulation::Geom_traits::FT> > >;
+
+#ifdef CGAL_TR_DIMSTATS
+inline void dimstats(bool interior)
+{
+  struct Counts
+  {
+    std::atomic<std::size_t> total{0}, interior{0};
+    ~Counts()
+    {
+      const std::size_t t = total.load(), i = interior.load();
+      std::cerr << "[dimstats] collapses=" << t << " both_endpoints_interior=" << i
+                << " (" << (t ? 100.0 * double(i) / double(t) : 0.0) << "%)"
+                << std::endl;
+    }
+  };
+  static Counts c;
+  ++c.total;
+  if (interior) ++c.interior;
+}
+#endif
 
 template<typename C3t3,
          typename SizingFunction,
@@ -1674,11 +1766,36 @@ public:
   bool lock_zone(const Edge_vv& e, const C3t3& c3t3) const
   {
     if (is_gone(e))
+    {
+      CGAL_TR_ZS(stage_gone);
       return true; // nothing to lock; execute_operation_vv() will skip it
+    }
 
     const Tr& tr = c3t3.triangulation();
+
+    // SABOTAGE arm. The two endpoints and the destination, and nothing else:
+    // no star, no halo. It cannot possibly cover the cells a collapse rewires,
+    // and it exists so that "0 violations" from the measured arm can be shown
+    // to be a result rather than a check that never fires. The midpoint is
+    // kept because without it the arm fails for a second, unrelated reason
+    // (the destination lock) and the two causes become impossible to tell
+    // apart in the report.
+    if (Parallel_tuning::get().mvlz_collapse_zone == 2)
+    {
+      if (!tr.try_lock_vertex(e.first) || !tr.try_lock_vertex(e.second))
+        return false;
+      if (is_gone(e)) return true;
+      const auto& vs = tr.tds().vertices();
+      if (!vs.is_used(e.first) || !vs.is_used(e.second)) return true;
+      return tr.try_lock_point(CGAL::midpoint(point(e.first->point()),
+                                              point(e.second->point())));
+    }
+
     if (!tr.try_lock_vertex(e.first) || !tr.try_lock_vertex(e.second))
+    {
+      CGAL_TR_ZS(stage_endpoint);
       return false;
+    }
 
     // Re-checked now that both vertices are held: another thread may have
     // merged one of them away between the test above and the locks.
@@ -1707,23 +1824,71 @@ public:
     // is the only destination left to take.
     if (!tr.try_lock_point(CGAL::midpoint(point(e.first->point()),
                                           point(e.second->point()))))
+    {
+      CGAL_TR_ZS(stage_midpoint);
       return false;
+    }
 
     std::vector<Cell_handle> inc_cells_0, inc_cells_1;
     bool* const tls = zone_tls(tr);
-    if (!tr.try_lock_and_get_incident_cells(e.first, inc_cells_0, tls)
-     || !tr.try_lock_and_get_incident_cells(e.second, inc_cells_1, tls))
+    if (!tr.try_lock_and_get_incident_cells(e.first, inc_cells_0, tls))
+    {
+      CGAL_TR_ZS(stage_star0);
       return false;
+    }
+    if (!tr.try_lock_and_get_incident_cells(e.second, inc_cells_1, tls))
+    {
+      CGAL_TR_ZS(stage_star1);
+      return false;
+    }
 
-    // The two stars are not the whole write footprint. Collapsing re-stitches
-    // the region it removes to the cells around it, and in doing so calls
-    // set_cell() on the vertices of those neighbouring cells -- including the
-    // one vertex of each that lies outside the stars. A thread that does not
-    // hold that vertex can therefore have its v->cell() rewritten underneath
-    // it, and the next star walk follows a cell that is being recycled.
-    if (!lock_zone_halo(tr, inc_cells_0, inc_cells_1,
-                        Parallel_tuning::get().apex_only_collapse_halo))
-      return false;
+    // ---- the halo ------------------------------------------------------
+    // The claim this was written on: collapsing re-stitches the region it
+    // removes to the cells around it, and in doing so calls set_cell() on the
+    // vertices of those neighbouring cells -- including the one vertex of each
+    // that lies outside the stars, at graph distance 2.
+    //
+    // MEASURED (MVLZ_COLLAPSE.md), and the claim does not survive. A Valgrind
+    // Lackey trace of every load and store of eight collapses, with every cell
+    // and vertex of the triangulation in the identity manifest so a miss would
+    // be reported rather than lost:
+    //
+    //     depth 2, cell   :  88 loads    0 stores   (one byte offset)
+    //     depth 2, vertex :   0 loads    0 stores
+    //
+    // Not one access of any kind reaches a vertex at distance 2, so the halo
+    // locks vertices the operation never touches. The depth-2 CELLS it does
+    // read are safe without it: a reader of a cell needs only one of its four
+    // vertices, since a writer would need all four, and each of those cells
+    // shares three vertices with a star cell we already hold. The snapshot/
+    // diff agrees on the write half over 1,200 collapses on three meshes --
+    // write radius 1, and every changed vertex at depth 0 or 1.
+    //
+    // So mode 1 drops it. Mode 0 keeps it, and is the control.
+    if (Parallel_tuning::get().mvlz_collapse_zone != 1)
+    {
+      if (!lock_zone_halo(tr, inc_cells_0, inc_cells_1,
+                          Parallel_tuning::get().apex_only_collapse_halo))
+      {
+        CGAL_TR_ZS(stage_halo);
+        return false;
+      }
+    }
+#ifdef CGAL_TR_ZONE_STATS
+    // how many distinct lock-grid cells this zone actually spans
+    {
+      boost::container::small_vector<int, 64> seen;
+      for (const std::vector<Cell_handle>* cs : { &inc_cells_0, &inc_cells_1 })
+        for (const Cell_handle c : *cs)
+          for (int k = 0; k < 4; ++k)
+          {
+            const int gi = tr.lock_grid_index(c->vertex(k)->point());
+            if (gi >= 0 && std::find(seen.begin(), seen.end(), gi) == seen.end())
+              seen.push_back(gi);
+          }
+      zone_stat_extent(seen.size());
+    }
+#endif
 
     // Self-check: the probe's own premise. If these fire, the probe and the
     // lock are not talking about the same thing, and no other report from it
@@ -1756,6 +1921,69 @@ public:
     if (is_gone(e))
       return false;
 
+#ifdef CGAL_TR_DIMSTATS
+    // How many collapses could take a SMALL zone under a two-zone design?
+    //
+    // The depth-2 tds_data marking (MVLZ_COLLAPSE.md §0) is suspected to come
+    // from can_be_collapsed() -> surface_patch_index(u) in the re-queue tail,
+    // which is called only when BOTH endpoints of a re-queued edge have
+    // in_dimension() != 3. Every re-queued edge is (vkept, u), so if vkept is
+    // interior the call cannot happen for any u.
+    //
+    // vkept is interior whenever both endpoints are: the two merge rules in
+    // this file disagree (max at collapse_type==TO_MIDPOINT, min in
+    // merge_vertices) but 3 and 3 give 3 under either. So this predicate is
+    // decidable at LOCK time from the two vertices already held, in O(1) --
+    // unlike the k-ring elision, whose classification cost as much as the work
+    // it avoided.
+    {
+      const bool interior = (e.first->in_dimension() == 3)
+                         && (e.second->in_dimension() == 3);
+      dimstats(interior);
+    }
+#endif
+
+#ifdef CGAL_TR_MVLZ_PROBE
+    // The window opens as early as it CAN, which is here: after is_gone() and
+    // before is_edge(). Trap 1 of MVLZ_METHOD says open before the first line,
+    // because the split probe first opened after is_edge() and a footprint
+    // that excludes part of the operation is not the operation's footprint --
+    // is_edge() marks tds_data() over a whole star, which is what went
+    // missing. is_edge() is therefore inside the window here.
+    //
+    // is_gone() cannot be: it is the guard that says these two vertex handles
+    // still name live vertices. A collapse DESTROYS one of its endpoints, so
+    // a stale candidate's handles dangle, and the probe's first act is to walk
+    // incident_cells() from both of them. Opening before is_gone() segfaults
+    // on the first stale candidate -- observed, not predicted. Nothing is lost
+    // by opening after it: is_gone() reads m_deleted_vertices, a hash set on
+    // the side, and touches no cell and no vertex. This is the one place where
+    // "before the first line" and "over the whole mesh footprint" differ, and
+    // the second is the property that matters.
+    //
+    // The window also covers the RE-QUEUE TAIL below (finite_incident_edges
+    // + can_be_collapsed + is_too_short around the kept vertex), because the
+    // executor holds this zone until execute_operation_vv() returns. That
+    // tail is part of what the zone has to protect whether or not it is part
+    // of "the collapse", and it reads a 1-ring of a vertex that has just
+    // MOVED, so leaving it outside the window would measure a different
+    // operation from the one that runs.
+    mvlz_reporter();
+    Mvlz_probe<Tr> mvlz(c3t3.triangulation());
+    mvlz.zone_today_has_apex_halo();          // collapse's shipped zone: A1
+    // The two-zone predicate, decided from the two endpoints alone, in O(1),
+    // at a point where both are held. If both are interior then the kept
+    // vertex is interior (max and min of 3,3 are both 3, and the two merge
+    // rules in this file disagree only elsewhere), so can_be_collapsed() can
+    // never call surface_patch_index() for any re-queued edge.
+    mvlz.classify((e.first->in_dimension() == 3 && e.second->in_dimension() == 3) ? 1 : 0);
+    mvlz.begin("collapse", e.first, e.second);
+    struct Mvlz_end {
+      Mvlz_probe<Tr>& p; bool ok = false;
+      ~Mvlz_end() { p.end(ok); }
+    } mvlz_end{mvlz};
+#endif
+
     Cell_handle cell;
     int i0, i1;
     if (!c3t3.triangulation().tds().is_edge(e.first, e.second, cell, i0, i1))
@@ -1773,10 +2001,23 @@ public:
 
     std::vector<Edge> incident;
     c3t3.triangulation().finite_incident_edges(vkept, std::back_inserter(incident));
+
+    // N9 -- a patch cache for the re-queue. Every edge here is (vkept, u), so
+    // can_be_collapsed() computes surface_patch_index(vkept) once per incident
+    // edge, ~20 times, for the same answer. The cache lives for THIS operation
+    // only: the mesh is not modified again before the loop ends, which is the
+    // condition the cache's own comment states, and a cache that outlived the
+    // operation would be answering with patches from a mesh that has since
+    // been collapsed.
+    Vertex_patch_cache<C3t3> requeue_cache;
+    Vertex_patch_cache<C3t3>* const cache_ptr =
+      Parallel_tuning::get().requeue_patch_cache ? &requeue_cache : nullptr;
+
     for (const Edge& ei : incident)
     {
+      CGAL_TR_PATCHSTAT(edges);
       const auto [collapsible, boundary]
-        = can_be_collapsed(ei, c3t3, m_protect_boundaries, m_cell_selector);
+        = can_be_collapsed(ei, c3t3, m_protect_boundaries, m_cell_selector, cache_ptr);
       if (!collapsible)
         continue;
 
@@ -1785,16 +2026,23 @@ public:
       if (sqlen != std::nullopt)
         *new_candidates++ = std::make_pair(sqlen.value(), make_vertex_pair(ei));
     }
+#ifdef CGAL_TR_MVLZ_PROBE
+    mvlz_end.ok = true;
+#endif
     return true;
   }
 
   // shortest edge first is the point of the ordering the bimap keeps
   static constexpr bool requires_ordered_processing = true;
 
+#endif // CGAL_LINKED_WITH_TBB
+
 private:
+  // set_precollected() and get_elements() use this unconditionally, so it
+  // cannot live inside the TBB guard: without TBB the class did not compile
+  // at all. Only the C1 fused-edge-pass path ever sets it.
   const std::vector<Edge_with_length>* m_precollected = nullptr;
 public:
-#endif // CGAL_LINKED_WITH_TBB
 
   /**
   * Collapses `edge`, and keeps `short_edges` up to date : `collapse_edge()`
@@ -1940,13 +2188,36 @@ public:
                         while (queue.try_pop(candidate))
                         {
                           const Edge_vv& e = candidate.second;
+#ifdef CGAL_TR_ZONE_STATS
+                          CGAL_TR_ZS(zones_locked);
+                          CGAL_TR_ZS(zone_attempts);
+                          std::size_t zs_fail = 0;
+                          const bool zs_time =
+                            ((Zone_stats::get().zone_attempts.load() & 63u) == 0u);
+                          const auto zs_t0 = std::chrono::steady_clock::now();
+#endif
                           while (!op.lock_zone(e, c3t3))
                           {
+#ifdef CGAL_TR_ZONE_STATS
+                            CGAL_TR_ZS(zone_attempts);
+                            CGAL_TR_ZS(yields);
+                            ++zs_fail;
+#endif
                             c3t3.triangulation().unlock_all_elements();
                             std::this_thread::yield();
                           }
+#ifdef CGAL_TR_ZONE_STATS
+                          if (zs_time && zs_fail)
+                          {
+                            Zone_stats::get().ns_sampled += static_cast<std::size_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - zs_t0).count());
+                            Zone_stats::get().n_sampled += zs_fail;
+                          }
+#endif
                           requeued.clear();
-                          op.execute_operation_vv(e, c3t3, std::back_inserter(requeued));
+                          if (!op.execute_operation_vv(e, c3t3, std::back_inserter(requeued)))
+                            CGAL_TR_ZS(zones_wasted);
                           c3t3.triangulation().unlock_all_elements();
 
                           for (const Candidate& c : requeued)

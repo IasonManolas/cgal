@@ -44,23 +44,54 @@ namespace internal {
 struct Parallel_tuning
 {
   // ---- Group A : lock area ------------------------------------------------
-  // A1/A2: a cell adjacent to a locked star shares a facet with it, so three
-  // of its four vertices are already held; only the apex needs locking.
-  bool apex_only_collapse_halo = false;
-  bool apex_only_flip_halo     = false;
+  // A1/A2 -- SHIPPED 2026-09-05. A cell adjacent to a locked star shares a
+  // facet with it, so three of its four vertices are already held; only the
+  // apex needs locking. Measured independently: +3.33% (collapse) and +6.59%
+  // (flip), both 24/24 configs faster, cycles improving at least as much as
+  // wall. Verified with the lock probe against a liveness reference of 118,419
+  // unlocked writes, and by a 60-run crash soak.
+  // Default ON. `CGAL_TR_APEX_HALO_*=0` restores the pre-ship behaviour.
+  bool apex_only_collapse_halo = true;
+  bool apex_only_flip_halo     = true;
   // A3/A4: hoist the thread-local lock-grid handle out of try_lock, so the
   // enumerable_thread_specific lookup is paid once per zone instead of once
   // per vertex of every cell in it. Two INDEPENDENT regions, so that each can
   // be measured on its own: the halo (A3) and the star walk (A4).
+  // MVLZ-SPLIT. Measured 2026-09-05 (MVLZ_SPLIT.md): a split touches only the
+  // cells incident to its edge and their facet-neighbours -- 92.5M traced
+  // accesses over 10 splits, 0 loads and 0 stores on any other cell, and
+  // nothing beyond graph distance 1. lock_zone() nevertheless takes both full
+  // endpoint stars, which is 2.1x the vertices. This switch takes the measured
+  // set instead: the edge's cell ring, plus one apex per ring facet.
+  // Default OFF. This is a correctness-critical change, so it ships only after
+  // a crash soak, and the OFF arm is the control in that soak.
+  // 0 = today's zone (both full endpoint stars)
+  // 1 = the measured MVLZ (edge ring + one apex per ring facet)
+  // 2 = SABOTAGE, endpoints only. Deliberately insufficient: the positive
+  //     control for the lock-coverage check. A "0 violations" result from
+  //     mode 1 means nothing unless the same check is shown to FIRE here.
+  int  mvlz_split_zone         = 0;
+  // The same three arms for collapse (MVLZ_COLLAPSE.md).
+  // 0 = today's zone (both full stars + the A1 apex halo + the midpoint)
+  // 1 = the measured MVLZ
+  // 2 = SABOTAGE, endpoints + midpoint only. Deliberately insufficient.
+  int  mvlz_collapse_zone      = 0;
+  // N9: give the collapse re-queue a patch cache. Scoped to one operation.
+  bool requeue_patch_cache     = false;
+  // Private-marking star walk in surface_patch_index(): no shared tds_data.
+  bool private_marking         = false;
   bool halo_tls_hoist          = false;
   bool star_tls_hoist          = false;
   // A5: size the lock grid from mesh density instead of a constant.
   // 0 disables; otherwise the target number of star-sized neighbourhoods per
   // grid cell.
   int  lock_grid_per_star      = 0;
-  // A6: bounded attempts, then defer to the end of the bucket, instead of
-  // spinning on a contended zone. Unordered operations only.
-  bool defer_on_conflict       = false;
+  // A6 -- SHIPPED 2026-09-05, +0.62%. Bounded attempts, then defer to the end
+  // of the bucket, instead of spinning on a contended zone. Unordered
+  // operations only. The gain is NOT reclaimed spin -- utilisation is
+  // unchanged, 3.416 cores against 3.413 -- it is not discarding the two-star
+  // BFS walk on each failed attempt. Default ON.
+  bool defer_on_conflict       = true;
 
   // ---- Group B : lock elision --------------------------------------------
   // 0 off, 1 R19 as shipped, 2 B1 candidate-local, 3 B2 grid ownership,
@@ -80,9 +111,18 @@ struct Parallel_tuning
   int  partitioner             = 0;
   bool reuse_partition         = false;
   int  buckets_per_thread      = 4;
-  // 0 submission order, 1 largest-bucket-first (LPT).
-  int  bucket_schedule         = 0;
+  // D4 -- SHIPPED 2026-09-05, +0.44%. 0 submission order, 1 largest-bucket-
+  // first (LPT). Equal-count buckets hold equal counts but not equal work, so
+  // the phase waits on its slowest bucket; submitting the big ones first
+  // shortens the tail for the cost of one sort of ~16 vectors. Default 1.
+  int  bucket_schedule         = 1;
 
+  /**
+  * Turns the four changes shipped on 2026-09-05 off together, so their
+  * COMBINED effect can be measured against the state that preceded them in a
+  * single A/B with one environment variable (POLICY 0.2). `CGAL_TR_SHIP4=0`
+  * is the pre-ship arm; unset or 1 is what ships.
+  */
   static const Parallel_tuning& get()
   {
     static const Parallel_tuning t = load();
@@ -94,6 +134,19 @@ private:
   {
     const char* const e = std::getenv(name);
     return (e != nullptr) && (std::atoi(e) != 0);
+  }
+  // For a switch that is ON by default: unset means on, and an explicit 0
+  // turns it off. `flag()` cannot express that.
+  static bool flag_on(const char* name)
+  {
+    const char* const e = std::getenv(name);
+    return (e == nullptr) || (std::atoi(e) != 0);
+  }
+  // For an integer whose 0 is a meaningful value rather than "use the default".
+  static int number_or(const char* name, const int dflt)
+  {
+    const char* const e = std::getenv(name);
+    return (e == nullptr) ? dflt : std::atoi(e);
   }
   static int number(const char* name, const int dflt)
   {
@@ -107,12 +160,16 @@ private:
   static Parallel_tuning load()
   {
     Parallel_tuning t;
-    t.apex_only_collapse_halo  = flag("CGAL_TR_APEX_HALO_COLLAPSE");
-    t.apex_only_flip_halo      = flag("CGAL_TR_APEX_HALO_FLIP");
+    t.apex_only_collapse_halo  = flag_on("CGAL_TR_APEX_HALO_COLLAPSE");
+    t.apex_only_flip_halo      = flag_on("CGAL_TR_APEX_HALO_FLIP");
+    t.mvlz_split_zone          = number("CGAL_TR_MVLZ_SPLIT_ZONE", 0);
+    t.mvlz_collapse_zone       = number("CGAL_TR_MVLZ_COLLAPSE_ZONE", 0);
+    t.requeue_patch_cache      = flag("CGAL_TR_REQUEUE_PATCH_CACHE");
+    t.private_marking          = flag("CGAL_TR_PRIVATE_MARKING");
     t.halo_tls_hoist           = flag("CGAL_TR_HALO_TLS_HOIST");
     t.star_tls_hoist           = flag("CGAL_TR_STAR_TLS_HOIST");
     t.lock_grid_per_star       = number("CGAL_TR_LOCK_GRID_PER_STAR", 0);
-    t.defer_on_conflict        = flag("CGAL_TR_DEFER_ON_CONFLICT");
+    t.defer_on_conflict        = flag_on("CGAL_TR_DEFER_ON_CONFLICT");
     t.elision_mode             = number("CGAL_TR_ELISION_MODE", 0);
     t.fused_edge_pass          = flag("CGAL_TR_FUSED_EDGE_PASS");
     t.parallel_refresh         = flag("CGAL_TR_PARALLEL_REFRESH");
@@ -123,7 +180,27 @@ private:
     t.partitioner              = number("CGAL_TR_PARTITIONER", 0);
     t.reuse_partition          = flag("CGAL_TR_REUSE_PARTITION");
     t.buckets_per_thread       = number("CGAL_TR_BUCKETS_PER_THREAD", 4);
-    t.bucket_schedule          = number("CGAL_TR_BUCKET_SCHEDULE", 0);
+    t.bucket_schedule          = number_or("CGAL_TR_BUCKET_SCHEDULE", 1);
+
+    // ONE switch for the shippable collapse change, because `ab_alloc.sh` takes
+    // a single environment variable as the arm. The two halves are inseparable
+    // anyway: the smaller zone is only safe once the marking is private
+    // (MVLZ_COLLAPSE.md STATUS), so measuring them apart measures nothing that
+    // could ship.
+    if (flag("CGAL_TR_COLLAPSE_MVLZ"))
+    {
+      t.private_marking    = true;
+      t.mvlz_collapse_zone = 1;
+    }
+
+    // One switch for the combined re-measurement.
+    if (!flag_on("CGAL_TR_SHIP4"))
+    {
+      t.apex_only_collapse_halo = false;
+      t.apex_only_flip_halo     = false;
+      t.defer_on_conflict       = false;
+      t.bucket_schedule         = 0;
+    }
     return t;
   }
 };

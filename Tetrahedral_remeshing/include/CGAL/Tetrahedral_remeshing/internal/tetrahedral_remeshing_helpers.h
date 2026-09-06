@@ -94,29 +94,90 @@ namespace internal
 * Returns false as soon as one lock fails, exactly as the loop it replaces; the
 * caller unlocks everything and retries.
 */
+#ifndef CGAL_TR_ZONE_STATS
+#define CGAL_TR_ZS(field) ((void)0)
+#endif
+
 #ifdef CGAL_TR_ZONE_STATS
-// Phase-0 sizing only. Never in a measurement build: these are process-wide
+// Phase-0 counters. NEVER in a measurement build: these are process-wide
 // atomics on the hot path.
+//
+// What each one decides:
+//   stage_*        where a failed lock_zone() gives up, hence how much star-
+//                  walk work a retry discards, hence whether "fail cheap
+//                  first" is worth anything.
+//   yields/attempts + sampled nanoseconds: whether contention costs WAITING or
+//                  DISCARDED WORK. task_clock cannot separate them -- both burn
+//                  CPU -- which is why A6's flat utilisation settled nothing.
+//   zones_wasted   zones locked whose operation then did nothing: sizes
+//                  "lock later".
+//   extent_hist    distinct grid cells a zone spans, as a histogram. Decides
+//                  the radius-lock idea, and only as a DISTRIBUTION: a mean
+//                  says nothing about whether a 3x3x3 block covers the tail.
 struct Zone_stats
 {
-  std::atomic<std::size_t> halo_vertex_locks{0};   // calls the default path makes
-  std::atomic<std::size_t> halo_distinct_indices{0}; // distinct grid cells in them
   std::atomic<std::size_t> zones_locked{0};
-  std::atomic<std::size_t> zone_attempts{0};       // incl. failed attempts
+  std::atomic<std::size_t> zone_attempts{0};
+  std::atomic<std::size_t> zones_wasted{0};
+  std::atomic<std::size_t> yields{0};
+  std::atomic<std::size_t> ns_sampled{0};       // ns spent in sampled failures
+  std::atomic<std::size_t> n_sampled{0};
+  std::atomic<std::size_t> stage_gone{0};       // gave up before any lock
+  std::atomic<std::size_t> stage_endpoint{0};   // endpoint vertex lock failed
+  std::atomic<std::size_t> stage_midpoint{0};   // midpoint lock failed
+  std::atomic<std::size_t> stage_star0{0};      // first star walk failed
+  std::atomic<std::size_t> stage_star1{0};      // second star walk failed
+  std::atomic<std::size_t> stage_halo{0};       // halo failed, both walks lost
+  std::atomic<std::size_t> extent_hist[65]{};   // >=64 saturates in the last bin
+  std::atomic<std::size_t> extent_n{0};
+  std::atomic<std::size_t> extent_sum{0};
+
   static Zone_stats& get() { static Zone_stats z; return z; }
+
   ~Zone_stats()
   {
-    std::cerr << "[zone] halo vertex-lock calls " << halo_vertex_locks
-              << ", distinct grid cells " << halo_distinct_indices
-              << ", dedup ratio "
-              << (halo_distinct_indices ? double(halo_vertex_locks)/double(halo_distinct_indices) : 0.0)
-              << "\n[zone] zones locked " << zones_locked
-              << ", lock_zone attempts " << zone_attempts
-              << ", retry rate "
-              << (zones_locked ? double(zone_attempts)/double(zones_locked) - 1.0 : 0.0)
+    const std::size_t zl = zones_locked.load(), za = zone_attempts.load();
+    std::cerr << "\n[zone] zones locked " << zl << ", attempts " << za
+              << ", retry rate " << (zl ? double(za)/double(zl) - 1.0 : 0.0)
+              << "\n[zone] zones that then did nothing " << zones_wasted.load()
+              << "  (" << (zl ? 100.0*double(zones_wasted.load())/double(zl) : 0.0) << "% of locked)"
+              << "\n[zone] yields " << yields.load()
+              << ", sampled failures " << n_sampled.load()
+              << ", mean ns per failed attempt "
+              << (n_sampled.load() ? double(ns_sampled.load())/double(n_sampled.load()) : 0.0)
+              << "\n[zone] where lock_zone gave up:"
+              << "\n         gone      " << stage_gone.load()
+              << "\n         endpoint  " << stage_endpoint.load()
+              << "\n         midpoint  " << stage_midpoint.load()
+              << "\n         star0     " << stage_star0.load()   << "   (1 walk discarded)"
+              << "\n         star1     " << stage_star1.load()   << "   (2 walks discarded)"
+              << "\n         halo      " << stage_halo.load()    << "   (2 walks discarded)"
               << std::endl;
+    const std::size_t en = extent_n.load();
+    std::cerr << "[zone] zone extent in distinct grid cells, n=" << en
+              << " mean " << (en ? double(extent_sum.load())/double(en) : 0.0) << "\n";
+    std::size_t cum = 0;
+    for (int i = 0; i <= 64; ++i)
+    {
+      cum += extent_hist[i].load();
+      const double pc = en ? 100.0*double(cum)/double(en) : 0.0;
+      if (extent_hist[i].load())
+        std::cerr << "[zone]   " << (i == 64 ? ">=64" : std::to_string(i).c_str())
+                  << "  n=" << extent_hist[i].load() << "  cum " << pc << "%\n";
+    }
+    std::cerr.flush();
   }
 };
+
+#define CGAL_TR_ZS(field) (++::CGAL::Tetrahedral_remeshing::internal::Zone_stats::get().field)
+
+inline void zone_stat_extent(std::size_t cells)
+{
+  Zone_stats& z = Zone_stats::get();
+  ++z.extent_hist[cells > 64 ? 64 : cells];
+  ++z.extent_n;
+  z.extent_sum += cells;
+}
 #endif
 
 /**
@@ -1211,6 +1272,101 @@ bool is_boundary_vertex(const typename C3t3::Vertex_handle& v,
   return false;
 }
 
+/**
+* PRIVATE-MARKING star walk (MVLZ_COLLAPSE.md).
+*
+* `incident_facets()` marks `tds_data()` on every cell it visits and clears it
+* on the way out. That byte is SHARED by every thread and carries no identity,
+* so two threads walking overlapping regions cannot tell their own marks from
+* each other's: one skips a cell it never visited (an incomplete star, silently)
+* or has its marks cleared under it (revisits). Measured on `118287` f=1.5:
+* 48 such writes per 12 collapses land on cells at graph distance 2, and 30 of
+* them are not covered by the lock zone -- WITH the apex halo in place.
+*
+* This walk keeps its visited set in a thread-local vector instead, so nothing
+* is shared and the race cannot exist. It reads the same cells the original
+* read, and reads are already safe under the protocol: a reader of a cell needs
+* only ONE of its four vertices, and every cell here contains `v`, which the
+* caller holds. The trace agrees -- 0 unprotected loads in every arm measured.
+*
+* Stars are ~24 cells, so the linear scan over the visited vector is cheaper
+* than it looks, and there is no cleanup pass at all (the original spends half
+* its depth-2 writes on `clear()`).
+*
+* ORDER CAVEAT: `incident_facets()` yields each facet once, in ITS traversal
+* order, and this yields each facet from both incident cells in a different
+* order. Only the first in-complex facet is kept, so for a vertex lying on more
+* than one patch the two can legitimately disagree. That is checked, not
+* assumed -- see the mismatch counter under CGAL_TR_DIMSTATS.
+*/
+#ifdef CGAL_TR_DIMSTATS
+namespace internal {
+inline void spi_equiv(bool same)
+{
+  struct Counts
+  {
+    std::atomic<std::size_t> same{0}, diff{0};
+    ~Counts()
+    {
+      const std::size_t s = same.load(), d = diff.load();
+      std::cerr << "[spi_equiv] surface_patch_index private vs original:"
+                << " same=" << s << " DIFFERENT=" << d
+                << " (" << ((s + d) ? 100.0 * double(d) / double(s + d) : 0.0)
+                << "% differ)" << std::endl;
+    }
+  };
+  static Counts c;
+  if (same) ++c.same; else ++c.diff;
+}
+} // namespace internal
+#endif
+
+template<typename C3t3>
+std::optional<typename C3t3::Surface_patch_index>
+surface_patch_index_private(const typename C3t3::Vertex_handle v,
+                            const C3t3& c3t3)
+{
+  using Cell_handle = typename C3t3::Triangulation::Cell_handle;
+  using Facet = typename C3t3::Facet;
+  std::optional<typename C3t3::Surface_patch_index> patch;
+
+  // Three things the first cut got wrong, each worth measuring separately:
+  //
+  //  * MARK BEFORE PUSH. Pushing every neighbour and de-duplicating on pop
+  //    puts each cell on the stack once per incident neighbour -- about three
+  //    times over -- and pays a scan for each. Checking before the push means
+  //    every cell is scanned once and enters the stack once.
+  //  * EARLY EXIT. Only the FIRST in-complex facet is wanted, and this is a
+  //    plain return rather than an output iterator, so there is no reason to
+  //    finish the star once one is found. The original cannot do this: it
+  //    feeds `incident_facets` an output iterator and has to walk to the end.
+  //    Callers are guarded on `in_dimension() != 3`, i.e. surface, curve and
+  //    corner vertices, so a complex facet is usually found immediately.
+  //  * FACET DEDUP. Each facet is shared by two cells and would be tested from
+  //    both; testing only from the smaller handle visits each exactly once,
+  //    the same rule `incident_cells_3` itself uses.
+  boost::container::small_vector<Cell_handle, 64> visited, stack;
+  visited.push_back(v->cell());
+  stack.push_back(v->cell());
+  while (!stack.empty())
+  {
+    const Cell_handle c = stack.back();
+    stack.pop_back();
+
+    const int iv = c->index(v);
+    for (int i = 0; i < 4; ++i)
+    {
+      if (i == iv) continue;                    // that facet does not contain v
+      const Cell_handle n = c->neighbor(i);     // shares a facet containing v
+      if (c < n && c3t3.is_in_complex(Facet(c, i)))
+        return c3t3.surface_patch_index(Facet(c, i));
+      if (std::find(visited.begin(), visited.end(), n) == visited.end())
+      { visited.push_back(n); stack.push_back(n); }
+    }
+  }
+  return patch;
+}
+
 template<typename C3t3>
 std::optional<typename C3t3::Surface_patch_index>
 surface_patch_index(const typename C3t3::Vertex_handle v,
@@ -1218,6 +1374,44 @@ surface_patch_index(const typename C3t3::Vertex_handle v,
 {
   typedef typename C3t3::Facet Facet;
   std::optional<typename C3t3::Surface_patch_index> patch;
+
+  // PARALLEL ONLY. The race this avoids does not exist with one thread, and
+  // the two walks are not equivalent -- both return "the first in-complex
+  // facet" and "first" is traversal order, so a vertex on more than one patch
+  // can get a different patch from each. Measured disagreement: 0.06% on
+  // 65619, 3.5% on 118287, 13.1% on cdt/51492, where feature-curve vertices
+  // (which sit on patch boundaries) outnumber surface vertices 6406 to 438.
+  //
+  // So the sequential path keeps the original walk BYTE FOR BYTE and its
+  // byte-identity gate stays meaningful, while the parallel path -- which is
+  // nondeterministic under thread scheduling anyway, and is the only path
+  // where the shared tds_data byte can be raced -- takes the private one.
+  // `if constexpr` so the sequential build never instantiates it.
+  if constexpr (std::is_convertible_v<
+                  typename C3t3::Triangulation::Concurrency_tag, CGAL::Parallel_tag>)
+  if (internal::Parallel_tuning::get().private_marking)
+  {
+#ifdef CGAL_TR_DIMSTATS
+    // Is the private walk EQUIVALENT to the one it replaces? Both yield "the
+    // first in-complex facet", and "first" is traversal order, so a vertex on
+    // more than one patch can legitimately get a different answer. Count it
+    // rather than assume it away.
+    {
+      std::optional<typename C3t3::Surface_patch_index> ref;
+      c3t3.triangulation().incident_facets(v,
+        boost::make_function_output_iterator([&](const Facet& f)
+        {
+          if (ref == std::nullopt && c3t3.is_in_complex(f))
+            ref = c3t3.surface_patch_index(f);
+        }));
+      const auto mine = surface_patch_index_private(v, c3t3);
+      internal::spi_equiv(mine == ref);
+      return mine;
+    }
+#else
+    return surface_patch_index_private(v, c3t3);
+#endif
+  }
 
   // the star is examined through an output iterator rather than collected :
   // only the first facet of the complex is of interest

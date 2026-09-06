@@ -24,6 +24,7 @@
 
 #include <CGAL/Tetrahedral_remeshing/internal/Elementary_operation.h>
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
+#include <CGAL/Tetrahedral_remeshing/internal/MVLZ_probe.h>
 
 #include <unordered_map>
 #include <functional>
@@ -497,6 +498,22 @@ public:
     Tr& tr = c3t3.triangulation();
     const Edge_vv& e = element;
 
+#ifdef CGAL_TR_MVLZ_PROBE
+    // The window opens BEFORE is_edge(). It used to open after, which left
+    // is_edge()'s walk over the whole star of the first endpoint outside every
+    // measurement -- the one part of the operation whose safety had to be
+    // argued instead of measured. The cost is that a stale candidate now
+    // counts as an operation; it writes nothing, so it does not disturb the
+    // write results.
+    mvlz_reporter();
+    Mvlz_probe<Tr> mvlz(tr);
+    mvlz.begin("split", e.first, e.second);
+    struct Mvlz_end {
+      Mvlz_probe<Tr>& p; bool ok = false;
+      ~Mvlz_end() { p.end(ok); }
+    } mvlz_end{mvlz};
+#endif
+
     Cell_handle cell;
     int i1, i2;
     if (!tr.tds().is_edge(e.first, e.second, cell, i1, i2))
@@ -528,6 +545,9 @@ public:
     m_midpoints_ofs << vh->point() << std::endl;
 #endif
     m_visitor.after_split(tr, vh);
+#ifdef CGAL_TR_MVLZ_PROBE
+    mvlz_end.ok = true;
+#endif
     return true;
   }
 
@@ -538,9 +558,108 @@ public:
   bool lock_zone(const Element_type& element, const C3t3& c3t3) const
   {
     const Tr& tr = c3t3.triangulation();
+
+    const int mode = Parallel_tuning::get().mvlz_split_zone;
+    if (mode == 2)
+    {
+      // SABOTAGE: the two endpoints only, which cannot possibly cover the
+      // cells the split rewires. Exists so the lock-coverage check can be
+      // shown able to report a violation on this binary.
+      return tr.try_lock_vertex(element.first) && tr.try_lock_vertex(element.second);
+    }
+    if (mode == 1)
+      return lock_zone_mvlz(element, tr);
+
     std::vector<Cell_handle> inc_cells_first, inc_cells_second;
     return tr.try_lock_and_get_incident_cells(element.first, inc_cells_first)
         && tr.try_lock_and_get_incident_cells(element.second, inc_cells_second);
+  }
+
+  /**
+  * The MEASURED zone (MVLZ_SPLIT.md): the vertices of the cells incident to
+  * the edge, plus one apex per ring facet.
+  *
+  * Why this is the whole footprint. A Valgrind Lackey trace of 92.5M memory
+  * accesses over 10 splits recorded every load and store the operation
+  * performs. Every cell and vertex of the triangulation was in the trace's
+  * identity manifest, so a miss would have been reported rather than lost:
+  *  - cells incident to the edge      3103 loads,  136 stores
+  *  - their facet-neighbours          1313 loads,  170 stores
+  *  - EVERY OTHER CELL                   0 loads,    0 stores
+  * and nothing at all beyond graph distance 1. An independent snapshot/diff
+  * over 741 splits on two meshes agrees on the write half.
+  *
+  * Three things this relies on, none of them obvious:
+  *
+  * 1. `execute_operation()` calls `tds().is_edge()` BEFORE anything this
+  *    measurement covered, and that walks the whole star of the first
+  *    endpoint. It is safe without holding that star because we hold the
+  *    endpoint itself, and a thread may only modify a cell while holding all
+  *    four of its vertices -- so no cell incident to a vertex we hold can be
+  *    modified under us. That is the protocol invariant, not a measurement,
+  *    and it is the main thing the crash soak is testing.
+  *
+  * 2. The mirror cell across a ring facet shares three vertices with the ring
+  *    cell, which are already held; only its apex is missing. Same argument as
+  *    the shipped A1/A2 apex-only halo.
+  *
+  * 3. `is_edge()` failing means the candidate went stale, NOT that the zone is
+  *    contended. It must return true here: the executor spins
+  *    `while (!lock_zone(...))`, so returning false for a stale candidate is
+  *    an infinite loop. execute_operation() re-runs is_edge() and drops it.
+  */
+  bool lock_zone_mvlz(const Element_type& element, const Tr& tr) const
+  {
+    if (!tr.try_lock_vertex(element.first) || !tr.try_lock_vertex(element.second))
+      return false;
+
+    // The split CREATES a vertex at the midpoint, and the lock grid is keyed
+    // on position, so the midpoint's grid cell must be held too -- the same
+    // reason collapse locks its destination (the 2026-08-31 root-cause crash).
+    // The lock-coverage check shows split has never done this: the shipped
+    // both-stars zone leaves the new vertex unheld in 180 of 5008 changed
+    // cells, purely because the midpoint usually happens to fall in a grid
+    // cell some star vertex already covers. That is luck, not protection, and
+    // a smaller zone gets less of it.
+    if (!tr.try_lock_point(CGAL::midpoint(point(element.first->point()),
+                                          point(element.second->point()))))
+      return false;
+
+    // is_edge() is not a read. TDS::is_edge() marks tds_data() on every cell
+    // of the FIRST endpoint's star and clears it on scope exit, so it writes
+    // shared scratch state on the whole star. That write is invisible to a
+    // snapshot/diff because it restores the old value, which is exactly why
+    // the first version of this zone measured clean and was still wrong: the
+    // Lackey trace caught 54 stores per 8 splits on star cells that are
+    // neither ring nor mirror. Two threads resolving overlapping edges would
+    // corrupt each other's marks. So the first endpoint's star must be held
+    // in full; only the second endpoint's exclusive star is saved.
+    std::vector<Cell_handle> star_first;
+    if (!tr.try_lock_and_get_incident_cells(element.first, star_first))
+      return false;
+
+    Cell_handle c;
+    int i1, i2;
+    if (!tr.tds().is_edge(element.first, element.second, c, i1, i2))
+      return true;                       // stale, not contended -- see (3)
+
+    typename Tr::Cell_circulator circ = tr.incident_cells(Edge(c, i1, i2));
+    const typename Tr::Cell_circulator end = circ;
+    do
+    {
+      const Cell_handle rc = circ;
+      if (!tr.try_lock_cell(rc))         // the ring cell's four vertices
+        return false;
+      for (int k = 0; k < 4; ++k)
+      {
+        const Cell_handle n = rc->neighbor(k);
+        if (!tr.try_lock_vertex(n->vertex(n->index(rc))))   // its apex only
+          return false;
+      }
+    }
+    while (++circ != end);
+
+    return true;
   }
 
   // Where the element sits, for the spatial grouping the parallel executor
