@@ -15,6 +15,7 @@
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
+#include <cstdio>
 #include <cstdlib>
 
 namespace CGAL {
@@ -76,6 +77,17 @@ struct Parallel_tuning
   // 1 = the measured MVLZ
   // 2 = SABOTAGE, endpoints + midpoint only. Deliberately insufficient.
   int  mvlz_collapse_zone      = 0;
+  // The same arms for flip. NOTE the prior here is the OPPOSITE of collapse's:
+  // `zone_ring` is 2 for flip, the class comment says a flip re-stitches mirror
+  // cells that "live in the two-ring", and `CGAL_TR_FLIP_HALO_LOCK=0` is
+  // documented as crashing. So mode 1 is expected to FAIL, and that expectation
+  // is what makes it worth running: a control that is supposed to fire.
+  // 0 = today's zone (both full stars + the apex halo)
+  // 1 = both stars, no halo
+  // (2 = sabotage is NOT implemented yet; the loader rejects it rather than
+  //  silently behaving like 0 -- an arm that does not differ from its control
+  //  is the A-vs-A' failure this campaign has already paid for twelve times.)
+  int  mvlz_flip_zone          = 0;
   // N9: give the collapse re-queue a patch cache. Scoped to one operation.
   bool requeue_patch_cache     = false;
   // Private-marking star walk in surface_patch_index(): no shared tds_data.
@@ -164,6 +176,13 @@ private:
     t.apex_only_flip_halo      = flag_on("CGAL_TR_APEX_HALO_FLIP");
     t.mvlz_split_zone          = number("CGAL_TR_MVLZ_SPLIT_ZONE", 0);
     t.mvlz_collapse_zone       = number("CGAL_TR_MVLZ_COLLAPSE_ZONE", 0);
+    t.mvlz_flip_zone           = number("CGAL_TR_MVLZ_FLIP_ZONE", 0);
+    if (t.mvlz_flip_zone != 0 && t.mvlz_flip_zone != 1)
+    {
+      std::fprintf(stderr, "CGAL_TR_MVLZ_FLIP_ZONE=%d is not implemented\n",
+                   t.mvlz_flip_zone);
+      std::abort();
+    }
     t.requeue_patch_cache      = flag("CGAL_TR_REQUEUE_PATCH_CACHE");
     t.private_marking          = flag("CGAL_TR_PRIVATE_MARKING");
     t.halo_tls_hoist           = flag("CGAL_TR_HALO_TLS_HOIST");

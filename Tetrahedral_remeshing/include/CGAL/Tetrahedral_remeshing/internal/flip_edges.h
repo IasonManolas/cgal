@@ -21,6 +21,7 @@
 
 #include <CGAL/Tetrahedral_remeshing/internal/Elementary_operation.h>
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
+#include <CGAL/Tetrahedral_remeshing/internal/MVLZ_probe.h>
 
 #include <boost/container/small_vector.hpp>
 #include <boost/functional/hash.hpp>
@@ -2102,6 +2103,17 @@ public:
     if (!flip_halo_lock_enabled())
       return true;
 
+    // The same three arms collapse used (MVLZ_COLLAPSE.md): 0 shipped,
+    // 1 the candidate MVLZ (no halo), 2 sabotage. The PRIOR here is the
+    // opposite of collapse's -- `zone_ring` is 2, the class comment says a
+    // flip re-stitches mirror cells that "live in the two-ring", and
+    // CGAL_TR_FLIP_HALO_LOCK=0 is documented as crashing. So mode 1 is
+    // expected to FAIL, and that expectation is what makes it worth measuring:
+    // a control that is supposed to fire.
+    const int mvlz = Parallel_tuning::get().mvlz_flip_zone;
+    if (mvlz == 1)
+      return true;                       // candidate: both stars, no halo
+
     return lock_zone_halo(tr, inc0, inc1,
                           Parallel_tuning::get().apex_only_flip_halo);
   }
@@ -2162,6 +2174,26 @@ public:
 
   bool execute_operation(const Element_type& vp, C3t3& c3t3) override
   {
+#ifdef CGAL_TR_MVLZ_PROBE
+    // Window opens on the FIRST line. Flip needs no liveness guard ahead of it
+    // the way collapse did: a flip destroys cells, never vertices, and the
+    // flip pass runs alone, so the element's two handles cannot dangle.
+    //
+    // What this window does NOT cover, and must be remembered when reading the
+    // result: lock_zone() runs before it and is where the two star walks (and
+    // their tds_data marking) happen, and `inc_cells` is a side structure, not
+    // a mesh object, so no access to it appears in the manifest at all.
+    mvlz_reporter();
+    Mvlz_probe<typename C3t3::Triangulation> mvlz(c3t3.triangulation());
+    mvlz.zone_today_has_apex_halo();     // lock_flip_zone(): both stars + halo
+    mvlz.classify((vp.first->in_dimension() == 3 && vp.second->in_dimension() == 3) ? 1 : 0);
+    mvlz.begin("flip", vp.first, vp.second);
+    struct Mvlz_end {
+      Mvlz_probe<typename C3t3::Triangulation>& p; bool ok = false;
+      ~Mvlz_end() { p.end(ok); }
+    } mvlz_end{mvlz};
+#endif
+
     Cells_vector& o_inc_vh = inc_cells[vp.first];
     if (o_inc_vh.empty())
       c3t3.triangulation().incident_cells(vp.first, std::back_inserter(o_inc_vh));
@@ -2174,6 +2206,9 @@ public:
     Edge edge(ch, i0, i1);
     const Sliver_removal_result res
       = find_best_flip(edge, c3t3, MIN_ANGLE_BASED, inc_cells, m_cell_selector, m_visitor);
+#ifdef CGAL_TR_MVLZ_PROBE
+    mvlz_end.ok = (res == VALID_FLIP);
+#endif
     return (res == VALID_FLIP);
   }
 
