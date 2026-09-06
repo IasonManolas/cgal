@@ -86,6 +86,21 @@ namespace internal {
 inline volatile unsigned long mvlz_mark_begin = 0;
 inline volatile unsigned long mvlz_mark_end   = 0;
 
+// 1 while a probed operation's window is open. It exists for ONE purpose:
+// naming a call site that addr2line cannot reach. A memory trace records the
+// store's own PC, and its inline chain ends at the out-of-line callee
+// (`incident_cells_3`), so the CALLER -- a return address on the stack -- is
+// invisible to the trace. With this flag a debugger can stop at that callee
+// only while a flip is executing:
+//
+//   gdb -batch -ex 'break incident_cells_3 if mvlz_in_window == 1' //       -ex run -ex bt --args mvlz_traceg ...
+//
+// which is exact, needs no valgrind, and answers in seconds instead of the
+// 30-minute round trip of fix-and-re-trace. Written after two rounds of
+// guessing call sites from source: the first guess removed 93% of the marking
+// and the second removed none of it.
+inline volatile int mvlz_in_window = 0;
+
 struct Mvlz_config
 {
   int  radius   = 2;
@@ -589,6 +604,7 @@ public:
       std::fprintf(f, ".\n");
       std::fflush(f);
       mvlz_mark_begin = (unsigned long)id;     // <-- window opens here
+      mvlz_in_window = 1;
       return;
     }
 
@@ -613,6 +629,7 @@ public:
     if (cfg.trace)
     {
       mvlz_mark_end = 1;             // <-- window closes here, before anything else
+      mvlz_in_window = 0;
       m_active = false;
       if (cfg.exit_after >= 0 && ++windows_closed() >= cfg.exit_after)
       {

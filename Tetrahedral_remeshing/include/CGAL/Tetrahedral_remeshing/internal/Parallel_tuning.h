@@ -92,6 +92,13 @@ struct Parallel_tuning
   bool requeue_patch_cache     = false;
   // Private-marking star walk in surface_patch_index(): no shared tds_data.
   bool private_marking         = false;
+  // Flip's equivalent of `private_marking`, and NOT covered by it: flip's
+  // shared-byte marking comes from `incident_cells()` and `tds().is_edge()`
+  // walks started at a ring apex, not from `surface_patch_index()`. Measured
+  // 2026-09-07: without this, a flip stores at depth 2 on every mesh and class
+  // traced, 72-110 of those stores unprotected WITH the shipped zone in place.
+  // Parallel path only. See MVLZ_FLIP.md §4.
+  bool private_flip_marking    = false;
   bool halo_tls_hoist          = false;
   bool star_tls_hoist          = false;
   // A5: size the lock grid from mesh density instead of a constant.
@@ -185,6 +192,7 @@ private:
     }
     t.requeue_patch_cache      = flag("CGAL_TR_REQUEUE_PATCH_CACHE");
     t.private_marking          = flag("CGAL_TR_PRIVATE_MARKING");
+    t.private_flip_marking     = flag("CGAL_TR_PRIVATE_FLIP_MARKING");
     t.halo_tls_hoist           = flag("CGAL_TR_HALO_TLS_HOIST");
     t.star_tls_hoist           = flag("CGAL_TR_STAR_TLS_HOIST");
     t.lock_grid_per_star       = number("CGAL_TR_LOCK_GRID_PER_STAR", 0);
@@ -210,6 +218,19 @@ private:
     {
       t.private_marking    = true;
       t.mvlz_collapse_zone = 1;
+    }
+
+    // ONE switch for the shippable flip change, for the same reason as
+    // CGAL_TR_COLLAPSE_MVLZ above: `ab_alloc.sh` takes a single environment
+    // variable as the arm, and the two halves are inseparable anyway. Dropping
+    // the apex halo is only safe once flip's marking is private -- measured,
+    // the halo's whole contribution in the traced sample was covering
+    // `tds_data()` scratch writes at depth 2 (MVLZ_FLIP.md §4b) -- so
+    // measuring either half alone measures something that cannot ship.
+    if (flag("CGAL_TR_FLIP_MVLZ"))
+    {
+      t.private_flip_marking = true;
+      t.mvlz_flip_zone       = 1;
     }
 
     // One switch for the combined re-measurement.

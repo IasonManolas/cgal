@@ -438,7 +438,10 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
                                           indices(facet_circulator->second, j));
             if (curr != vh0  && curr != vh1)
             {
-              if (tr.tds().is_edge(curr, vh))
+              // MVLZ_FLIP.md §4: `curr` is a RING APEX, at depth 1, so this
+              // walk of its star marks tds_data() out at depth 2 -- outside
+              // any flip zone. Private under CGAL_TR_PRIVATE_FLIP_MARKING.
+              if (is_edge_maybe_private(tr, curr, vh))
                 is_edge = true;
             }
           }
@@ -625,7 +628,7 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
 
     boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
     if (o_inc_vh.empty())
-      tr.incident_cells(vh, std::back_inserter(o_inc_vh));
+      incident_cells_maybe_private(tr, vh, std::back_inserter(o_inc_vh));
 
     //a chord is an edge joining vh to an apex that is not one of its two
     //neighbors on the ring (positions p-1 and p+1)
@@ -789,7 +792,7 @@ Sliver_removal_result flip_n_to_m(C3t3& c3t3,
 
   boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
   if (o_inc_vh.empty())
-    tr.incident_cells(vh, std::back_inserter(o_inc_vh));
+    incident_cells_maybe_private(tr, vh, std::back_inserter(o_inc_vh));
 
   do
   {
@@ -1912,7 +1915,7 @@ bool flip_surface_edge(C3t3& c3t3,
 
     CGAL_expensive_assertion(debug::check_facets(vh0, vh1, vh2, vh3, c3t3));
 
-    if (!tr.tds().is_edge(vh2, vh3)) // most-likely to happen early exit
+    if (!is_edge_maybe_private(tr, vh2, vh3)) // most-likely to happen early exit
     {
       const Surface_patch_index surfi = c3t3.surface_patch_index(boundary_facets[0]);
 
@@ -1961,12 +1964,12 @@ bool flip_surface_edge(C3t3& c3t3,
           Cell_handle c;
           int li, lj, lk;
           CGAL_expensive_assertion_code(bool b =)
-          tr.tds().is_facet(vh2, vh3, vh0, c, li, lj, lk);
+          is_facet_maybe_private(tr, vh2, vh3, vh0, c, li, lj, lk);
           CGAL_expensive_assertion(b);
           c3t3.add_to_complex(c, (6 - li - lj - lk), surfi);
 
           CGAL_expensive_assertion_code(b = )
-          tr.tds().is_facet(vh2, vh3, vh1, c, li, lj, lk);
+          is_facet_maybe_private(tr, vh2, vh3, vh1, c, li, lj, lk);
           CGAL_expensive_assertion(b);
           c3t3.add_to_complex(c, (6 - li - lj - lk), surfi);
 
@@ -2185,7 +2188,14 @@ public:
     // a mesh object, so no access to it appears in the manifest at all.
     mvlz_reporter();
     Mvlz_probe<typename C3t3::Triangulation> mvlz(c3t3.triangulation());
-    mvlz.zone_today_has_apex_halo();     // lock_flip_zone(): both stars + halo
+    // Only arm 0 takes the halo, so only arm 0 may claim it. Telling the probe
+    // the halo is held when the arm under test dropped it would make the
+    // "is the measured minimum inside the zone the code takes" check compare
+    // the measurement against a zone that was never acquired. The per-object
+    // coverage fields come from the lock data structure itself and are honest
+    // either way; this line is about the T set.
+    if (Parallel_tuning::get().mvlz_flip_zone == 0)
+      mvlz.zone_today_has_apex_halo();   // lock_flip_zone(): both stars + halo
     mvlz.classify((vp.first->in_dimension() == 3 && vp.second->in_dimension() == 3) ? 1 : 0);
     mvlz.begin("flip", vp.first, vp.second);
     struct Mvlz_end {

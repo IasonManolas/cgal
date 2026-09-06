@@ -1299,6 +1299,147 @@ bool is_boundary_vertex(const typename C3t3::Vertex_handle& v,
 * than one patch the two can legitimately disagree. That is checked, not
 * assumed -- see the mismatch counter under CGAL_TR_DIMSTATS.
 */
+/**
+* PRIVATE-MARKING STAR WALKS FOR FLIP.
+*
+* Measured 2026-09-07 (MVLZ_FLIP.md): a flip stores at graph distance 2 from
+* its edge on every mesh and every class traced, and every one of those stores
+* is at `+92 = tds_data()` -- the shared conflict byte -- with 72-110 of them
+* unprotected even with the SHIPPED zone in place. They come from star walks
+* started at a RING APEX, a depth-1 vertex whose own star reaches depth 2:
+* `incident_cells(vh)` and `tds().is_edge(u, v)` in flip_edges.h.
+*
+* Neither is covered by `private_marking`, which has exactly one call site,
+* inside `surface_patch_index()`. Flip reaches patches through
+* `incident_facets(edge)`, an edge circulator that does not mark, so the
+* collapse fix leaves flip's race untouched. These two are flip's equivalent.
+*
+* The walks below are the SAME walks, with the visited set moved into a local
+* container. Nothing is shared, so the race cannot exist.
+*
+* ORDER. `is_edge_private` reproduces `TDS_3::is_edge`'s traversal exactly --
+* same queue, same neighbour order, same early exit -- so it returns the same
+* cell, not merely the same boolean. `incident_cells_threadsafe` is CGAL's
+* own; it walks the star in the same breadth-first order as `is_edge` but
+* `incident_cells` walks it with a STACK, so the two agree as SETS and can
+* differ in ORDER. The output of a flip pass is therefore gated on identity at
+* one thread rather than argued to be unchanged.
+*
+* PARALLEL ONLY, at compile time, so a sequential build never instantiates
+* them and its byte-identity gate keeps its meaning.
+*/
+template<typename Tr>
+bool is_edge_private(const Tr& tr,
+                     const typename Tr::Vertex_handle u,
+                     const typename Tr::Vertex_handle v,
+                     typename Tr::Cell_handle& c, int& i, int& j)
+{
+  using Cell_handle = typename Tr::Cell_handle;
+  CGAL_precondition(tr.dimension() == 3);
+  if (u == v)
+    return false;
+
+  boost::container::small_vector<Cell_handle, 128> cells;
+  boost::container::flat_set<Cell_handle, std::less<>,
+    boost::container::small_vector<Cell_handle, 128>> visited;
+
+  const Cell_handle d = u->cell();
+  cells.emplace_back(d);
+  visited.insert(d);
+
+  int head = 0, tail = 1;
+  do
+  {
+    const Cell_handle ch = cells[head];
+    for (j = 0; j < 4; ++j)          // use parameter j on purpose, as TDS does
+    {
+      if (ch->vertex(j) == v)
+      {
+        c = ch;
+        i = ch->index(u);
+        return true;
+      }
+      if (ch->vertex(j) == u)
+        continue;
+      const Cell_handle next = ch->neighbor(j);
+      if (!visited.insert(next).second)
+        continue;
+      cells.emplace_back(next);
+      ++tail;
+    }
+    ++head;
+  }
+  while (head != tail);
+  return false;
+}
+
+template<typename Tr>
+bool is_edge_maybe_private(const Tr& tr,
+                           const typename Tr::Vertex_handle u,
+                           const typename Tr::Vertex_handle v)
+{
+  if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+    if (internal::Parallel_tuning::get().private_flip_marking)
+    {
+      typename Tr::Cell_handle c;
+      int i, j;
+      return is_edge_private(tr, u, v, c, i, j);
+    }
+  return tr.tds().is_edge(u, v);
+}
+
+/**
+* `TDS_3::is_facet(u, v, w, ...)` is `incident_cells(u, ...)` followed by a
+* scan, so it marks u's whole star. Flip calls it with u a RING APEX
+* (flip_edges.h, the boundary-flip result handling), which puts the marking at
+* depth 2 exactly as the other two walks did. Found by tracing the FIRST fix
+* and seeing 22-44 depth-2 stores survive it -- the walks a source read had
+* named were not all of them, which is the whole reason the trace is the
+* primary instrument.
+*/
+template<typename Tr>
+bool is_facet_maybe_private(const Tr& tr,
+                            const typename Tr::Vertex_handle u,
+                            const typename Tr::Vertex_handle v,
+                            const typename Tr::Vertex_handle w,
+                            typename Tr::Cell_handle& c, int& i, int& j, int& k)
+{
+  if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+    if (internal::Parallel_tuning::get().private_flip_marking)
+    {
+      using Cell_handle = typename Tr::Cell_handle;
+      if (u == v || u == w || v == w)
+        return false;
+      if (tr.dimension() < 2)
+        return false;
+      boost::container::small_vector<Cell_handle, 64> cells;
+      tr.incident_cells_threadsafe(u, std::back_inserter(cells));
+      for (const Cell_handle ch : cells)
+        if (ch->has_vertex(v, j) && ch->has_vertex(w, k))
+        {
+          c = ch;
+          i = c->index(u);
+          return true;
+        }
+      return false;
+    }
+  return tr.tds().is_facet(u, v, w, c, i, j, k);
+}
+
+template<typename Tr, typename OutputIterator>
+void incident_cells_maybe_private(const Tr& tr,
+                                  const typename Tr::Vertex_handle v,
+                                  OutputIterator out)
+{
+  if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
+    if (internal::Parallel_tuning::get().private_flip_marking)
+    {
+      tr.incident_cells_threadsafe(v, out);
+      return;
+    }
+  tr.incident_cells(v, out);
+}
+
 #ifdef CGAL_TR_DIMSTATS
 namespace internal {
 inline void spi_equiv(bool same)
