@@ -2209,6 +2209,51 @@ public:
   * chase costs more than probing a table keyed on vertex pointers the walk has
   * already loaded. Fewer operations, more misses.
   */
+  /**
+  * Mode 3: direct-mapped tag table, no collision resolution and no side vector.
+  *
+  * Mode 1's probe is a multiply-shift, a table load, then `seen[k - 1]` -- a
+  * DEPENDENT load into a second array -- and a loop on collision. All that is
+  * needed here is "have I already locked this vertex", and being wrong in the
+  * conservative direction is free: a missed skip costs one redundant
+  * `try_lock()` that is guaranteed to return true, never a missing lock.
+  *
+  * So: one slot per vertex, chosen from the pointer's low bits, holding a tag
+  * from the high bits. Hit means seen, miss means overwrite and report unseen.
+  * One shift, one mask, one load, one compare, one store -- no loop, no second
+  * array, and the table is 256 bytes like the others.
+  */
+  struct Zone_vertex_tags
+  {
+    static constexpr unsigned SLOTS = 64;     // power of two, 512 bytes
+    const void* slot[SLOTS];
+    Zone_vertex_tags() { std::memset(slot, 0, sizeof(slot)); }
+
+    /**
+    * The slot holds the FULL pointer, not a truncated tag.
+    *
+    * A truncated tag would be smaller and is what a cache like this normally
+    * stores, but here the two error directions are not symmetric. Reporting
+    * "unseen" for a vertex already locked costs one redundant `try_lock()`
+    * that returns true -- free. Reporting "seen" for a vertex NEVER locked
+    * drops a lock, and on this code a dropped lock is a SIGSEGV. A tag
+    * collision produces exactly the second kind, and it is only impossible if
+    * vertex pointers are aligned enough that the discarded bits cannot differ
+    * -- which is not something to assume about a container's element size.
+    * A full-pointer compare has no false positives at all, and still costs one
+    * load, one compare and one store with no dependent second load.
+    */
+    bool seen_or_record(const void* p)
+    {
+      const std::uintptr_t u = reinterpret_cast<std::uintptr_t>(p);
+      const unsigned s = unsigned(u >> 4) & (SLOTS - 1);
+      if(slot[s] == p)
+        return true;
+      slot[s] = p;
+      return false;
+    }
+  };
+
   static int zone_vertex_dedup_mode()
   {
     static const int mode = []{
@@ -2216,6 +2261,31 @@ public:
       return (e == nullptr) ? 1 : std::atoi(e);
     }();
     return mode;
+  }
+
+  bool try_lock_cell_tags(bool* tls, const Cell_handle& c,
+                          Zone_vertex_tags& tg) const
+  {
+    if(!this->is_parallel())
+      return true;
+    for(int k = 0; k < 4; ++k)
+    {
+      const Vertex_handle vk = c->vertex(k);
+      if(tg.seen_or_record(&*vk))
+        continue;
+      if(tls == nullptr)
+      {
+        if(!this->try_lock_vertex(vk))
+          return false;
+      }
+      else
+      {
+        const int gi = this->lock_grid_index(vk->point());
+        if(gi >= 0 && !this->try_lock_grid_index(tls, gi))
+          return false;
+      }
+    }
+    return true;
   }
 
   /**
@@ -2324,14 +2394,19 @@ public:
 
     const int dmode = this->is_parallel() ? zone_vertex_dedup_mode() : 0;
     Zone_vertex_dedup dd;
+    Zone_vertex_tags  tg;
     if(dmode == 1)
       dd.seen_or_record(&*v);           // v was just locked above
+    else if(dmode == 3)
+      tg.seen_or_record(&*v);
 
     // The seed cell is locked in full under every mode: there is no earlier
     // cell for its vertices to have been shared with.
     Cell_handle d = v->cell();
-    if(!(dmode == 1 ? this->try_lock_cell_dedup(tls, d, dd)
-                    : this->try_lock_cell_tls(tls, d))) // LOCK
+    const bool seed_ok = (dmode == 1) ? this->try_lock_cell_dedup(tls, d, dd)
+                       : (dmode == 3) ? this->try_lock_cell_tags(tls, d, tg)
+                                      : this->try_lock_cell_tls(tls, d);
+    if(!seed_ok) // LOCK
       return false;
 
     cells.push_back(d);
@@ -2349,6 +2424,7 @@ public:
 
         Cell_handle next = c->neighbor(i);
         const bool locked = (dmode == 2) ? this->try_lock_neighbour_cell(tls, c, i)
+                          : (dmode == 3) ? this->try_lock_cell_tags(tls, next, tg)
                           : (dmode == 1) ? this->try_lock_cell_dedup(tls, next, dd)
                                          : this->try_lock_cell_tls(tls, next);
         if(!locked) // LOCK
