@@ -244,6 +244,36 @@ private:
       t.mvlz_flip_zone       = 3;
     }
 
+    /**
+    * THE MVLZ ARMS SHIP ON BY DEFAULT from 2026-09-07, in the same shape as
+    * CGAL_TR_SHIP4 above: unset or 1 is what ships, `CGAL_TR_MVLZ_SHIP=0` is
+    * the pre-ship arm. Both halves of each operation move together because
+    * neither is safe alone -- a smaller zone with shared marking is an
+    * unprotected write by construction.
+    *
+    *   collapse  private_marking + mvlz_collapse_zone=1
+    *             ACCEPTED 2026-09-07, PGO acceptance, ghat +12.542%,
+    *             208 runs, 24/24 configs, Protocol VALID
+    *   flip      private_flip_marking + mvlz_flip_zone=3 (ring + mirror)
+    *             CLEAR 2026-09-07 on the SCREEN tier, ghat +20.843%,
+    *             208 runs, every gate passed, 23/24 configs faster.
+    *             POLICY 5.2 makes CLEAR ship-eligible without a PGO run.
+    *
+    * !! THE A/B VARIABLE CHANGED. !! Before this, `ab_alloc.sh
+    * CGAL_TR_COLLAPSE_MVLZ ... 0 1` and `... CGAL_TR_FLIP_MVLZ ... 0 1` were
+    * the arms. They are now BOTH ON in either arm, so those A/Bs would compare
+    * A against A' and report a null -- the failure this campaign has already
+    * paid for twelve times. Use `CGAL_TR_MVLZ_SHIP` as the arm variable, and
+    * confirm with envspy that the arms differ before believing any result.
+    */
+    if (flag_on("CGAL_TR_MVLZ_SHIP"))
+    {
+      t.private_marking      = true;
+      t.mvlz_collapse_zone   = 1;
+      t.private_flip_marking = true;
+      t.mvlz_flip_zone       = 3;
+    }
+
     // One switch for the combined re-measurement.
     if (!flag_on("CGAL_TR_SHIP4"))
     {
