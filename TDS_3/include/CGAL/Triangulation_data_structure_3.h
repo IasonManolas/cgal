@@ -26,6 +26,9 @@
 
 #include <array>
 #include <cstddef>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
 #include <functional>
 #include <iostream>
 #include <istream>
@@ -903,10 +906,26 @@ private:
                 Cell_handle c = cell_stack.top();
                 cell_stack.pop();
 
+#ifndef CGAL_TR_NO_PREFETCH_STAR
+                // next->tds_data() below is a load DEPENDENT on c->neighbor(i),
+                // so the four neighbours of a popped cell otherwise serialise
+                // into four full memory latencies. The neighbour handles all
+                // live in c, which is already hot; issuing their addresses up
+                // front lets the four cache misses overlap instead.
+                Cell_handle nb_[4];
+                for (int i_ = 0; i_ < 4; ++i_) {
+                        nb_[i_] = c->neighbor(i_);
+                        __builtin_prefetch(&*nb_[i_]);
+                }
+#endif
                 for (int i=0; i<4; ++i) {
                         if (c->vertex(i) == v)
                                 continue;
+#ifndef CGAL_TR_NO_PREFETCH_STAR
+                        Cell_handle next = nb_[i];
+#else
                         Cell_handle next = c->neighbor(i);
+#endif
                         if (c < next)
                                 *it.second++ = Facet(c, i); // Incident facet.
                         if (! next->tds_data().is_clear())
@@ -920,37 +939,113 @@ private:
         return it;
   }
 
+  // Star gather that never writes to the cells it visits (see
+  // incident_cells_3, which marks tds_data() and so cannot be run
+  // concurrently on overlapping stars).
+  //
+  // The visited set used to be
+  //     boost::container::flat_set<Cell_handle, std::less<>,
+  //                                small_vector<Cell_handle, 128>>
+  // whose insert is a lower_bound followed by a memmove of up to 128 handles:
+  // O(n^2) byte traffic in the star size, on a branch the predictor cannot
+  // learn, executed ~3n times per gather. It is replaced by an open-addressed
+  // table of 8-BIT INDICES into `cells` (0 = empty, k = cells[k-1]). The table
+  // is 256 bytes, so clearing it is four cache lines rather than 128 handle
+  // constructions, and a probe is one multiply-shift plus -- at the load
+  // factor a vertex star actually reaches (typically 20-40 cells, <= 0.16) --
+  // almost always a single slot read.
+  //
+  // Stars larger than the 8-bit index can address fall back to a linear scan
+  // of `cells`, which is correct because that scan sees every cell found so
+  // far, whether or not it was also recorded in the table.
   template <class IncidentFacetIterator, typename CellsContainers>
   void
   incident_cells_3_threadsafe(Vertex_handle v, Cell_handle d,
                               CellsContainers &cells,
                               IncidentFacetIterator facet_it) const
   {
-    boost::container::flat_set<Cell_handle,
-                               std::less<>,
-                               boost::container::small_vector<Cell_handle, 128>> found_cells;
-    // boost::unordered_set<Cell_handle, Handle_hash_function> found_cells;
+    // A/B scaffold: CGAL_TR_STAR_DEDUP=flat restores the flat_set above, so
+    // the two dedups can be compared in one binary under ab.sh/metric.py.
+    static const bool use_flat = []{
+      const char* const e = std::getenv("CGAL_TR_STAR_DEDUP");
+      return e != nullptr && e[0] == 'f';
+    }();
+    if (use_flat)
+    {
+      boost::container::flat_set<Cell_handle,
+                                 std::less<>,
+                                 boost::container::small_vector<Cell_handle, 128>> found_cells;
+      cells.push_back(d);
+      found_cells.insert(d);
+      std::size_t head = 0;
+      do {
+        Cell_handle c = cells[head];
+        for (int i=0; i<4; ++i) {
+          if (c->vertex(i) == v)
+            continue;
+          Cell_handle next = c->neighbor(i);
+          if (c < next)
+            *facet_it++ = Facet(c, i); // Incident facet
+          if (! found_cells.insert(next).second )
+            continue;
+          cells.push_back(next);
+        }
+        ++head;
+      } while (head != cells.size());
+      return;
+    }
 
+    constexpr unsigned    TSIZE  = 256;   // power of two
+    constexpr std::size_t MAXIDX = 192;   // keeps the table's load <= 0.75
+    unsigned char table[TSIZE];
+    std::memset(table, 0, sizeof(table));
+
+    auto seen_or_record = [&](Cell_handle ch, std::size_t idx) -> bool
+    {
+      if (idx > MAXIDX)
+        return std::find(cells.begin(), cells.end(), ch) == cells.end();
+      const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(&*ch);
+      unsigned s = unsigned((p * 0x9E3779B97F4A7C15ull) >> 56) & (TSIZE - 1);
+      for (;;) {
+        const unsigned char k = table[s];
+        if (k == 0) { table[s] = static_cast<unsigned char>(idx + 1); return true; }
+        if (cells[k - 1] == ch) return false;
+        s = (s + 1) & (TSIZE - 1);
+      }
+    };
+
+    seen_or_record(d, 0);
     cells.push_back(d);
-    found_cells.insert(d);
-    int head=0;
-    int tail=1;
+    std::size_t head = 0;
     do {
       Cell_handle c = cells[head];
 
+#ifndef CGAL_TR_NO_PREFETCH_STAR
+      // Same dependent-load break as in incident_cells_3: &*next is needed by
+      // the dedup probe below and is reached through c->neighbor(i), so the
+      // four neighbours otherwise serialise into four full memory latencies.
+      Cell_handle nb_[4];
+      for (int i_ = 0; i_ < 4; ++i_) {
+        nb_[i_] = c->neighbor(i_);
+        __builtin_prefetch(&*nb_[i_]);
+      }
+#endif
       for (int i=0; i<4; ++i) {
         if (c->vertex(i) == v)
           continue;
+#ifndef CGAL_TR_NO_PREFETCH_STAR
+        Cell_handle next = nb_[i];
+#else
         Cell_handle next = c->neighbor(i);
+#endif
         if (c < next)
           *facet_it++ = Facet(c, i); // Incident facet
-        if (! found_cells.insert(next).second )
+        if (! seen_or_record(next, cells.size()) )
           continue;
         cells.push_back(next);
-        ++tail;
       }
       ++head;
-    } while(head != tail);
+    } while (head != cells.size());
   }
 
   void just_incident_cells_3(Vertex_handle v,
