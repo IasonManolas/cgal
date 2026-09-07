@@ -105,6 +105,29 @@ struct Parallel_tuning
   // Parallel path only. See MVLZ_FLIP.md §4.
   bool private_flip_marking    = false;
   bool halo_tls_hoist          = false;
+  /**
+  * A3. Resolve the thread-local lock grid ONCE per zone instead of once per
+  * vertex asked about, by passing the resolved pointer down as `tls`.
+  *
+  * RECORDED AS -18.69% AND CLOSED. That number does not reproduce. Re-measured
+  * 2026-09-07 at HEAD, 3 reps, palindromic, geomean over
+  * 102041/118287/124534/65619 at f=0.5, arm consumed in both arms by envspy
+  * interception and the null device absent:
+  *
+  *     1 thread   +0.86%   3 of 4 configs faster, one neutral
+  *     4 threads  +0.85%   4 of 4 configs faster
+  *
+  * Output is byte-identical to the off arm at one thread on 102041, 124534 and
+  * 65619. The loop it hoists out of is not the loop that was measured: the
+  * zone vertex dedup (7088448ce42) removed the ~96-asks-per-zone redundancy,
+  * so what remains is ~25 distinct vertices, and the hoist now saves a
+  * thread-local lookup on each of them rather than competing with a much
+  * larger cost.
+  *
+  * STILL DEFAULT OFF. +0.86% is POLICY 5.2 CONFIRM tier (0-2%), which needs a
+  * PGO acceptance run, not a screen. Do not flip this default on the strength
+  * of the numbers above; run the CONFIRM first. Data: campaign/tls/.
+  */
   bool star_tls_hoist          = false;
   // A5: size the lock grid from mesh density instead of a constant.
   // 0 disables; otherwise the target number of star-sized neighbourhoods per
