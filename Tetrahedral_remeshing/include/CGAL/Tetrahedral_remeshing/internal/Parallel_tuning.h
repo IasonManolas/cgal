@@ -272,6 +272,18 @@ private:
       t.mvlz_collapse_zone   = 1;
       t.private_flip_marking = true;
       t.mvlz_flip_zone       = 3;
+      // Split joins the shipped set at the user's direction, 2026-09-07.
+      // WEAKER EVIDENCE THAN THE OTHER TWO, AND THE DIFFERENCE MATTERS:
+      // collapse has a PGO acceptance and flip a screen CLEAR; split has
+      // neither. Output is byte-identical to split_zone=0 at one thread on
+      // 118287, 124534, 65619 and 102041 f=0.5 (mesh md5), which is a real
+      // gate and drift-immune. Its TIMING is not established -- the runs
+      // measured ~+1%, inside noise, on a machine that was drifting 25% over
+      // the sweep. And its lock-coverage positive control (the `=2` sabotage
+      // arm, which must be shown to FIRE before a "0 violations" result from
+      // arm 1 means anything) has never been run. Revert this hunk alone if a
+      // parallel correctness question appears.
+      t.mvlz_split_zone      = 1;
     }
 
     // One switch for the combined re-measurement.
