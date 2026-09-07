@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdio>
 #include <chrono>
 #include <numeric>
 #include <dlfcn.h>
@@ -631,6 +632,25 @@ private:
     return enabled;
   }
 
+
+  /**
+  * CGAL_TR_ELISION_STATS=1 reports, per operation and per call, how many
+  * elements the interior/boundary classification actually freed from their
+  * lock zone. It exists because the classification is paid unconditionally
+  * (the elision_mode switch falls through to it), and its cost is only
+  * justified by what it produces. halofix measured `interior 0 | locked
+  * 392764` on every internal-flip call -- the chain running dead. Whether the
+  * same holds here is a measurement, not an inference, and this is it.
+  */
+  static bool elision_stats()
+  {
+    static const bool on = []{
+      const char* const e = std::getenv("CGAL_TR_ELISION_STATS");
+      return e != nullptr && *e == '1';
+    }();
+    return on;
+  }
+
   using Vertex_handle = typename C3t3::Triangulation::Vertex_handle;
   using Interior_set = boost::concurrent_flat_map<Vertex_handle, char,
                                                   boost::hash<Vertex_handle> >;
@@ -1168,6 +1188,16 @@ private:
     }
 
     const Interior_set interior = classify_interior(parts, op, c3t3);
+    if (elision_stats())
+    {
+      std::size_t n_int = 0, n_tot = 0;
+      for (const std::vector<Element_type>& part : parts)
+        for (const Element_type& e : part)
+        { ++n_tot; if (is_interior(e, op, interior)) ++n_int; }
+      std::fprintf(stderr, "[elision] %-34s interior %8zu | locked %8zu | %5.1f%% freed\n",
+                   op.operation_name().c_str(), n_int, n_tot - n_int,
+                   n_tot ? 100.0 * double(n_int) / double(n_tot) : 0.0);
+    }
 #ifdef CGAL_TR_ELISION_CHECK
     check_interior_classification(parts, op, c3t3, interior);
 #endif

@@ -906,26 +906,22 @@ private:
                 Cell_handle c = cell_stack.top();
                 cell_stack.pop();
 
-#ifndef CGAL_TR_NO_PREFETCH_STAR
                 // next->tds_data() below is a load DEPENDENT on c->neighbor(i),
                 // so the four neighbours of a popped cell otherwise serialise
                 // into four full memory latencies. The neighbour handles all
                 // live in c, which is already hot; issuing their addresses up
                 // front lets the four cache misses overlap instead.
                 Cell_handle nb_[4];
-                for (int i_ = 0; i_ < 4; ++i_) {
+                const bool pf_ = tr_star_gather_ported();
+                if (pf_)
+                  for (int i_ = 0; i_ < 4; ++i_) {
                         nb_[i_] = c->neighbor(i_);
                         __builtin_prefetch(&*nb_[i_]);
-                }
-#endif
+                  }
                 for (int i=0; i<4; ++i) {
                         if (c->vertex(i) == v)
                                 continue;
-#ifndef CGAL_TR_NO_PREFETCH_STAR
-                        Cell_handle next = nb_[i];
-#else
-                        Cell_handle next = c->neighbor(i);
-#endif
+                        Cell_handle next = pf_ ? nb_[i] : c->neighbor(i);
                         if (c < next)
                                 *it.second++ = Facet(c, i); // Incident facet.
                         if (! next->tds_data().is_clear())
@@ -937,6 +933,32 @@ private:
         } while(!cell_stack.empty());
 
         return it;
+  }
+
+  // ---------------------------------------------------------------------
+  // CGAL_TR_STAR_GATHER -- THE ARM VARIABLE for the ported star gather.
+  //
+  // POLICY 0.2 requires both arms of an A/B to live in ONE binary behind ONE
+  // environment variable. The port has two halves -- the open-addressed dedup
+  // and the neighbour prefetch that breaks the dependent load -- and the
+  // prefetch half was a compile-time #ifndef, which would have needed a second
+  // build and put the halves in different binaries. Both are runtime now.
+  //
+  //   unset or 1 = ported path (open-addressed dedup + prefetch)  -- ships
+  //   0          = pre-port path (flat_set dedup, no prefetch)    -- baseline
+  //
+  // CGAL_TR_STAR_DEDUP=flat is kept as a finer probe moving the dedup half
+  // alone, for attributing the two halves against each other.
+  //
+  // The branch is a function-local static: one predictable, well-predicted test
+  // per popped cell, against four memory latencies it may overlap.
+  static bool tr_star_gather_ported()
+  {
+    static const bool on = []{
+      const char* const e = std::getenv("CGAL_TR_STAR_GATHER");
+      return e == nullptr || *e != '0';
+    }();
+    return on;
   }
 
   // Star gather that never writes to the cells it visits (see
@@ -968,7 +990,8 @@ private:
     // the two dedups can be compared in one binary under ab.sh/metric.py.
     static const bool use_flat = []{
       const char* const e = std::getenv("CGAL_TR_STAR_DEDUP");
-      return e != nullptr && e[0] == 'f';
+      if (e != nullptr && e[0] == 'f') return true;   // finer probe, dedup half only
+      return !tr_star_gather_ported();                // the arm variable
     }();
     if (use_flat)
     {
@@ -1020,24 +1043,20 @@ private:
     do {
       Cell_handle c = cells[head];
 
-#ifndef CGAL_TR_NO_PREFETCH_STAR
       // Same dependent-load break as in incident_cells_3: &*next is needed by
       // the dedup probe below and is reached through c->neighbor(i), so the
       // four neighbours otherwise serialise into four full memory latencies.
       Cell_handle nb_[4];
-      for (int i_ = 0; i_ < 4; ++i_) {
-        nb_[i_] = c->neighbor(i_);
-        __builtin_prefetch(&*nb_[i_]);
-      }
-#endif
+      const bool pf_ = tr_star_gather_ported();
+      if (pf_)
+        for (int i_ = 0; i_ < 4; ++i_) {
+          nb_[i_] = c->neighbor(i_);
+          __builtin_prefetch(&*nb_[i_]);
+        }
       for (int i=0; i<4; ++i) {
         if (c->vertex(i) == v)
           continue;
-#ifndef CGAL_TR_NO_PREFETCH_STAR
-        Cell_handle next = nb_[i];
-#else
-        Cell_handle next = c->neighbor(i);
-#endif
+        Cell_handle next = pf_ ? nb_[i] : c->neighbor(i);
         if (c < next)
           *facet_it++ = Facet(c, i); // Incident facet
         if (! seen_or_record(next, cells.size()) )
