@@ -2192,13 +2192,98 @@ public:
     }
   };
 
-  static bool zone_vertex_dedup_on()
+  /**
+  * 0 = no dedup, every cell asks about all four of its vertices.
+  * 1 = the open-addressed table above. THE DEFAULT.
+  * 2 = the mirror-vertex step below. KILLED, kept as a control.
+  *
+  * 2 needs no table at all, so it looked like the better of the two. It is
+  * not: measured against 0 in the same binary, 3 reps, palindromic, geomean
+  * over 102041/118287/124534/65619 at f=0.5,
+  *
+  *     1 thread    mode 1  0.9076    mode 2  0.9405
+  *     4 threads   mode 1  0.9138    mode 2  0.9425
+  *
+  * `mirror_index(c, i)` is `c->neighbor(i)->index(c)`, a scan of `next`'s four
+  * neighbour pointers behind a dependent load on `next` itself. That cache
+  * chase costs more than probing a table keyed on vertex pointers the walk has
+  * already loaded. Fewer operations, more misses.
+  */
+  static int zone_vertex_dedup_mode()
   {
-    static const bool on = []{
+    static const int mode = []{
       const char* const e = std::getenv("CGAL_TR_ZONE_VDEDUP");
-      return e == nullptr || *e != '0';
+      return (e == nullptr) ? 1 : std::atoi(e);
     }();
-    return on;
+    return mode;
+  }
+
+  /**
+  * The neighbour step, locked in O(1) with no visited set.
+  *
+  * `next = c->neighbor(i)` shares with `c` the facet opposite `c`'s vertex i,
+  * which is three of `c`'s four vertices. `c` is only ever in the queue after
+  * it was locked in full, so those three are already held by this thread.
+  * `next`'s fourth vertex -- the one opposite the shared facet, which is
+  * `mirror_vertex(c, i)` -- is therefore the ONLY vertex of `next` that can
+  * still need locking.
+  *
+  * So the whole visited set collapses to one index lookup. This is exact for
+  * the same reason the table was: a vertex this thread already holds answers
+  * `try_lock()` true off its own thread-local grid, so not asking returns the
+  * same answer and leaves the same locks held. If `next` was already reached
+  * by another path its mirror vertex is simply re-locked, which is a no-op.
+  */
+  bool try_lock_neighbour_cell(bool* tls, const Cell_handle& c, int i) const
+  {
+    if(!this->is_parallel())
+      return true;
+    const Cell_handle next = c->neighbor(i);
+    const Vertex_handle vn = next->vertex(this->_tds.mirror_index(c, i));
+    // Positive control FOR THE CHECK BELOW: with this set the mirror vertex is
+    // not locked at all, so the check must FIRE. A check that has never been
+    // seen to fire proves nothing when it passes.
+    static const bool sabotage =
+      std::getenv("CGAL_TR_ZONE_VDEDUP_SABOTAGE") != nullptr;
+
+    bool ok;
+    if(sabotage)
+      ok = true;
+    else if(tls == nullptr)
+      ok = this->try_lock_vertex(vn);
+    else
+    {
+      const int gi = this->lock_grid_index(vn->point());
+      ok = (gi < 0) || this->try_lock_grid_index(tls, gi);
+    }
+
+    // Positive control for the induction the mode rests on: after a successful
+    // neighbour step, ALL FOUR of `next`'s vertices must be held by this
+    // thread, not just the mirror one. Arguing that from the walk's structure
+    // is not the same as observing it, and a dropped lock on this project
+    // surfaces as a SIGSEGV rather than a wrong answer. Opt-in, off in every
+    // measured build.
+    // Cached: this is on the hot path, and an uncached getenv() here -- a
+    // linear scan of the environment ~96 times per zone -- measured as a 49%
+    // regression that looked exactly like the mode being a bad idea.
+    static const bool check =
+      std::getenv("CGAL_TR_ZONE_VDEDUP_CHECK") != nullptr;
+    if(ok && check)
+    {
+      for(int k = 0; k < 4; ++k)
+      {
+        const Vertex_handle vk = next->vertex(k);
+        if(this->is_infinite(vk))
+          continue;
+        if(!this->is_point_locked_by_this_thread(vk->point()))
+        {
+          std::fprintf(stderr,
+            "[vdedup] UNHELD vertex %d of a neighbour cell after the mirror step\n", k);
+          std::abort();
+        }
+      }
+    }
+    return ok;
   }
 
   // `try_lock_cell_tls()` with the redundant per-vertex asks removed.
@@ -2237,14 +2322,16 @@ public:
     if(!this->try_lock_vertex(v))
       return false;
 
+    const int dmode = this->is_parallel() ? zone_vertex_dedup_mode() : 0;
     Zone_vertex_dedup dd;
-    const bool dedup = zone_vertex_dedup_on() && this->is_parallel();
-    if(dedup)
+    if(dmode == 1)
       dd.seen_or_record(&*v);           // v was just locked above
 
+    // The seed cell is locked in full under every mode: there is no earlier
+    // cell for its vertices to have been shared with.
     Cell_handle d = v->cell();
-    if(!(dedup ? this->try_lock_cell_dedup(tls, d, dd)
-               : this->try_lock_cell_tls(tls, d))) // LOCK
+    if(!(dmode == 1 ? this->try_lock_cell_dedup(tls, d, dd)
+                    : this->try_lock_cell_tls(tls, d))) // LOCK
       return false;
 
     cells.push_back(d);
@@ -2261,8 +2348,10 @@ public:
           continue;
 
         Cell_handle next = c->neighbor(i);
-        if(!(dedup ? this->try_lock_cell_dedup(tls, next, dd)
-                   : this->try_lock_cell_tls(tls, next))) // LOCK
+        const bool locked = (dmode == 2) ? this->try_lock_neighbour_cell(tls, c, i)
+                          : (dmode == 1) ? this->try_lock_cell_dedup(tls, next, dd)
+                                         : this->try_lock_cell_tls(tls, next);
+        if(!locked) // LOCK
         {
           for(Cell_handle ch : cells)
           {
