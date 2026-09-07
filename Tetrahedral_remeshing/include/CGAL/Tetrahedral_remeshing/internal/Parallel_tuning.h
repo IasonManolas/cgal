@@ -83,7 +83,12 @@ struct Parallel_tuning
   // documented as crashing. So mode 1 is expected to FAIL, and that expectation
   // is what makes it worth running: a control that is supposed to fire.
   // 0 = today's zone (both full stars + the apex halo)
-  // 1 = both stars, no halo
+  // 1 = both stars, no halo -- a CONTROL that is expected to fail, not the
+  //     candidate. Measured: it takes unprotected stores from 110 to 310 on
+  //     the same 8 operations (MVLZ_FLIP.md 4b)
+  // 3 = the measured MVLZ: ring cells + their mirror cells. 13.00 zone
+  //     vertices against 32.00 today, a strict subset in 24/24 probed
+  //     operations. THE CANDIDATE
   // (2 = sabotage is NOT implemented yet; the loader rejects it rather than
   //  silently behaving like 0 -- an arm that does not differ from its control
   //  is the A-vs-A' failure this campaign has already paid for twelve times.)
@@ -184,7 +189,7 @@ private:
     t.mvlz_split_zone          = number("CGAL_TR_MVLZ_SPLIT_ZONE", 0);
     t.mvlz_collapse_zone       = number("CGAL_TR_MVLZ_COLLAPSE_ZONE", 0);
     t.mvlz_flip_zone           = number("CGAL_TR_MVLZ_FLIP_ZONE", 0);
-    if (t.mvlz_flip_zone != 0 && t.mvlz_flip_zone != 1)
+    if (t.mvlz_flip_zone != 0 && t.mvlz_flip_zone != 1 && t.mvlz_flip_zone != 3)
     {
       std::fprintf(stderr, "CGAL_TR_MVLZ_FLIP_ZONE=%d is not implemented\n",
                    t.mvlz_flip_zone);
@@ -222,15 +227,21 @@ private:
 
     // ONE switch for the shippable flip change, for the same reason as
     // CGAL_TR_COLLAPSE_MVLZ above: `ab_alloc.sh` takes a single environment
-    // variable as the arm, and the two halves are inseparable anyway. Dropping
-    // the apex halo is only safe once flip's marking is private -- measured,
-    // the halo's whole contribution in the traced sample was covering
-    // `tds_data()` scratch writes at depth 2 (MVLZ_FLIP.md §4b) -- so
-    // measuring either half alone measures something that cannot ship.
+    // variable as the arm, and the two halves are inseparable anyway. The
+    // smaller zone is only safe once flip's marking is private -- mode 3 stops
+    // locking the stars, and a marking walk over a star it no longer holds is
+    // an unprotected write by construction -- so measuring either half alone
+    // measures something that cannot ship.
+    //
+    // NOTE this changed on 2026-09-07: it used to select mode 1 (both stars,
+    // no halo), which the measurement says is the WRONG DIRECTION -- it drops
+    // protection from the mirror cells, which ARE written, while keeping the
+    // rest of the stars, which are not (MVLZ_FLIP.md §5). Mode 1 survives as a
+    // control that is supposed to fail.
     if (flag("CGAL_TR_FLIP_MVLZ"))
     {
       t.private_flip_marking = true;
-      t.mvlz_flip_zone       = 1;
+      t.mvlz_flip_zone       = 3;
     }
 
     // One switch for the combined re-measurement.

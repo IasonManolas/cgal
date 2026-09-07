@@ -643,8 +643,10 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
 
     boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
     if (o_inc_vh.empty())
+    {
       CGAL_TR_MVLZ_SITE("flip_n_to_m/incident_cells(apex)#1");
       incident_cells_maybe_private(tr, vh, std::back_inserter(o_inc_vh));
+    }
 
     //a chord is an edge joining vh to an apex that is not one of its two
     //neighbors on the ring (positions p-1 and p+1)
@@ -808,8 +810,10 @@ Sliver_removal_result flip_n_to_m(C3t3& c3t3,
 
   boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
   if (o_inc_vh.empty())
+  {
     CGAL_TR_MVLZ_SITE("flip_n_to_m/incident_cells(apex)#2");
     incident_cells_maybe_private(tr, vh, std::back_inserter(o_inc_vh));
+  }
 
   do
   {
@@ -1981,14 +1985,14 @@ bool flip_surface_edge(C3t3& c3t3,
           CGAL_expensive_assertion(tr.tds().is_edge(vh2, vh3));
           Cell_handle c;
           int li, lj, lk;
-          CGAL_expensive_assertion_code(bool b =)
           CGAL_TR_MVLZ_SITE("flip_surface_edge/is_facet(vh0)");
+          CGAL_expensive_assertion_code(bool b =)
           is_facet_maybe_private(tr, vh2, vh3, vh0, c, li, lj, lk);
           CGAL_expensive_assertion(b);
           c3t3.add_to_complex(c, (6 - li - lj - lk), surfi);
 
-          CGAL_expensive_assertion_code(b = )
           CGAL_TR_MVLZ_SITE("flip_surface_edge/is_facet(vh1)");
+          CGAL_expensive_assertion_code(b = )
           is_facet_maybe_private(tr, vh2, vh3, vh1, c, li, lj, lk);
           CGAL_expensive_assertion(b);
           c3t3.add_to_complex(c, (6 - li - lj - lk), surfi);
@@ -2118,6 +2122,11 @@ public:
                       const Vertex_handle v0, const Vertex_handle v1,
                       Cells_vector& inc0, Cells_vector& inc1) const
   {
+    // Mode 3 does not take the two stars at all, so it cannot be expressed as
+    // an early return further down: it replaces the star walks themselves.
+    if (Parallel_tuning::get().mvlz_flip_zone == 3)
+      return lock_flip_mvlz(tr, v0, v1, inc0, inc1);
+
     bool* const tls = zone_tls(tr);
     if (!tr.try_lock_and_get_incident_cells(v0, inc0, tls)
      || !tr.try_lock_and_get_incident_cells(v1, inc1, tls))
@@ -2135,10 +2144,97 @@ public:
     // a control that is supposed to fire.
     const int mvlz = Parallel_tuning::get().mvlz_flip_zone;
     if (mvlz == 1)
-      return true;                       // candidate: both stars, no halo
+      return true;                       // control: both stars, no halo
 
     return lock_zone_halo(tr, inc0, inc1,
                           Parallel_tuning::get().apex_only_flip_halo);
+  }
+
+  /**
+  * MODE 3 -- the measured MVLZ: **ring cells and their mirror cells**.
+  *
+  * `write set only : 13.00 vertices` against `locked today : 32.00`, a strict
+  * subset in 24/24 probed operations (MVLZ_FLIP.md §3, and the `LOCK SET PER
+  * OPERATION` block of every trace report). The ring cells are rewritten in
+  * full; the mirror cells -- the cells across the ring's two OUTER facets --
+  * are written at `neighbor(i)` only, which is the re-stitching the apex halo
+  * was added for. Nothing else is written: `written cells by class:
+  * ring=27 mirror=10 star_other=0 far=0`.
+  *
+  * A ring cell holds v0, v1 and two apices; the facets opposite the two
+  * APICES contain the edge, so their neighbours are further ring cells. The
+  * two facets opposite v0 and v1 are the outer ones, and their neighbours are
+  * the mirror cells -- which is why only `index(v0)` and `index(v1)` are
+  * followed below. A mirror cell shares that whole facet with its ring cell,
+  * so three of its four vertices are already locked and only its apex is new.
+  *
+  * WHY THE STARS ARE STILL WALKED BUT NO LONGER LOCKED. `execute_operation()`
+  * needs the full star of v0 in `inc_cells` -- `is_edge_uv()` scans it -- and
+  * `find_best_flip()` walks the star of a ring apex. Those are READS, and the
+  * protocol already covers them: a reader of a cell is safe holding ANY ONE of
+  * its four vertices, because a writer needs all four. Every star cell of v0
+  * contains v0; every cell in a ring apex's star contains that apex, which is
+  * a vertex of a ring cell. Both are locked here. Measured, every arm and
+  * every class: 0 unprotected loads.
+  *
+  * The walk must be `incident_cells_threadsafe`, not `incident_cells`: the
+  * latter marks the shared `tds_data()` byte, and the cells it would mark are
+  * no longer inside the zone. This mode is therefore inseparable from
+  * `private_flip_marking`, exactly as collapse's zone was -- which is why
+  * `CGAL_TR_FLIP_MVLZ` sets both.
+  *
+  * The two walks agree with `try_lock_and_get_incident_cells()` in ORDER and
+  * not merely as sets: both are breadth-first from `v->cell()` over the same
+  * `i = 0..3` neighbour order with the same `vertex(i) == v` skip. So
+  * `inc_cells` holds the same sequence and `is_edge_uv()` returns the same
+  * cell. That is an argument; the gate is byte-identical output at one thread.
+  */
+  bool lock_flip_mvlz(const typename C3t3::Triangulation& tr,
+                      const Vertex_handle v0, const Vertex_handle v1,
+                      Cells_vector& inc0, Cells_vector& inc1) const
+  {
+    bool* const tls = zone_tls(tr);
+
+    // Same primitive as lock_zone_halo(): the grid index of the vertex's
+    // point, or the whole-vertex lock when the TLS hoist is off. A vertex
+    // whose point falls outside the grid gives gi < 0 and needs no lock, the
+    // convention the rest of the locking code already uses for the infinite
+    // vertex.
+    const auto take = [&](const Vertex_handle& v) -> bool
+    {
+      if (tls == nullptr)
+        return tr.try_lock_vertex(v);
+      const int gi = tr.lock_grid_index(v->point());
+      return (gi < 0) ? true : tr.try_lock_grid_index(tls, gi);
+    };
+
+    // The endpoints first, and before anything is dereferenced: `v->cell()`
+    // must not be read until v is held. Both are written by the flip anyway.
+    if (!take(v0) || !take(v1))
+      return false;
+
+    tr.incident_cells_threadsafe(v0, std::back_inserter(inc0));
+    tr.incident_cells_threadsafe(v1, std::back_inserter(inc1));
+
+    for (const Cell_handle c : inc0)
+    {
+      int iv1;
+      if (!c->has_vertex(v1, iv1))
+        continue;                         // in star(v0) but not a ring cell
+
+      for (int i = 0; i < 4; ++i)         // ring cell: rewritten in full
+        if (!take(c->vertex(i)))
+          return false;
+
+      const int iv0 = c->index(v0);
+      for (const int j : { iv0, iv1 })    // the two OUTER facets
+      {
+        const Cell_handle n = c->neighbor(j);
+        if (!take(n->vertex(n->index(c))))   // the mirror apex
+          return false;
+      }
+    }
+    return true;
   }
 
   static bool flip_halo_lock_enabled()
@@ -2214,8 +2310,11 @@ public:
     // the measurement against a zone that was never acquired. The per-object
     // coverage fields come from the lock data structure itself and are honest
     // either way; this line is about the T set.
-    if (Parallel_tuning::get().mvlz_flip_zone == 0)
+    const int mvlz_arm = Parallel_tuning::get().mvlz_flip_zone;
+    if (mvlz_arm == 0)
       mvlz.zone_today_has_apex_halo();   // lock_flip_zone(): both stars + halo
+    else if (mvlz_arm == 3)
+      mvlz.zone_today_is_ring_mirror();  // lock_flip_mvlz(): ring + mirror
     mvlz.classify((vp.first->in_dimension() == 3 && vp.second->in_dimension() == 3) ? 1 : 0);
     mvlz.begin("flip", vp.first, vp.second);
     struct Mvlz_end {
@@ -2226,8 +2325,13 @@ public:
 
     Cells_vector& o_inc_vh = inc_cells[vp.first];
     if (o_inc_vh.empty())
+    {
+      // MARKING walk, and the only one left inside a window. It is normally
+      // dead: lock_zone() has already filled inc_cells[vp.first], so the guard
+      // is false on the parallel path. Counted to keep that a measurement.
       CGAL_TR_MVLZ_SITE("internal_flip_exec/incident_cells(v0)");
       c3t3.triangulation().incident_cells(vp.first, std::back_inserter(o_inc_vh));
+    }
 
     Cell_handle ch;
     int i0, i1;

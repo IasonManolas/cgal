@@ -38,6 +38,7 @@
 #include <CGAL/utility.h>
 #include <CGAL/SMDS_3/internal/indices_management.h>
 #include <CGAL/Tetrahedral_remeshing/internal/Parallel_tuning.h>
+#include <CGAL/Tetrahedral_remeshing/internal/MVLZ_probe.h>
 
 #include <CGAL/IO/File_binary_mesh_3.h>
 
@@ -1381,10 +1382,12 @@ bool is_edge_maybe_private(const Tr& tr,
   if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
     if (internal::Parallel_tuning::get().private_flip_marking)
     {
+      CGAL_TR_MVLZ_SITE("helper/is_edge:PRIVATE");
       typename Tr::Cell_handle c;
       int i, j;
       return is_edge_private(tr, u, v, c, i, j);
     }
+  CGAL_TR_MVLZ_SITE("helper/is_edge:SHARED");
   return tr.tds().is_edge(u, v);
 }
 
@@ -1407,6 +1410,7 @@ bool is_facet_maybe_private(const Tr& tr,
   if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
     if (internal::Parallel_tuning::get().private_flip_marking)
     {
+      CGAL_TR_MVLZ_SITE("helper/is_facet:PRIVATE");
       using Cell_handle = typename Tr::Cell_handle;
       if (u == v || u == w || v == w)
         return false;
@@ -1423,6 +1427,7 @@ bool is_facet_maybe_private(const Tr& tr,
         }
       return false;
     }
+  CGAL_TR_MVLZ_SITE("helper/is_facet:SHARED");
   return tr.tds().is_facet(u, v, w, c, i, j, k);
 }
 
@@ -1434,9 +1439,11 @@ void incident_cells_maybe_private(const Tr& tr,
   if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
     if (internal::Parallel_tuning::get().private_flip_marking)
     {
+      CGAL_TR_MVLZ_SITE("helper/incident_cells:PRIVATE");
       tr.incident_cells_threadsafe(v, out);
       return;
     }
+  CGAL_TR_MVLZ_SITE("helper/incident_cells:SHARED");
   tr.incident_cells(v, out);
 }
 
@@ -1550,12 +1557,22 @@ surface_patch_index(const typename C3t3::Vertex_handle v,
       return mine;
     }
 #else
+    CGAL_TR_MVLZ_SITE("surface_patch_index/PRIVATE");
     return surface_patch_index_private(v, c3t3);
 #endif
   }
 
   // the star is examined through an output iterator rather than collected :
   // only the first facet of the complex is of interest
+  //
+  // MARKING WALK. `incident_facets(v, out)` goes through
+  // `visit_incident_cells()`, which marks `tds_data()` on every cell of the
+  // star and clears it afterwards -- TDS_3.h:194 and :193, reached from :915
+  // and :1427. Those are exactly the addresses a flip trace attributes its
+  // remaining depth-1 stores to, on ring, mirror AND "other" cells alike.
+  // Counted here so that "is this walk reached from inside a FLIP window"
+  // stops being a source-reading question.
+  CGAL_TR_MVLZ_SITE("surface_patch_index/incident_facets(v)");
   c3t3.triangulation().incident_facets(v,
     boost::make_function_output_iterator([&](const Facet& f)
     {

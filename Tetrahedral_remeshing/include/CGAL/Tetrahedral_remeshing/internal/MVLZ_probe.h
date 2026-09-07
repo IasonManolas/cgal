@@ -383,6 +383,7 @@ class Mvlz_probe
   // reporting split's zone for a collapse would make that check compare the
   // measurement against a zone the code does not take.
   bool m_zone_has_halo = false;
+  bool m_zone_is_ring_mirror = false;
 
   static long& counter() { static long c = 0; return c; }
   static long& windows_closed() { static long c = 0; return c; }
@@ -467,6 +468,7 @@ public:
   // merely smaller.
   void zone_today(std::unordered_set<const Vertex*>& z) const
   {
+    if (m_zone_is_ring_mirror) { zone_ring_mirror(z); return; }
     std::vector<Cell_handle> inc;
     std::vector<Cell_handle> star;
     for (Vertex_handle v : {m_v0, m_v1})
@@ -488,12 +490,41 @@ public:
       }
   }
 
+  // The zone flip's MODE 3 takes: ring cells in full, plus the apex of each
+  // mirror cell. It must be built here and not inferred from the stars,
+  // because mode 3 does not lock the stars at all -- reporting the star zone
+  // for it would compare the measured minimum against a zone the code never
+  // acquired, which is the failure the `zone_today_has_apex_halo()` comment
+  // already warns about for arm 1.
+  void zone_ring_mirror(std::unordered_set<const Vertex*>& z) const
+  {
+    std::vector<Cell_handle> inc;
+    m_tr.incident_cells(m_v0, std::back_inserter(inc));
+    z.insert(&*m_v0);
+    z.insert(&*m_v1);
+    for (const Cell_handle c : inc)
+    {
+      int iv1;
+      if (!c->has_vertex(m_v1, iv1)) continue;
+      for (int i = 0; i < 4; ++i) z.insert(&*c->vertex(i));
+      const int iv0 = c->index(m_v0);
+      for (const int j : { iv0, iv1 })
+      {
+        const Cell_handle n = c->neighbor(j);
+        z.insert(&*n->vertex(n->index(c)));
+      }
+    }
+  }
+
 public:
   explicit Mvlz_probe(Tr& tr) : m_tr(tr) { m_R = Mvlz_config::get().radius; }
 
   // Call before begin() for an operation whose shipped zone includes the
   // apex halo (collapse), so "locked today" names the zone the code takes.
   void zone_today_has_apex_halo() { m_zone_has_halo = true; }
+
+  // Call before begin() when the arm under test is flip's mode 3.
+  void zone_today_is_ring_mirror() { m_zone_is_ring_mirror = true; }
 
   // Call before begin(). 1 = the operation is in the class the small zone is
   // claimed to cover, 0 = it is not, -1 = unclassified.
