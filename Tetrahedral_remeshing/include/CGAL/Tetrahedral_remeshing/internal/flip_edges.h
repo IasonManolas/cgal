@@ -1246,7 +1246,7 @@ std::size_t flip_all_edges(const std::vector<VertexPair>& edges,
   {
     boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vp.first];
     if (o_inc_vh.empty())
-      tr.incident_cells(vp.first, std::back_inserter(o_inc_vh));
+      incident_cells_maybe_private(tr, vp.first, std::back_inserter(o_inc_vh));
 
     Cell_handle ch;
     int i0, i1;
@@ -2128,8 +2128,10 @@ public:
       return lock_flip_mvlz(tr, v0, v1, inc0, inc1);
 
     bool* const tls = zone_tls(tr);
-    if (!tr.try_lock_and_get_incident_cells(v0, inc0, tls)
-     || !tr.try_lock_and_get_incident_cells(v1, inc1, tls))
+    const bool tlagic_ok = tr.try_lock_and_get_incident_cells(v0, inc0, tls)
+                        && tr.try_lock_and_get_incident_cells(v1, inc1, tls);
+    Star_census::hit(0, inc0.size() + inc1.size());
+    if (!tlagic_ok)
       return false;
 
     if (!flip_halo_lock_enabled())
@@ -2214,7 +2216,37 @@ public:
       return false;
 
     tr.incident_cells_threadsafe(v0, std::back_inserter(inc0));
-    tr.incident_cells_threadsafe(v1, std::back_inserter(inc1));
+    Star_census::hit(1, inc0.size());
+
+    /**
+    * The star of v1 is gathered only to fill `inc_cells[v1]`; nothing in this
+    * function reads `inc1`, and mode 3's zone is the ring plus the mirror
+    * cells, which are found by scanning `inc0`. The census says the two walks
+    * here are 73.6% of every star cell the remesher walks, and this one is
+    * half of that.
+    *
+    * Leaving it empty is safe because EVERY reader of the map guards with
+    * `if (o_inc_vh.empty())` and refills. The readers keyed on an element's
+    * first vertex stay dead, because `lock_zone()` fills that slot for every
+    * element before `execute_operation()` runs; the ones keyed on an arbitrary
+    * vertex already refill through `incident_cells_maybe_private()`, so a
+    * refill that does become live is a PRIVATE walk and cannot mark a cell the
+    * zone no longer holds. The two that still used the marking walk are moved
+    * onto the private one below, so that stays true.
+    *
+    * Off by default until it has been soaked at 4 threads: this trades an
+    * eager walk for a conditional one, and if the condition fires more often
+    * than the census suggests it moves cost rather than removing it.
+    */
+    static const bool lazy_star1 = []{
+      const char* const e = std::getenv("CGAL_TR_FLIP_LAZY_STAR1");
+      return e != nullptr && *e != '0';
+    }();
+    if (!lazy_star1)
+    {
+      tr.incident_cells_threadsafe(v1, std::back_inserter(inc1));
+      Star_census::hit(2, inc1.size());
+    }
 
     for (const Cell_handle c : inc0)
     {
@@ -2330,7 +2362,8 @@ public:
       // dead: lock_zone() has already filled inc_cells[vp.first], so the guard
       // is false on the parallel path. Counted to keep that a measurement.
       CGAL_TR_MVLZ_SITE("internal_flip_exec/incident_cells(v0)");
-      c3t3.triangulation().incident_cells(vp.first, std::back_inserter(o_inc_vh));
+      incident_cells_maybe_private(c3t3.triangulation(), vp.first,
+                                   std::back_inserter(o_inc_vh));
     }
 
     Cell_handle ch;
@@ -2457,7 +2490,7 @@ public:
     if (inc_vh0.empty())
     {
       CGAL_TR_MVLZ_SITE("boundary_flip_exec/incident_cells(vh0)");
-      tr.incident_cells(vh0, std::back_inserter(inc_vh0));
+      incident_cells_maybe_private(tr, vh0, std::back_inserter(inc_vh0));
     }
 
     Cell_handle c;

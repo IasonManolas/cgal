@@ -1225,6 +1225,7 @@ public:
   bool lock_zone(const Element_type& v, const C3t3& c3t3) const
   {
     std::vector<Cell_handle> inc_cells;
+    Star_census::hit(7, 0);
     return c3t3.triangulation().try_lock_and_get_incident_cells(
              v, inc_cells, zone_tls(c3t3.triangulation()));
   }
@@ -1539,6 +1540,7 @@ public:
   bool lock_zone(const Element_type& v, const C3t3& c3t3) const
   {
     std::vector<Cell_handle> inc_cells;
+    Star_census::hit(7, 0);
     return c3t3.triangulation().try_lock_and_get_incident_cells(
              v, inc_cells, zone_tls(c3t3.triangulation()));
   }
@@ -1661,6 +1663,7 @@ public:
   bool lock_zone(const Element_type& v, const C3t3& c3t3) const
   {
     std::vector<Cell_handle> inc_cells;
+    Star_census::hit(7, 0);
     return c3t3.triangulation().try_lock_and_get_incident_cells(
              v, inc_cells, zone_tls(c3t3.triangulation()));
   }

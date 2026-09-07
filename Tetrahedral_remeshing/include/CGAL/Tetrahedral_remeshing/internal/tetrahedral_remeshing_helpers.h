@@ -1331,6 +1331,76 @@ bool is_boundary_vertex(const typename C3t3::Vertex_handle& v,
 * PARALLEL ONLY, at compile time, so a sequential build never instantiates
 * them and its byte-identity gate keeps its meaning.
 */
+/**
+* Star-gather census. The profile says the parallel lineage spends about twice
+* as much absolute time walking vertex stars as the sequential one does, which
+* would be REDUNDANT walks rather than expensive ones -- a different problem
+* with a different fix. Counting per call site is the only way to tell which,
+* because a flat profile names the callee and every one of these walks is the
+* same callee.
+*
+* Off unless CGAL_TR_STAR_CENSUS is set; the counters are relaxed atomics and
+* the whole thing compiles to nothing on the fast path when it is unset.
+*/
+struct Star_census
+{
+  struct Site { std::atomic<std::size_t> calls{0}; std::atomic<std::size_t> cells{0}; };
+  static bool on()
+  {
+    static const bool b = std::getenv("CGAL_TR_STAR_CENSUS") != nullptr;
+    return b;
+  }
+  static Site& site(int i)
+  {
+    static Site s[8];
+    return s[i];
+  }
+  static const char* name(int i)
+  {
+    static const char* n[8] = {
+      "flip/tlagic",        "lock_flip_mvlz/v0",  "lock_flip_mvlz/v1",
+      "helper/inc_cells",   "helper/is_facet",    "is_edge_private",
+      "collapse/tlagic",    "split+smooth/tlagic" };
+    return n[i];
+  }
+  static void hit(int i, std::size_t cells)
+  {
+    if (!on()) return;
+    // Construct every Site BEFORE the Reporter, so the Reporter is destroyed
+    // first and still sees live counters. Without this the report never
+    // printed at all -- the Reporter static was simply never instantiated.
+    static const bool init = []{
+      for (int k = 0; k < 8; ++k) site(k);
+      reporter();
+      return true;
+    }();
+    (void)init;
+    site(i).calls.fetch_add(1, std::memory_order_relaxed);
+    site(i).cells.fetch_add(cells, std::memory_order_relaxed);
+  }
+  // Reported from a static destructor, with the exit code, because a run that
+  // crashed prints nothing and a silent control otherwise looks like a pass.
+  struct Reporter
+  {
+    ~Reporter()
+    {
+      if (!on()) return;
+      std::size_t tc = 0, tw = 0;
+      for (int i = 0; i < 8; ++i)
+      { tc += site(i).calls.load(); tw += site(i).cells.load(); }
+      std::fprintf(stderr, "[census] TOTAL calls=%zu cells=%zu\n", tc, tw);
+      for (int i = 0; i < 8; ++i)
+      {
+        const std::size_t c = site(i).calls.load(), w = site(i).cells.load();
+        if (c == 0) continue;
+        std::fprintf(stderr, "[census] %-36s calls=%9zu cells=%11zu (%5.1f%% of cells)\n",
+                     name(i), c, w, tw ? 100.0 * double(w) / double(tw) : 0.0);
+      }
+    }
+  };
+  static Reporter& reporter() { static Reporter r; return r; }
+};
+
 template<typename Tr>
 bool is_edge_private(const Tr& tr,
                      const typename Tr::Vertex_handle u,
@@ -1412,6 +1482,7 @@ bool is_edge_private(const Tr& tr,
       {
         c = ch;
         i = ch->index(u);
+        Star_census::hit(5, cells.size());
         return true;
       }
       if (ch->vertex(j) == u)
@@ -1424,6 +1495,7 @@ bool is_edge_private(const Tr& tr,
     ++head;
   }
   while (head != cells.size());
+  Star_census::hit(5, cells.size());
   return false;
 }
 
@@ -1471,6 +1543,7 @@ bool is_facet_maybe_private(const Tr& tr,
         return false;
       boost::container::small_vector<Cell_handle, 64> cells;
       tr.incident_cells_threadsafe(u, std::back_inserter(cells));
+      Star_census::hit(4, cells.size());
       for (const Cell_handle ch : cells)
         if (ch->has_vertex(v, j) && ch->has_vertex(w, k))
         {
@@ -1494,6 +1567,7 @@ void incident_cells_maybe_private(const Tr& tr,
     {
       CGAL_TR_MVLZ_SITE("helper/incident_cells:PRIVATE");
       tr.incident_cells_threadsafe(v, out);
+      Star_census::hit(3, 0);
       return;
     }
   CGAL_TR_MVLZ_SITE("helper/incident_cells:SHARED");

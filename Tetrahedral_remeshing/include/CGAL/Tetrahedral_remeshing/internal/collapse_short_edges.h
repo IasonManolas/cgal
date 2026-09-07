@@ -1836,6 +1836,7 @@ public:
       CGAL_TR_ZS(stage_star0);
       return false;
     }
+    Star_census::hit(6, inc_cells_0.size());
     if (!tr.try_lock_and_get_incident_cells(e.second, inc_cells_1, tls))
     {
       CGAL_TR_ZS(stage_star1);

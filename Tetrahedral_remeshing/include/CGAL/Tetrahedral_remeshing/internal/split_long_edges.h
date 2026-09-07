@@ -571,6 +571,7 @@ public:
       return lock_zone_mvlz(element, tr);
 
     std::vector<Cell_handle> inc_cells_first, inc_cells_second;
+    Star_census::hit(7, 0);
     return tr.try_lock_and_get_incident_cells(element.first, inc_cells_first)
         && tr.try_lock_and_get_incident_cells(element.second, inc_cells_second);
   }
@@ -635,6 +636,7 @@ public:
     // corrupt each other's marks. So the first endpoint's star must be held
     // in full; only the second endpoint's exclusive star is saved.
     std::vector<Cell_handle> star_first;
+    Star_census::hit(7, 0);
     if (!tr.try_lock_and_get_incident_cells(element.first, star_first))
       return false;
 
