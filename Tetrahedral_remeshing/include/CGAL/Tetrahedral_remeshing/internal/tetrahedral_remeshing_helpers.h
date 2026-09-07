@@ -51,6 +51,8 @@
 
 #include <optional>
 #include <atomic>
+#include <cstring>
+#include <cstdint>
 #include <algorithm>
 #include <iostream>
 
@@ -1341,14 +1343,66 @@ bool is_edge_private(const Tr& tr,
     return false;
 
   boost::container::small_vector<Cell_handle, 128> cells;
+
+  // The visited set used to be
+  //     boost::container::flat_set<Cell_handle, std::less<>,
+  //                                small_vector<Cell_handle, 128>>
+  // whose insert is a lower_bound followed by a memmove of up to 128 handles:
+  // O(n^2) byte traffic in the star size, on a branch the predictor cannot
+  // learn, executed ~3n times per walk. It showed up as 4.1% of one-thread
+  // runtime in `boost::container::dtl::flat_tree::insert_unique`, alongside
+  // 1.8% in this function.
+  //
+  // This is the same open-addressed table of 8-bit indices into `cells` that
+  // `TDS_3::incident_cells_3_threadsafe` already uses (0 = empty, k =
+  // cells[k-1]): 256 bytes to clear rather than 128 handle constructions, and
+  // a probe is one multiply-shift plus, at the load factor a vertex star
+  // actually reaches, almost always a single slot read. Stars larger than the
+  // 8-bit index can address fall back to a linear scan of `cells`, which is
+  // correct because that scan sees every cell found so far whether or not it
+  // was also recorded in the table.
+  //
+  // THE TABLE IS A LOCAL AND NOTHING SHARED IS WRITTEN, so this is sound at
+  // any number of threads -- it is a cheaper spelling of the same private
+  // visited set, not a sequential shortcut. `CGAL_TR_PRIVATE_DEDUP=0` restores
+  // the flat_set so both arms live in one binary (POLICY 0.2).
+  static const bool use_flat = []{
+    const char* const e = std::getenv("CGAL_TR_PRIVATE_DEDUP");
+    return e != nullptr && *e == '0';
+  }();
+
+  constexpr unsigned    TSIZE  = 256;   // power of two
+  constexpr std::size_t MAXIDX = 192;   // keeps the table's load <= 0.75
+  unsigned char table[TSIZE];
   boost::container::flat_set<Cell_handle, std::less<>,
     boost::container::small_vector<Cell_handle, 128>> visited;
+  if (use_flat)
+    visited.reserve(128);
+  else
+    std::memset(table, 0, sizeof(table));
+
+  const auto seen_or_record = [&](Cell_handle ch, std::size_t idx) -> bool
+  {
+    if (use_flat)
+      return visited.insert(ch).second;
+    if (idx > MAXIDX)
+      return std::find(cells.begin(), cells.end(), ch) == cells.end();
+    const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(&*ch);
+    unsigned sl = unsigned((p * 0x9E3779B97F4A7C15ull) >> 56) & (TSIZE - 1);
+    for (;;)
+    {
+      const unsigned char k = table[sl];
+      if (k == 0) { table[sl] = static_cast<unsigned char>(idx + 1); return true; }
+      if (cells[k - 1] == ch) return false;
+      sl = (sl + 1) & (TSIZE - 1);
+    }
+  };
 
   const Cell_handle d = u->cell();
+  seen_or_record(d, 0);
   cells.emplace_back(d);
-  visited.insert(d);
 
-  int head = 0, tail = 1;
+  std::size_t head = 0;
   do
   {
     const Cell_handle ch = cells[head];
@@ -1363,14 +1417,13 @@ bool is_edge_private(const Tr& tr,
       if (ch->vertex(j) == u)
         continue;
       const Cell_handle next = ch->neighbor(j);
-      if (!visited.insert(next).second)
+      if (!seen_or_record(next, cells.size()))
         continue;
       cells.emplace_back(next);
-      ++tail;
     }
     ++head;
   }
-  while (head != tail);
+  while (head != cells.size());
   return false;
 }
 
@@ -1380,7 +1433,7 @@ bool is_edge_maybe_private(const Tr& tr,
                            const typename Tr::Vertex_handle v)
 {
   if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
-    if (internal::Parallel_tuning::get().private_flip_marking)
+    if (internal::Parallel_tuning::use_private_flip_marking())
     {
       CGAL_TR_MVLZ_SITE("helper/is_edge:PRIVATE");
       typename Tr::Cell_handle c;
@@ -1408,7 +1461,7 @@ bool is_facet_maybe_private(const Tr& tr,
                             typename Tr::Cell_handle& c, int& i, int& j, int& k)
 {
   if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
-    if (internal::Parallel_tuning::get().private_flip_marking)
+    if (internal::Parallel_tuning::use_private_flip_marking())
     {
       CGAL_TR_MVLZ_SITE("helper/is_facet:PRIVATE");
       using Cell_handle = typename Tr::Cell_handle;
@@ -1437,7 +1490,7 @@ void incident_cells_maybe_private(const Tr& tr,
                                   OutputIterator out)
 {
   if constexpr (std::is_convertible_v<typename Tr::Concurrency_tag, CGAL::Parallel_tag>)
-    if (internal::Parallel_tuning::get().private_flip_marking)
+    if (internal::Parallel_tuning::use_private_flip_marking())
     {
       CGAL_TR_MVLZ_SITE("helper/incident_cells:PRIVATE");
       tr.incident_cells_threadsafe(v, out);

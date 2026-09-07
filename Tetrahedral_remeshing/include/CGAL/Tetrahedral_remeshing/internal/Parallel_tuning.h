@@ -178,6 +178,36 @@ struct Parallel_tuning
     return b;
   }
 
+  /**
+  * A7 level 4. The narrow version of what level 2 got wrong.
+  *
+  * Level 2 turned `private_flip_marking` off outright, which also reverted the
+  * flip ZONE from mode 3 to mode 0 -- a different walk, not just a different
+  * dedup -- and lost. This flag leaves every zone exactly as it ships and
+  * changes only the three `*_maybe_private` helpers, sending them to the
+  * shared-marking counterpart they were introduced to replace. With one worker
+  * the shared `tds_data()` byte has no other writer, so that is sound, and it
+  * is cheaper: `is_edge_private`'s visited set is a `flat_set` over a
+  * `small_vector<128>`, whose insert is a lower_bound plus a memmove of up to
+  * 128 handles -- the same O(n^2) structure the star-gather port removed from
+  * `incident_cells_3_threadsafe`. Measured at 1 thread with A7 level 3:
+  * `is_edge_private` 1.8% and `flat_tree::insert_unique` 4.1%.
+  *
+  * Set by the remesher before any pass runs; never flipped afterwards.
+  */
+  static bool& seq_shared_marking()
+  {
+    static bool b = false;
+    return b;
+  }
+
+  // True when a `*_maybe_private` helper should take its PRIVATE branch: the
+  // arm is on, and we are not on the single-worker fast path.
+  static bool use_private_flip_marking()
+  {
+    return get().private_flip_marking && !seq_shared_marking();
+  }
+
   static const Parallel_tuning& get()
   {
     static const Parallel_tuning t = load();

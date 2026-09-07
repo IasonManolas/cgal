@@ -193,7 +193,12 @@ private:
       if (m_c3t3.triangulation().get_lock_data_structure() == nullptr)
       {
         const int level = skip_locking();
-        if (level == 3)
+        if (level >= 4)
+          // Narrower than level 2: the zones are untouched, only the three
+          // `*_maybe_private` helpers go back to shared marking.
+          Tetrahedral_remeshing::internal::Parallel_tuning::seq_shared_marking()
+            = true;
+        if (level >= 3)
           // Level 3 keeps the MVLZ arms (level 2 turned them off and was
           // measurably WORSE, so that arm survives only as a control) and
           // makes their private star walk dedup by marking instead.
