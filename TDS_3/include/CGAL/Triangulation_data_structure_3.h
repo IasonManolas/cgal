@@ -156,6 +156,25 @@ using Visited_vertex =
                              internal::Tag_or_has_member_visited_tag_t<Tag, Vertex_handle>::value>;
 } // end namespace TDS_3
 
+/**
+* A7 level 3. Set by the tetrahedral remesher when it has established that
+* the executor has a single worker, before any pass runs.
+*
+* `incident_cells_3_threadsafe` exists because it must not write the shared
+* `tds_data()` marking byte. With one worker there is nobody to share it
+* with, so the walk can dedup by marking -- one byte written per cell and a
+* clear pass at the end -- instead of a 256-byte table memset plus a
+* multiply-shift probe per neighbour. The BFS itself, its neighbour order
+* and the facets it emits are unchanged, so callers that depend on the
+* ORDER of `cells` (flip's `lock_flip_mvlz`, `is_edge_private`) see the same
+* sequence.
+*/
+inline bool& tds_seq_marking_gather()
+{
+  static bool b = false;
+  return b;
+}
+
 template < class Vb = Triangulation_ds_vertex_base_3<>,
            class Cb = Triangulation_ds_cell_base_3<>,
            class Concurrency_tag_ = Sequential_tag
@@ -961,6 +980,7 @@ private:
     return on;
   }
 
+
   // Star gather that never writes to the cells it visits (see
   // incident_cells_3, which marks tds_data() and so cannot be run
   // concurrently on overlapping stars).
@@ -1015,6 +1035,35 @@ private:
         }
         ++head;
       } while (head != cells.size());
+      return;
+    }
+
+    if (tds_seq_marking_gather())
+    {
+      // Same walk, marking dedup. `cells` may already hold entries from an
+      // earlier gather by the same caller, so the clear pass is bounded to
+      // what this call appended.
+      const std::size_t first = cells.size();
+      cells.push_back(d);
+      d->tds_data().mark_in_conflict();
+      std::size_t head = first;
+      do {
+        Cell_handle c = cells[head];
+        for (int i=0; i<4; ++i) {
+          if (c->vertex(i) == v)
+            continue;
+          Cell_handle next = c->neighbor(i);
+          if (c < next)
+            *facet_it++ = Facet(c, i); // Incident facet
+          if (! next->tds_data().is_clear())
+            continue;
+          cells.push_back(next);
+          next->tds_data().mark_in_conflict();
+        }
+        ++head;
+      } while (head != cells.size());
+      for (std::size_t k = first; k < cells.size(); ++k)
+        cells[k]->tds_data().clear();
       return;
     }
 

@@ -110,6 +110,17 @@ struct Parallel_tuning
   // 0 disables; otherwise the target number of star-sized neighbourhoods per
   // grid cell.
   int  lock_grid_per_star      = 0;
+  // A7 -- skip the spatial lock grid entirely when the executor is running
+  // with one worker. This is not a heuristic: with a single thread there is no
+  // other party a zone can protect against, so every try_lock() is pure
+  // overhead. Measured at 1 thread the lock protocol is ~38% of runtime
+  // (try_lock 18.0%, incident_cells_3_threadsafe 9.3%,
+  // try_lock_and_get_incident_cells 8.2%, pthread_getspecific 2.9%), all of it
+  // paid against threads that do not exist.
+  //
+  // Off by default so the arm and its control live in one binary (POLICY 0.2).
+  // 1 = drop the grid when the effective parallelism is 1.
+  int  seq_nolock              = 0;
   // A6 -- SHIPPED 2026-09-05, +0.62%. Bounded attempts, then defer to the end
   // of the bucket, instead of spinning on a contended zone. Unordered
   // operations only. The gain is NOT reclaimed spin -- utilisation is
@@ -147,11 +158,50 @@ struct Parallel_tuning
   * single A/B with one environment variable (POLICY 0.2). `CGAL_TR_SHIP4=0`
   * is the pre-ship arm; unset or 1 is what ships.
   */
+  /**
+  * A7 level 2 -- the sequential fast path. Set by the remesher when it has
+  * established that the executor has a single worker (see
+  * `Adaptive_remesher::skip_locking()`), BEFORE any pass runs, and never
+  * flipped afterwards, so no pass ever observes it changing.
+  *
+  * With one worker the MVLZ arms have nothing to protect: `private_marking`
+  * and `private_flip_marking` buy race-freedom by walking stars with a
+  * PRIVATE visited set (`incident_cells_threadsafe`, `is_edge_private`)
+  * instead of the shared `tds_data()` marking byte, and the marking walk is
+  * the cheaper of the two. Measured at 1 thread with the lock grid already
+  * dropped, `incident_cells_3_threadsafe` is 11.2% of runtime against 2.6%
+  * for the marking `incident_cells_3`.
+  */
+  static bool& seq_fast_path()
+  {
+    static bool b = false;
+    return b;
+  }
+
   static const Parallel_tuning& get()
   {
     static const Parallel_tuning t = load();
+    static const Parallel_tuning t_seq = sequentialize(t);
+    return seq_fast_path() ? t_seq : t;
+  }
+
+private:
+  /**
+  * The single-worker variant of a loaded tuning: every switch whose only job
+  * is to make a pass safe against another thread goes back to the cheaper
+  * shared-marking path it replaced. Nothing else is touched, so a switch
+  * being measured stays in force.
+  */
+  static Parallel_tuning sequentialize(Parallel_tuning t)
+  {
+    t.private_marking      = false;
+    t.private_flip_marking = false;
+    t.mvlz_collapse_zone   = 0;
+    t.mvlz_flip_zone       = 0;
+    t.mvlz_split_zone      = 0;
     return t;
   }
+public:
 
 private:
   static bool flag(const char* name)
@@ -201,6 +251,7 @@ private:
     t.halo_tls_hoist           = flag("CGAL_TR_HALO_TLS_HOIST");
     t.star_tls_hoist           = flag("CGAL_TR_STAR_TLS_HOIST");
     t.lock_grid_per_star       = number("CGAL_TR_LOCK_GRID_PER_STAR", 0);
+    t.seq_nolock               = number_or("CGAL_TR_SEQ_NOLOCK", 0);
     t.defer_on_conflict        = flag_on("CGAL_TR_DEFER_ON_CONFLICT");
     t.elision_mode             = number("CGAL_TR_ELISION_MODE", 0);
     t.fused_edge_pass          = flag("CGAL_TR_FUSED_EDGE_PASS");

@@ -34,9 +34,14 @@
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 
+#ifdef CGAL_LINKED_WITH_TBB
+#include <tbb/global_control.h>
+#endif
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <memory>
 #include <optional>
@@ -187,10 +192,54 @@ private:
     {
       if (m_c3t3.triangulation().get_lock_data_structure() == nullptr)
       {
+        const int level = skip_locking();
+        if (level == 3)
+          // Level 3 keeps the MVLZ arms (level 2 turned them off and was
+          // measurably WORSE, so that arm survives only as a control) and
+          // makes their private star walk dedup by marking instead.
+          CGAL::tds_seq_marking_gather() = true;
+        if (level == 2)
+          // Also send the passes down the shared-marking walks the MVLZ arms
+          // replaced. Set here, before any pass runs, and never flipped again.
+          Tetrahedral_remeshing::internal::Parallel_tuning::seq_fast_path() = true;
+        if (level >= 1)
+          return; // leaves the lock data structure null: every try_lock() is a
+                  // no-op returning true, at no cost.
         m_lock_ds.emplace(m_c3t3.bbox(), chosen_lock_grid_size());
         m_c3t3.triangulation().set_lock_data_structure(std::addressof(*m_lock_ds));
       }
     }
+#endif
+  }
+
+  /**
+  * A7 -- true when the lock grid can be dropped because the executor has a
+  * single worker. `tbb::global_control::active_value()` reports the
+  * parallelism actually in force, which is what the benchmark's
+  * `global_control` sets and what `parallel_for` will honour, so it is the
+  * right thing to test rather than the hardware concurrency.
+  *
+  * Guarded by `CGAL_TR_SEQ_NOLOCK` (default off) so both arms are in one
+  * binary; it prints to stderr under CGAL_TR_SEQ_NOLOCK_VERBOSE so that the
+  * arm can be shown to be live by interception rather than by reading source
+  * (POLICY 0.2).
+  */
+  int skip_locking() const
+  {
+#ifdef CGAL_LINKED_WITH_TBB
+    const int level =
+      Tetrahedral_remeshing::internal::Parallel_tuning::get().seq_nolock;
+    if (level == 0)
+      return 0;
+    const std::size_t p = tbb::global_control::active_value(
+                            tbb::global_control::max_allowed_parallelism);
+    const int applied = (p <= 1) ? level : 0;
+    if (std::getenv("CGAL_TR_SEQ_NOLOCK_VERBOSE") != nullptr)
+      std::fprintf(stderr, "[A7] max_allowed_parallelism=%zu level=%d applied=%d\n",
+                   p, level, applied);
+    return applied;
+#else
+    return 0;
 #endif
   }
 

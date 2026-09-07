@@ -2114,6 +2114,11 @@ public:
   // Tetrahedral_remeshing passes.
   bool try_lock_cell_tls(bool* tls, const Cell_handle& c) const
   {
+    // No lock data structure at all (A7: a single-worker executor drops it).
+    // Short-circuit here rather than dereferencing the cell's four vertices to
+    // ask four separate no-op questions.
+    if(!this->is_parallel())
+      return true;
     if(tls == nullptr)
       return this->try_lock_cell(c);
     for(int k = 0; k < 4; ++k)
