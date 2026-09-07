@@ -284,6 +284,62 @@ struct Mvlz_totals
   }
 };
 
+/**
+* WHICH WALK ACTUALLY FIRES INSIDE A WINDOW.
+*
+* Written after two rounds of naming a marking call site by reading source.
+* The first named two of three walks and removed 93% of the marking; the
+* second named `is_facet()` at the boundary-flip sites, was given a private
+* twin, and the re-trace came back IDENTICAL TO THE DIGIT -- because that site
+* is never reached in these windows at all. A 5-minute build and a 30-minute
+* trace bought the information that a call counter gives for free.
+*
+* `addr2line` cannot supply it: a store's inline chain ends at the out-of-line
+* callee (`incident_cells_3`), and the CALLER is a return address on the stack,
+* which a memory trace does not record. So the caller has to say its own name.
+*
+* Read the two columns together. `in_window` is the number the residue can
+* come from; `total` says whether a site with `in_window = 0` is dead code or
+* merely outside the probe. A site that is 0/0 was never compiled into the
+* path being measured, and blaming it is the mistake above.
+*
+* No locking: the probe runs single-threaded by construction (the trace is
+* segmented on program order), and `mvlz_in_window` is only meaningful there.
+*/
+struct Mvlz_site_census
+{
+  std::map<std::string, long> in_window, total;
+
+  static Mvlz_site_census& get() { static Mvlz_site_census c; return c; }
+
+  void report(std::FILE* f) const
+  {
+    if (!f) return;
+    std::fprintf(f, "\nCALL-SITE CENSUS  (walks that mark tds_data, by caller)\n");
+    if (total.empty())
+    {
+      std::fprintf(f, "  (no site instrumented was reached at all)\n");
+      return;
+    }
+    std::fprintf(f, "  %-40s %10s %10s\n", "site", "in_window", "total");
+    for (const auto& kv : total)
+    {
+      const auto it = in_window.find(kv.first);
+      std::fprintf(f, "  %-40s %10ld %10ld\n", kv.first.c_str(),
+                   (it == in_window.end()) ? 0L : it->second, kv.second);
+    }
+    std::fprintf(f, "  A site at in_window=0 cannot be the source of an "
+                    "unprotected store inside a window.\n");
+  }
+};
+
+inline void mvlz_site(const char* name)
+{
+  Mvlz_site_census& c = Mvlz_site_census::get();
+  ++c.total[name];
+  if (mvlz_in_window) ++c.in_window[name];
+}
+
 template <typename Tr>
 class Mvlz_probe
 {
@@ -608,6 +664,11 @@ public:
       return;
     }
 
+    // DIFF mode opens its window here -- the snapshot is taken, the operation
+    // runs next. The flag was originally set in the trace branch only, which
+    // made the call-site census read 0 everywhere on a diff run: the cheap
+    // instrument silently answered a question it was not being asked.
+    mvlz_in_window = 1;
     self_test();
   }
 
@@ -634,10 +695,17 @@ public:
       if (cfg.exit_after >= 0 && ++windows_closed() >= cfg.exit_after)
       {
         if (cfg.manifest) { std::fprintf(cfg.manifest, "#DONE\n"); std::fflush(cfg.manifest); }
+        // HERE, not in the reporter's destructor: `_Exit` skips static
+        // destructors by design, so a census printed from ~Mvlz_reporter is
+        // silently absent from every trace run -- which is the run where the
+        // window counts mean the most. Measured: the first traced census
+        // printed nothing at all.
+        Mvlz_site_census::get().report(stderr);
         std::_Exit(0);
       }
       return;
     }
+    mvlz_in_window = 0;
     finish(m_kind);
   }
 
@@ -812,6 +880,12 @@ struct Mvlz_reporter
     const char* p = std::getenv("CGAL_TR_MVLZ_OUT");
     if (!Mvlz_config::get().trace)
       Mvlz_totals::get().report(p ? p : "mvlz.txt");
+    // stderr on purpose: in TRACE mode no report file is written at all. This
+    // covers the runs that reach normal exit; a trace with CGAL_TR_MVLZ_
+    // EXIT_AFTER leaves through `_Exit(0)` and prints its census from there
+    // instead. A crashed run prints neither -- check the run's rc before
+    // reading a silent census as "no sites were hit".
+    Mvlz_site_census::get().report(stderr);
   }
 };
 
@@ -824,6 +898,7 @@ inline Mvlz_reporter& mvlz_reporter()
   // printed its results and then spun forever on a zero-byte report file.
   Mvlz_config::get();
   Mvlz_totals::get();
+  Mvlz_site_census::get();
   static Mvlz_reporter r;
   return r;
 }
@@ -831,6 +906,15 @@ inline Mvlz_reporter& mvlz_reporter()
 } // internal
 } // Tetrahedral_remeshing
 } // CGAL
+
+// Name a marking walk from the caller `is_facet`/`incident_cells` cannot see.
+// Compiles away entirely without the probe, so it may sit on a hot path.
+#define CGAL_TR_MVLZ_SITE(name) \
+  ::CGAL::Tetrahedral_remeshing::internal::mvlz_site(name)
+
+#else  // CGAL_TR_MVLZ_PROBE
+
+#define CGAL_TR_MVLZ_SITE(name) ((void)0)
 
 #endif // CGAL_TR_MVLZ_PROBE
 #endif // CGAL_TETRAHEDRAL_REMESHING_MVLZ_PROBE_H

@@ -126,10 +126,24 @@ Sliver_removal_result flip_3_to_2(typename C3t3::Edge& edge,
   }
 
   //Check structural validity
+  //
+  // MARKING WALK. `is_facet(u, v, w)` is `incident_cells(u)` plus a scan, and
+  // `u` here is a RING APEX -- a depth-1 vertex whose own star reaches depth 2.
+  // That is the third of flip's three marking walks and the one that survived
+  // the first fix: 22-40 unprotected `tds_data()` stores per 8 operations, all
+  // at depth 2 with cov=1 (MVLZ_FLIP.md 7). The other two, in flip_n_to_m,
+  // were already private; this one is on the 3-to-2 path, which is why
+  // making `is_facet` private at the boundary-flip sites changed nothing.
+  //
+  // Only the boolean is used here -- c/i0/i1/i3 are discarded -- so the
+  // ORDER CAVEAT on `is_facet_maybe_private` (which of the two cells sharing
+  // the facet is returned may differ) cannot reach the result.
   Cell_handle c;
   int i0, i1, i3;
-  if (tr.is_facet(vertices_around_edge[0], vertices_around_edge[1], vertices_around_edge[2],
-                  c, i0, i1, i3))
+  CGAL_TR_MVLZ_SITE("flip_3_to_2/is_facet");
+  if (is_facet_maybe_private(tr,
+                             vertices_around_edge[0], vertices_around_edge[1],
+                             vertices_around_edge[2], c, i0, i1, i3))
     return NOT_FLIPPABLE;
 
   //Check topological validity
@@ -441,6 +455,7 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
               // MVLZ_FLIP.md §4: `curr` is a RING APEX, at depth 1, so this
               // walk of its star marks tds_data() out at depth 2 -- outside
               // any flip zone. Private under CGAL_TR_PRIVATE_FLIP_MARKING.
+              CGAL_TR_MVLZ_SITE("flip_n_to_m/is_edge(curr,apex)");
               if (is_edge_maybe_private(tr, curr, vh))
                 is_edge = true;
             }
@@ -628,6 +643,7 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
 
     boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
     if (o_inc_vh.empty())
+      CGAL_TR_MVLZ_SITE("flip_n_to_m/incident_cells(apex)#1");
       incident_cells_maybe_private(tr, vh, std::back_inserter(o_inc_vh));
 
     //a chord is an edge joining vh to an apex that is not one of its two
@@ -792,6 +808,7 @@ Sliver_removal_result flip_n_to_m(C3t3& c3t3,
 
   boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
   if (o_inc_vh.empty())
+    CGAL_TR_MVLZ_SITE("flip_n_to_m/incident_cells(apex)#2");
     incident_cells_maybe_private(tr, vh, std::back_inserter(o_inc_vh));
 
   do
@@ -1915,6 +1932,7 @@ bool flip_surface_edge(C3t3& c3t3,
 
     CGAL_expensive_assertion(debug::check_facets(vh0, vh1, vh2, vh3, c3t3));
 
+    CGAL_TR_MVLZ_SITE("flip_surface_edge/is_edge(vh2,vh3)");
     if (!is_edge_maybe_private(tr, vh2, vh3)) // most-likely to happen early exit
     {
       const Surface_patch_index surfi = c3t3.surface_patch_index(boundary_facets[0]);
@@ -1964,11 +1982,13 @@ bool flip_surface_edge(C3t3& c3t3,
           Cell_handle c;
           int li, lj, lk;
           CGAL_expensive_assertion_code(bool b =)
+          CGAL_TR_MVLZ_SITE("flip_surface_edge/is_facet(vh0)");
           is_facet_maybe_private(tr, vh2, vh3, vh0, c, li, lj, lk);
           CGAL_expensive_assertion(b);
           c3t3.add_to_complex(c, (6 - li - lj - lk), surfi);
 
           CGAL_expensive_assertion_code(b = )
+          CGAL_TR_MVLZ_SITE("flip_surface_edge/is_facet(vh1)");
           is_facet_maybe_private(tr, vh2, vh3, vh1, c, li, lj, lk);
           CGAL_expensive_assertion(b);
           c3t3.add_to_complex(c, (6 - li - lj - lk), surfi);
@@ -2206,6 +2226,7 @@ public:
 
     Cells_vector& o_inc_vh = inc_cells[vp.first];
     if (o_inc_vh.empty())
+      CGAL_TR_MVLZ_SITE("internal_flip_exec/incident_cells(v0)");
       c3t3.triangulation().incident_cells(vp.first, std::back_inserter(o_inc_vh));
 
     Cell_handle ch;
@@ -2330,7 +2351,10 @@ public:
 
     Cells_vector& inc_vh0 = inc_cells[vh0];
     if (inc_vh0.empty())
+    {
+      CGAL_TR_MVLZ_SITE("boundary_flip_exec/incident_cells(vh0)");
       tr.incident_cells(vh0, std::back_inserter(inc_vh0));
+    }
 
     Cell_handle c;
     int i, j;
