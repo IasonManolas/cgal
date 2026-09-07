@@ -54,6 +54,8 @@
 #include <boost/property_map/function_property_map.hpp>
 #include <boost/unordered_map.hpp>
 #include <boost/utility/result_of.hpp>
+#include <cstring>
+#include <cstdint>
 #include <boost/container/small_vector.hpp>
 
 #ifndef CGAL_TRIANGULATION_3_DONT_INSERT_RANGE_OF_POINTS_WITH_INFO
@@ -2130,6 +2132,101 @@ public:
     return true;
   }
 
+  /**
+  * Zone-lock vertex dedup.
+  *
+  * Locking a star cell means locking its four vertices, and the walk visits
+  * ~24 cells sharing ~25 distinct vertices -- three of every cell's four are
+  * shared with the cell it was reached from. The unmemoised walk therefore
+  * asks `try_lock_vertex()` about 96 times for those ~25 vertices, and each
+  * ask is a thread-local-grid lookup plus a `grid_index()` computation (three
+  * multiplies and three clamps) before the load that answers it. At one
+  * thread that showed up as 18.9% of runtime in
+  * `Spatial_lock_grid_base_3::try_lock` and 2.5% in `pthread_getspecific`.
+  *
+  * WHY SKIPPING IS EXACT, NOT AN APPROXIMATION. A vertex this thread has
+  * ALREADY LOCKED in this same walk has `tls_grid[grid_index(v)] == true`, so
+  * `try_lock()` on it is guaranteed to return true without touching the
+  * shared grid. Skipping that call therefore returns the same answer and
+  * leaves the same locks held. Only vertices already locked BY THIS WALK are
+  * skipped, so no lock is ever assumed that was not taken.
+  *
+  * That makes it sound at ANY number of threads -- the table is a stack local
+  * and nothing shared is read or written differently. `CGAL_TR_ZONE_VDEDUP=0`
+  * restores the unmemoised walk so both arms live in one binary (POLICY 0.2).
+  *
+  * The table is the same open-addressed shape used by the star gather: 8-bit
+  * indices into `seen` (0 = empty, k = seen[k-1]), 256 bytes to clear. Stars
+  * with more distinct vertices than the 8-bit index can address fall back to
+  * reporting "not seen", which costs a redundant lock call and is never wrong.
+  */
+  struct Zone_vertex_dedup
+  {
+    static constexpr unsigned    TSIZE  = 256;   // power of two
+    static constexpr std::size_t MAXIDX = 192;   // keeps the table's load <= 0.75
+    unsigned char table[TSIZE];
+    boost::container::small_vector<const void*, 64> seen;
+
+    Zone_vertex_dedup() { std::memset(table, 0, sizeof(table)); }
+
+    // True when this vertex was already locked earlier in this same walk.
+    bool seen_or_record(const void* p)
+    {
+      if(seen.size() > MAXIDX)
+        return false;
+      unsigned s = unsigned((reinterpret_cast<std::uintptr_t>(p)
+                             * 0x9E3779B97F4A7C15ull) >> 56) & (TSIZE - 1);
+      for(;;)
+      {
+        const unsigned char k = table[s];
+        if(k == 0)
+        {
+          seen.push_back(p);
+          table[s] = static_cast<unsigned char>(seen.size());
+          return false;
+        }
+        if(seen[k - 1] == p)
+          return true;
+        s = (s + 1) & (TSIZE - 1);
+      }
+    }
+  };
+
+  static bool zone_vertex_dedup_on()
+  {
+    static const bool on = []{
+      const char* const e = std::getenv("CGAL_TR_ZONE_VDEDUP");
+      return e == nullptr || *e != '0';
+    }();
+    return on;
+  }
+
+  // `try_lock_cell_tls()` with the redundant per-vertex asks removed.
+  bool try_lock_cell_dedup(bool* tls, const Cell_handle& c,
+                           Zone_vertex_dedup& dd) const
+  {
+    if(!this->is_parallel())
+      return true;
+    for(int k = 0; k < 4; ++k)
+    {
+      const Vertex_handle vk = c->vertex(k);
+      if(dd.seen_or_record(&*vk))
+        continue;                       // already held by this walk
+      if(tls == nullptr)
+      {
+        if(!this->try_lock_vertex(vk))
+          return false;
+      }
+      else
+      {
+        const int gi = this->lock_grid_index(vk->point());
+        if(gi >= 0 && !this->try_lock_grid_index(tls, gi))
+          return false;
+      }
+    }
+    return true;
+  }
+
   template <typename IncidentCellsContainer>
   bool try_lock_and_get_incident_cells(Vertex_handle v, IncidentCellsContainer& cells,
                                        bool* tls = nullptr) const
@@ -2140,8 +2237,14 @@ public:
     if(!this->try_lock_vertex(v))
       return false;
 
+    Zone_vertex_dedup dd;
+    const bool dedup = zone_vertex_dedup_on() && this->is_parallel();
+    if(dedup)
+      dd.seen_or_record(&*v);           // v was just locked above
+
     Cell_handle d = v->cell();
-    if(!this->try_lock_cell_tls(tls, d)) // LOCK
+    if(!(dedup ? this->try_lock_cell_dedup(tls, d, dd)
+               : this->try_lock_cell_tls(tls, d))) // LOCK
       return false;
 
     cells.push_back(d);
@@ -2158,7 +2261,8 @@ public:
           continue;
 
         Cell_handle next = c->neighbor(i);
-        if(!this->try_lock_cell_tls(tls, next)) // LOCK
+        if(!(dedup ? this->try_lock_cell_dedup(tls, next, dd)
+                   : this->try_lock_cell_tls(tls, next))) // LOCK
         {
           for(Cell_handle ch : cells)
           {
