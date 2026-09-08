@@ -24,7 +24,11 @@
 #include <boost/unordered_set.hpp>
 
 #include <vector>
+#include <limits>
+#include <iostream>
 #include <algorithm>
+#include <cstdlib>
+#include <numeric>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -221,11 +225,9 @@ public:
 
       } while (++circ != done);
 
-      // compute and keep worst angle
-      Dihedral_angle_cosine curr_max_cos
-        = (std::max)(max_cos_dihedral_angle_in_range(triangulation, cells_to_remove, false),
-                     max_cos_dihedral_angle_in_range(triangulation, cells_to_update, false));
-
+      // the dihedral angles were compared before this copy was built, by
+      // collapse_keeps_angles_acceptable(), on the very same cells and points :
+      // whatever is left here has already passed that test
 
       vh0->set_point(Point_3(v0_new_pos.x(), v0_new_pos.y(), v0_new_pos.z()));
       vh1->set_point(Point_3(v0_new_pos.x(), v0_new_pos.y(), v0_new_pos.z()));
@@ -282,15 +284,6 @@ public:
           return ORIENTATION_PROBLEM;
       }
 
-      // check angles
-      for (Cell_handle cit : triangulation.finite_cell_handles())
-      {
-        auto max_cos_after_collapse = max_cos_dihedral_angle(triangulation, cit, false);
-        if (      curr_max_cos < max_cos_after_collapse  // angles decreased
-         && acceptable_max_cos < max_cos_after_collapse) // && angles go below acceptable bound
-          return ANGLE_PROBLEM;
-      }
-
       //int si_nb_vh0 = nb_incident_subdomains(vh0, c3t3);
       //int si_nb_vh1 = nb_incident_subdomains(vh1, c3t3);
       //int vertices_subdomain_nb_vh0 = std::max(si_nb_vh0, si_nb_vh1);
@@ -317,8 +310,6 @@ protected:
   Edge edge;
 
   bool not_an_edge;
-
-  const Dihedral_angle_cosine acceptable_max_cos{0.995}; // 0.995 cos <=> 5.7 degrees
 };
 
 
@@ -917,7 +908,9 @@ collapse(const typename C3t3::Cell_handle ch,
   {
     for (const auto& ei : cell_edges(c, tr))
     {
-      remove_from_bimap(ei, short_edges);
+      remove_from_bimap(std::make_pair(ei.first->vertex(ei.second),
+                                       ei.first->vertex(ei.third)),
+                        short_edges);
 
       const Vertex_handle eiv0 = c->vertex(ei.second);
       const Vertex_handle eiv1 = c->vertex(ei.third);
@@ -1041,36 +1034,33 @@ bool is_cells_set_manifold(const C3t3&,
   typedef std::array<Vh, 3> FV;
   typedef std::pair<Vh, Vh> EV;
 
-  std::unordered_map<FV, int, boost::hash<FV>> facets;
+  // A facet is shared by exactly two cells, so it bounds the set when its
+  // neighbour is outside : the triangulation already answers that, and asking
+  // it costs one lookup of a cell handle where counting the facets of the set
+  // meant hashing a triple of vertex handles for every facet of every cell.
+  std::unordered_map<EV, int, boost::hash<EV>> edges;
+  edges.reserve(4 * cells.size());
+
   for (Cell_handle c : cells)
   {
     for (int i = 0; i < 4; ++i)
     {
+      if (cells.find(c->neighbor(i)) != cells.end())
+        continue; // shared with another cell of the set
+
       const FV fvi = make_vertex_array(c->vertex((i + 1) % 4),
         c->vertex((i + 2) % 4),
         c->vertex((i + 3) % 4));
-      typename std::unordered_map<FV, int, boost::hash<FV>>::iterator fit = facets.find(fvi);
-      if (fit == facets.end())
-        facets.insert(std::make_pair(fvi, 1));
-      else
-        fit->second++;
-    }
-  }
 
-  std::unordered_map<EV, int, boost::hash<EV>> edges;
-  for (const auto& fvv : facets)
-  {
-    if (fvv.second != 1)
-      continue;
-
-    for (int i = 0; i < 3; ++i)
-    {
-      const EV evi = make_vertex_pair(fvv.first[i], fvv.first[(i + 1) % 3]);
-      typename std::unordered_map<EV, int, boost::hash<EV>>::iterator eit = edges.find(evi);
-      if (eit == edges.end())
-        edges.insert(std::make_pair(evi, 1));
-      else
-        eit->second++;
+      for (int k = 0; k < 3; ++k)
+      {
+        const EV evi = make_vertex_pair(fvi[k], fvi[(k + 1) % 3]);
+        typename std::unordered_map<EV, int, boost::hash<EV>>::iterator eit = edges.find(evi);
+        if (eit == edges.end())
+          edges.insert(std::make_pair(evi, 1));
+        else
+          eit->second++;
+      }
     }
   }
 
@@ -1078,6 +1068,87 @@ bool is_cells_set_manifold(const C3t3&,
     if (evv.second != 2)
       return false;
 
+  return true;
+}
+
+/**
+* Does the collapse leave the dihedral angles of the star acceptable?
+*
+* `CollapseTriangulation` answers this only after building a local copy of the
+* star and running the collapse on it, although the answer depends on the
+* geometry alone : the cells that survive are the star minus the ring of the
+* edge, with both extremities moved to the collapse point. Evaluating it here
+* leaves that copy unbuilt whenever it would have been rejected - which is what
+* happens to nearly half of the candidates that reach it.
+*
+* The comparison it performs is reproduced exactly, including the way the
+* midpoint is computed, so that the two agree down to the last bit.
+*/
+template<typename C3t3, typename CellRange>
+bool collapse_keeps_angles_acceptable(const typename C3t3::Edge& edge,
+                                      const C3t3& c3t3,
+                                      const Collapse_type collapse_type,
+                                      const CellRange& star)
+{
+  using Tr = typename C3t3::Triangulation;
+  using Cell_handle = typename Tr::Cell_handle;
+  using Vertex_handle = typename Tr::Vertex_handle;
+  using Point_3 = typename Tr::Point;
+  using Vector_3 = typename Tr::Geom_traits::Vector_3;
+  using Subdomain_index = typename C3t3::Subdomain_index;
+
+  const Dihedral_angle_cosine acceptable_max_cos{0.995}; // 0.995 cos <=> 5.7 degrees
+
+  const Tr& tr = c3t3.triangulation();
+  const Vertex_handle v0 = edge.first->vertex(edge.second);
+  const Vertex_handle v1 = edge.first->vertex(edge.third);
+
+  // same expression as CollapseTriangulation::collapse()
+  Vector_3 new_pos = vec(v0->point());
+  if (collapse_type == TO_MIDPOINT)
+    new_pos = new_pos + 0.5 * Vector_3(point(v0->point()), point(v1->point()));
+  else if (collapse_type == TO_V1)
+    new_pos = vec(point(v1->point()));
+  const auto p_new = point(Point_3(new_pos.x(), new_pos.y(), new_pos.z()));
+
+  boost::container::flat_set<Cell_handle,
+    std::less<Cell_handle>,
+    boost::container::small_vector<Cell_handle, 32> > ring;
+
+  typename Tr::Cell_circulator circ = tr.incident_cells(edge);
+  const typename Tr::Cell_circulator done = circ;
+  do { ring.insert(circ); } while (++circ != done);
+
+  // worst angle before : the ring, plus the star of the vertex that disappears
+  Dihedral_angle_cosine curr_max_cos = max_cos_dihedral_angle_in_range(tr, ring, false);
+
+  boost::container::small_vector<Cell_handle, 64> star_v1;
+  tr.finite_incident_cells(v1, std::back_inserter(star_v1));
+  const Dihedral_angle_cosine cos_v1
+    = max_cos_dihedral_angle_in_range(tr, star_v1, false);
+  if (curr_max_cos < cos_v1)
+    curr_max_cos = cos_v1;
+
+  // worst angle after : the cells of the star that the collapse keeps
+  const auto& gt = tr.geom_traits();
+  for (const Cell_handle c : star)
+  {
+    if (ring.find(c) != ring.end())
+      continue;
+    if (tr.is_infinite(c) || c->subdomain_index() == Subdomain_index())
+      continue;
+
+    auto p_at = [&](const int i)
+    {
+      const Vertex_handle v = c->vertex(i);
+      return (v == v0 || v == v1) ? p_new : point(v->point());
+    };
+    const Dihedral_angle_cosine after
+      = max_cos_dihedral_angle(p_at(0), p_at(1), p_at(2), p_at(3), gt);
+
+    if (curr_max_cos < after && acceptable_max_cos < after)
+      return false;
+  }
   return true;
 }
 
@@ -1175,6 +1246,12 @@ typename C3t3::Vertex_handle collapse_edge(const typename C3t3::Edge& edge,
     c3t3.triangulation().finite_incident_cells(v1_init,
       std::inserter(cells_to_insert, cells_to_insert.end()));
 
+    // the angle test is the one that discards most candidates, and the cheaper
+    // of the two : it walks the star once, where is_cells_set_manifold() walks
+    // the star of each of its vertices
+    if(!collapse_keeps_angles_acceptable(edge, c3t3, collapse_type, cells_to_insert))
+      return Vertex_handle();
+
     if(!is_cells_set_manifold(c3t3, cells_to_insert))
       return Vertex_handle();
 
@@ -1239,14 +1316,22 @@ auto can_be_collapsed(const typename C3T3::Edge& e,
   return Collapsible {true, boundary};
 }
 
-// The short edges left to collapse, shortest first. Edges are compared by
-// their vertex pair, but stored with their orientation : `collapse_edge()`
-// reads it to decide which extremity survives, so an edge already in the map
-// keeps the orientation it entered with, and only its length is updated.
+// The short edges left to collapse, shortest first. Edges are keyed by their
+// vertex pair and compared regardless of orientation, but stored with their
+// orientation : `collapse_edge()` reads it to decide which extremity
+// survives, so an edge already in the map keeps the orientation it entered
+// with, and only its length is updated.
+//
+// The key is a vertex pair rather than an Edge (Cell_handle, i, j) because
+// collapsing destroys and recycles cells: an Edge key would have to be
+// compared -- and so dereferenced -- long after the cell it names is gone.
+// Vertex handles stay meaningful, and are re-resolved to a current Edge with
+// tds().is_edge() at the point of use.
 template<typename C3t3>
 using Short_edges_bimap = boost::bimap<
-    boost::bimaps::set_of<typename C3t3::Triangulation::Edge,
-                          Compare_edges<typename C3t3::Triangulation::Edge> >,
+    boost::bimaps::set_of<std::pair<typename C3t3::Triangulation::Vertex_handle,
+                                    typename C3t3::Triangulation::Vertex_handle>,
+                          Compare_vertex_pairs<typename C3t3::Triangulation::Vertex_handle> >,
     boost::bimaps::multiset_of<typename C3t3::Triangulation::Geom_traits::FT,
                                std::less<typename C3t3::Triangulation::Geom_traits::FT> > >;
 
@@ -1262,6 +1347,7 @@ class Edge_collapse_operation
 public:
   using Tr = typename C3t3::Triangulation;
   using Vertex_handle = typename Tr::Vertex_handle;
+  using Cell_handle = typename Tr::Cell_handle;
   using Edge = typename Tr::Edge;
   using FT = typename Tr::Geom_traits::FT;
 
@@ -1289,18 +1375,104 @@ public:
   Element_range get_elements(const C3t3& c3t3) const override
   {
     Short_edges short_edges;
-    for (const Edge& e : c3t3.triangulation().finite_edges())
+    const Tr& tr = c3t3.triangulation();
+
+    auto eval = [&](const Edge& e, std::vector<std::pair<Edge, FT>>& out)
     {
       auto [collapsible, boundary]
         = can_be_collapsed(e, c3t3, m_protect_boundaries, m_cell_selector);
       if (!collapsible)
-        continue;
+        return;
 
       const auto sqlen = is_too_short(e, boundary, m_sizing, c3t3, m_cell_selector);
       if (sqlen != std::nullopt)
-        short_edges.insert(typename Short_edges::value_type(e, sqlen.value()));
-    }
+        out.emplace_back(e, sqlen.value());
+    };
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    // Parallel cell-scan candidate collection (see parallel_collect_finite_edges).
+    // The bimap itself is still built serially below: boost::bimap is not
+    // concurrency-safe for insertion, and its internal ordering doesn't depend
+    // on collection order anyway (it sorts by length on the right map).
+    std::vector<std::pair<Edge, FT>> short_edges_vec =
+      parallel_collect_finite_edges<std::pair<Edge, FT>>(tr, eval);
+#else
+    std::vector<std::pair<Edge, FT>> short_edges_vec;
+    for (const Edge& e : tr.finite_edges())
+      eval(e, short_edges_vec);
+#endif
+
+    for (const auto& es : short_edges_vec)
+      short_edges.insert(typename Short_edges::value_type(
+        std::make_pair(es.first.first->vertex(es.first.second),
+                       es.first.first->vertex(es.first.third)),
+        es.second));
+
     return short_edges;
+  }
+
+  /**
+  * Link vertices `vi` (`vi != v0 && vi != v1`) of every boundary-incident
+  * facet of `edge`. This is exactly the vertex set `get_collapse_type()` ->
+  * `topology_test()` reads via `nb_incident_subdomains(vi, ...)`
+  * (`tetrahedral_remeshing_helpers.h`), which walks `vi`'s full
+  * `incident_cells` star -- outside the endpoint-only claim the parallel wave
+  * selector uses. Needed so the wave selector (in
+  * `Elementary_operation_execution_parallel<Edge_collapse_operation>`) can
+  * widen its claim past `v0`/`v1` to cover every star this edge's own
+  * `collapse_edge()` call will actually read during the parallel phase.
+  * Usually empty: interior edges (no incident boundary facet) never reach
+  * `has_several_subdomains()` inside `topology_test()`.
+  */
+  boost::container::small_vector<Vertex_handle, 8>
+  topology_test_link_vertices(const Element_type& edge, const C3t3& c3t3) const
+  {
+    boost::container::small_vector<Vertex_handle, 8> out;
+    const Vertex_handle v0 = edge.first->vertex(edge.second);
+    const Vertex_handle v1 = edge.first->vertex(edge.third);
+    const auto& tr = c3t3.triangulation();
+
+    auto fcirc = tr.incident_facets(edge);
+    const auto fdone = fcirc;
+    do
+    {
+      if (tr.is_infinite(fcirc->first))
+        continue;
+      if (is_boundary(c3t3, *fcirc, m_cell_selector))
+      {
+        for (int i = 1; i < 4; ++i)
+        {
+          const Vertex_handle vi = fcirc->first->vertex((fcirc->second + i) % 4);
+          if (vi != v0 && vi != v1)
+            out.push_back(vi);
+        }
+      }
+    } while (++fcirc != fdone);
+
+    return out;
+  }
+
+  bool lock_zone(const Element_type& edge, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    const Vertex_handle v0 = edge.first->vertex(edge.second);
+    const Vertex_handle v1 = edge.first->vertex(edge.third);
+    if (!(tr.try_lock_vertex(v0) && tr.try_lock_vertex(v1)))
+      return false;
+    const auto& tds = tr.tds();
+    if (!tds.vertices().is_used(v0) || !tds.vertices().is_used(v1))
+      return false;
+    boost::container::small_vector<Cell_handle, 64> inc_cells_0, inc_cells_1;
+    return tr.try_lock_and_get_incident_cells(v0, inc_cells_0)
+        && tr.try_lock_and_get_incident_cells(v1, inc_cells_1);
+  }
+
+  bool requires_ordered_processing() const override { return true; }
+
+  typename Tr::Geom_traits::Point_3 point_on_element(const Element_type& e) const
+  {
+    auto cp = typename Tr::Geom_traits().construct_point_3_object();
+    return cp(e.first->vertex(e.second)->point());
   }
 
   bool execute_operation(const Element_type& edge, C3t3& c3t3) override
@@ -1313,15 +1485,26 @@ public:
   * Collapses `edge`, and keeps `short_edges` up to date : `collapse_edge()`
   * removes from it the edges it destroys, and the edges incident to the
   * vertex it keeps are re-evaluated here, since their length has changed.
+  *
+  * `short_edges` is templated so the parallel executor can pass a
+  * Short_edges_delta collector instead of the bimap itself, and replay the
+  * recorded updates once its wave has joined (see
+  * tetrahedral_remeshing_helpers.h).
   */
-  bool execute_operation(const Element_type& edge, C3t3& c3t3,
-                         Short_edges& short_edges)
+  /**
+  * Re-evaluates every edge incident to `vh` and writes the result to the work
+  * list. Runs `can_be_collapsed()` / `is_too_short()` on each edge (vh, x), and
+  * BOTH of those walk the incident cells of BOTH endpoints of the edge they are
+  * given -- so this traverses the star of every neighbour x of vh, well beyond
+  * vh's own star. That is why it cannot run inside a parallel wave under the
+  * cheap endpoint claim, and why the executor defers it (see
+  * Short_edges_delta::refresh_vertices). Safe to call once the wave has joined,
+  * and safe sequentially, where it is called inline from execute_operation().
+  */
+  template<typename ShortEdges>
+  void refresh_incident_edges(const Vertex_handle vh, C3t3& c3t3,
+                              ShortEdges& short_edges)
   {
-    const Vertex_handle vh = collapse_edge(edge, c3t3, m_sizing, m_protect_boundaries,
-                                           m_cell_selector, short_edges, m_visitor);
-    if (vh == Vertex_handle())
-      return false;
-
     std::vector<Edge> incident_short;
     c3t3.triangulation().finite_incident_edges(vh, std::back_inserter(incident_short));
     for (const Edge& eshort : incident_short)
@@ -1335,8 +1518,30 @@ public:
       if (collapsible)
         sqlen = is_too_short(eshort, boundary, m_sizing, c3t3, m_cell_selector);
 
-      update_bimap(eshort, short_edges, sqlen);
+      auto key = std::make_pair(eshort.first->vertex(eshort.second),
+                                eshort.first->vertex(eshort.third));
+      update_bimap(key, short_edges, sqlen);
     }
+  }
+
+  template<typename ShortEdgesOrDelta>
+  bool execute_operation(const Element_type& edge, C3t3& c3t3,
+                         ShortEdgesOrDelta& short_edges)
+  {
+    const Vertex_handle vh = collapse_edge(edge, c3t3, m_sizing, m_protect_boundaries,
+                                           m_cell_selector, short_edges, m_visitor);
+    if (vh == Vertex_handle())
+      return false;
+
+    // Under the parallel executor this must NOT run here : it walks the stars of
+    // vh's neighbours (see refresh_incident_edges), which lie outside the claim
+    // this wave member holds. Record the vertex and let the executor re-evaluate
+    // once the wave has joined and the mesh is stable again.
+    if constexpr (Defers_incident_refresh<ShortEdgesOrDelta>::value)
+      short_edges.refresh_vertices.push_back(vh);
+    else
+      refresh_incident_edges(vh, c3t3, short_edges);
+
     return true;
   }
 
@@ -1359,6 +1564,7 @@ class Elementary_operation_execution_sequential<
   using Operation = Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor>;
   using Short_edges = typename Operation::Short_edges;
   using Edge = typename Operation::Edge;
+  using Cell_handle = typename C3t3::Cell_handle;
 
 public:
   bool execute(Operation& op, C3t3& c3t3) const
@@ -1376,8 +1582,16 @@ public:
     {
       // the edge with shortest length
       typename Short_edges::right_map::iterator eit = short_edges.right.begin();
-      const Edge e = eit->second;
+      const auto vpair = eit->second;
       short_edges.right.erase(eit);
+
+      // the work list is keyed by vertex pair; resolve it to a current Edge,
+      // keeping the orientation the pair was stored with
+      Cell_handle cell;
+      int i0, i1;
+      if (!c3t3.triangulation().tds().is_edge(vpair.first, vpair.second, cell, i0, i1))
+        continue;
+      const Edge e(cell, i0, i1);
 
       if (op.execute_operation(e, c3t3, short_edges))
       {
@@ -1395,6 +1609,480 @@ public:
     return true;
   }
 };
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+
+/**
+* Collapse's work list is mutated as edges are collapsed: collapsing an edge
+* destroys some of its neighbours and shortens others, which must be
+* reflected in the shared shortest-first bimap before the next pop -- that
+* pop-and-update step is inherently sequential. But the per-edge work itself
+* (geometry validation, and the local triangulation edit) does not depend on
+* other, non-overlapping edges, so it can run concurrently once a batch of
+* "next shortest" candidates has been popped.
+*
+* Elements are processed in waves of up to COLLAPSE_WAVE_FACTOR * nthreads,
+* selected shortest-first from the work list. Unlike split, the wave is not
+* protected by lock_zone/retry: short edges cluster spatially, so a wave of
+* the globally shortest ones puts every thread on the same small region,
+* almost every lock attempt fails, and the retry loop degenerates into a
+* spin storm -- orders of magnitude slower than sequential collapse.
+*
+* Instead the wave is chosen to be conflict-free: an edge joins it only if
+* neither endpoint has been claimed by a wave member, where selecting an
+* edge claims every vertex of its incident cells. Two wave members then
+* share no cell, so their collapses read and write disjoint regions and need
+* no locking whatsoever. Edges rejected for conflict stay in the work list
+* and are reconsidered by the next wave, so shortest-first priority
+* survives.
+*
+* Two things make this pay, and both are easy to get wrong:
+* - Only the endpoints are tested, never the whole star. Testing the star of
+*   every candidate costs more than the geometry it protects (~4.8 s to
+*   expose ~1.4 s of work, on bear.mesh at 8 threads); testing endpoints is
+*   equally safe, by the argument at the test itself, and confines the star
+*   walk to accepted edges.
+* - Waves must be large. Only a fraction of the candidates scanned survive
+*   the conflict test, so a wave sized like split's leaves most threads idle
+*   -- hence COLLAPSE_WAVE_FACTOR, well above ORDERED_WAVE_FACTOR.
+*
+* On bear.mesh (3 iterations, 8 threads) collapse drops from 36.5 s to
+* 28.4 s against the sequential executor, and end-to-end remeshing from
+* 174 s to 143 s (medians of repeated runs; single runs on this workload
+* scatter by several seconds and one outlier is enough to invert the
+* comparison, so measure it repeatedly). CGAL_TET_REMESHING_COLLAPSE_SEQUENTIAL
+* opts back out.
+*
+* What is left is the serial replay below, still ~8.8 s of the last
+* iteration -- the next thing worth attacking.
+*
+* Work-list updates are *not* applied to the bimap from the workers. A
+* single collapse triggers on the order of a hundred of them (all six edges
+* of every cell incident to the deleted vertex, plus every edge incident to
+* the kept one), so pushing them through a shared lock costs more than the
+* parallelism they sit inside -- measurably slower than running collapse
+* sequentially. Each worker records its updates into a thread-local
+* Short_edges_delta instead, and the executor replays them into the bimap
+* after the wave joins, in per-thread order (see
+* tetrahedral_remeshing_helpers.h).
+*
+* Wave members keep their Edge (Cell_handle, i, j) as stored in the work
+* list -- including its orientation, which collapse_edge() reads to decide
+* which extremity survives. That is safe precisely because the wave is
+* conflict-free: no wave member touches the cells of another, so no member's
+* Cell_handle can be destroyed or recycled out from under it while the wave
+* runs.
+*/
+template<typename C3t3,
+         typename SizingFunction,
+         typename CellSelector,
+         typename Visitor>
+class Elementary_operation_execution_parallel<
+        Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor> >
+{
+  using Operation = Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor>;
+  using Short_edges = typename Operation::Short_edges;
+  using Edge = typename Operation::Edge;
+  using Vertex_handle = typename C3t3::Vertex_handle;
+  using Cell_handle = typename C3t3::Cell_handle;
+  using FT = typename C3t3::Triangulation::Geom_traits::FT;
+  using Vertex_pair = std::pair<Vertex_handle, Vertex_handle>;
+  using Delta = Short_edges_delta<Vertex_pair, FT>;
+
+  // Overridable at run time for the same reason as the other CGAL_TR_* knobs
+  // in this codebase (see Elementary_operation.h::buckets_per_thread() /
+  // use_unordered_waves()): A/B has to be interleaved within one binary and
+  // one thermal state, and that's impossible if the choice needs a rebuild.
+  // Read once; default is the parallel refresh (the new path).
+  // CGAL_TR_PAR_REFRESH=0 selects the old plain serial loop.
+  static bool use_par_refresh()
+  {
+    static const bool on = []
+      {
+        const char* const e = std::getenv("CGAL_TR_PAR_REFRESH");
+        return e == nullptr || *e != '0';
+      }();
+    return on;
+  }
+
+  // Wave-size knob, overridable at run time (CGAL_TR_COLLAPSE_WAVE_FACTOR).
+  // wave_size = factor * nthreads, and the selection scan window is
+  // 4 * wave_size -- so the SERIAL selection cost per wave grows linearly
+  // with thread count while the number of conflict-free edges a wave can
+  // actually hold saturates on the mesh's geometry. That is the suspected
+  // mechanism behind wave selection measuring SLOWER at 4 threads than at 1
+  // (2.95 s -> 3.23 s, see the "COLLAPSE ANATOMY" log entry). The knob makes
+  // the wave size separable from nthreads so the hypothesis can be A/B'd in
+  // one binary.
+  static std::size_t collapse_wave_factor()
+  {
+    static const std::size_t f = []() -> std::size_t
+      {
+        const char* const e = std::getenv("CGAL_TR_COLLAPSE_WAVE_FACTOR");
+        if (e != nullptr)
+        {
+          const long v = std::strtol(e, nullptr, 10);
+          if (v > 0) return static_cast<std::size_t>(v);
+        }
+        return static_cast<std::size_t>(COLLAPSE_WAVE_FACTOR);
+      }();
+    return f;
+  }
+
+public:
+  bool execute(Operation& op, C3t3& c3t3) const
+  {
+#ifdef CGAL_TET_REMESHING_COLLAPSE_SEQUENTIAL
+    // Opt out of the conflict-free wave and run collapse sequentially. See the
+    // note above the class for when that is the better choice.
+    return Elementary_operation_execution_sequential<Operation>().execute(op, c3t3);
+#else
+    Short_edges short_edges = op.get_elements(c3t3);
+    if (short_edges.empty())
+      return false;
+
+    ensure_lock_data_structure_initialized(c3t3);
+
+    auto& tr = c3t3.triangulation();
+    const std::size_t nthreads =
+      static_cast<std::size_t>((std::max)(1, tbb::this_task_arena::max_concurrency()));
+    // Collapse wants far larger waves than split's ORDERED_WAVE_FACTOR: only a
+    // fraction of the candidates scanned survive the conflict test, so a wave
+    // sized like split's leaves most threads idle.
+    const std::size_t wave_size =
+      (std::max)(std::size_t(1), collapse_wave_factor() * nthreads);
+
+    std::vector<Edge> wave;
+    wave.reserve(wave_size);
+    std::vector<typename Short_edges::right_map::iterator> selected;
+    selected.reserve(wave_size);
+    boost::container::small_vector<Cell_handle, 64> inc_cells;
+    // surviving vertices whose incident edges the wave deferred to the replay
+    std::vector<Vertex_handle> refresh_vertices;
+    // drawn from the shared monotonic counter, so stale stamps -- including
+    // ones left by the unordered wave executor -- never read as claimed
+    std::size_t wave_stamp = 0;
+    tbb::combinable<Delta> deltas;
+    std::vector<std::pair<Vertex_pair, std::optional<FT>>> replay;
+    std::vector<std::size_t> order;
+    // per-vertex results of the deferred refresh, evaluated in parallel below;
+    // kept outside the wave loop so its inner Delta vectors keep their
+    // capacity across waves instead of reallocating every time
+    std::vector<Delta> refresh_out;
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+    CGAL::Real_timer timer, timer_select, timer_par, timer_replay, timer_refresh;
+    // Selection-yield counters. `scanned` is the serial work the selection
+    // loop does; `accepted` is what it buys. accepted/scanned falling as
+    // nthreads rises is the signature of the anti-scaling described above.
+    std::size_t n_waves = 0, n_scanned = 0, n_accepted = 0, n_stale = 0;
+    timer.start();
+#endif
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_LIVELOCK_GUARD
+    // Livelock diagnostic. This loop terminates only by `short_edges` emptying
+    // or by the `wave.empty() && selected.empty()` break, and the post-join
+    // refresh re-inserts edges around every surviving vertex -- so an edge that
+    // is persistently is_too_short() but that collapse_edge() always refuses is
+    // erased and re-inserted forever, spinning the main thread while the workers
+    // idle. Track the smallest work-list size seen: real progress keeps setting
+    // new minima, a livelock stops. On stall, name the offending edge instead of
+    // hanging.
+    std::size_t best_size = (std::numeric_limits<std::size_t>::max)();
+    std::size_t stalled_iters = 0;
+    const std::size_t stall_limit = 10000;
+#endif
+    while (!short_edges.empty())
+    {
+#ifdef CGAL_TETRAHEDRAL_REMESHING_LIVELOCK_GUARD
+      if (short_edges.size() < best_size)
+      {
+        best_size = short_edges.size();
+        stalled_iters = 0;
+      }
+      else if (++stalled_iters > stall_limit)
+      {
+        const auto it = short_edges.right.begin();
+        std::cerr << "[livelock] collapse wave made no progress for "
+                  << stall_limit << " iterations.\n"
+                  << "  work list size " << short_edges.size()
+                  << " (best seen " << best_size << ")\n";
+        if (it != short_edges.right.end())
+        {
+          const Vertex_handle a = it->second.first;
+          const Vertex_handle b = it->second.second;
+          Cell_handle c; int i0, i1;
+          std::cerr << "  head edge sqlen " << it->first
+                    << "  dims " << a->in_dimension() << "/" << b->in_dimension()
+                    << "  still_an_edge " << tr.tds().is_edge(a, b, c, i0, i1)
+                    << "\n  head points " << point(a->point())
+                    << " -- " << point(b->point()) << std::endl;
+        }
+        CGAL_error_msg("tetrahedral remeshing: parallel collapse livelock");
+      }
+#endif
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+      timer_select.start();
+#endif
+      // Select a conflict-free wave: walk the work list shortest-first and take
+      // an edge only if no vertex of its incident cells has been claimed by an
+      // edge already in the wave. Two selected edges therefore share no cell,
+      // and not even a vertex between their cells, so the regions their
+      // collapses read and rewrite are disjoint -- the wave needs no locking
+      // at all. Rejected edges stay in the work list and are reconsidered by
+      // the next wave, so global shortest-first priority is preserved.
+      wave.clear();
+      selected.clear();
+      wave_stamp = next_wave_claim_stamp();
+      // Bound the scan. Conflicting edges are left in the work list, and
+      // near the front they are mostly neighbours of edges already selected,
+      // so scanning further and further down to fill a wave costs far more
+      // than it saves -- an unbounded scan re-examines the whole list every
+      // wave and dominates the phase. Whatever the window yields is enough;
+      // the rest is picked up by the next wave.
+      const std::size_t scan_limit = 4 * wave_size;
+      std::size_t scanned = 0;
+      for (auto eit = short_edges.right.begin();
+           eit != short_edges.right.end()
+             && wave.size() < wave_size && scanned < scan_limit; ++eit, ++scanned)
+      {
+        const Vertex_handle v0 = eit->second.first;
+        const Vertex_handle v1 = eit->second.second;
+
+        // The conflict test, O(1). It is exact -- not a filter -- because an
+        // accepted edge claims its 2-ring (see below), which is precisely the set
+        // of vertices whose own region would overlap this one's.
+        if (v0->wave_claim_stamp() == wave_stamp
+            || v1->wave_claim_stamp() == wave_stamp)
+          continue;
+
+        // resolve the stored vertex pair to a current Edge, keeping its
+        // orientation; drop the entry if it is no longer an edge
+        Cell_handle cell;
+        int i0, i1;
+        if (!tr.tds().is_edge(v0, v1, cell, i0, i1))
+        {
+          selected.push_back(eit); // erase it from the work list below
+          continue;
+        }
+        const Edge e(cell, i0, i1);
+
+        // Extra vertices whose full star this candidate's own collapse_edge()
+        // will read during the parallel phase, outside v0/v1 -- see
+        // topology_test_link_vertices()'s doc comment and the "ROOT CAUSE
+        // FOUND" log entry. Empty for interior edges (the common case), so
+        // this costs one facet circulation plus O(1) boundary tests per
+        // candidate scanned, and only reaches further when that circulation
+        // finds a boundary-incident facet.
+        const auto link_vs = op.topology_test_link_vertices(e, c3t3);
+
+        bool link_conflict = false;
+        for (const Vertex_handle& vi : link_vs)
+        {
+          if (vi->wave_claim_stamp() == wave_stamp)
+          {
+            link_conflict = true;
+            break;
+          }
+        }
+        if (link_conflict)
+          continue; // leave in work list; retry next wave
+
+        inc_cells.clear();
+        tr.incident_cells(v0, std::back_inserter(inc_cells));
+        tr.incident_cells(v1, std::back_inserter(inc_cells));
+        for (const Vertex_handle& vi : link_vs)
+          tr.incident_cells(vi, std::back_inserter(inc_cells));
+
+        // Accepted: claim the region -- every vertex of every cell incident to
+        // either endpoint, plus (when non-empty) every vertex of every cell
+        // incident to a topology_test() link vertex above. Combined with the
+        // conflict tests above this makes wave members disjoint not just in
+        // the cells collapse_edge() itself mutates, but also in every star its
+        // own topology_test() call reads -- which is what the parallel phase
+        // actually needs. The endpoint-only claim alone was proven insufficient
+        // by the "ROOT CAUSE FOUND" log entry: get_collapse_type()'s
+        // topology_test() reads link vertices' stars from inside collapse_edge,
+        // during the parallel phase, which the endpoint claim never covered.
+        //
+        // A full unconditional 2-ring claim was measured earlier as the
+        // alternative (66.4-70.7s against 27.7s for the collapse phase) and
+        // rejected on cost; the claim above is cheaper because it only widens
+        // for the (usually rare) candidates with a boundary-incident facet,
+        // instead of every candidate scanned.
+        for (const Cell_handle& c : inc_cells)
+          for (int k = 0; k < 4; ++k)
+            c->vertex(k)->set_wave_claim_stamp(wave_stamp);
+
+        wave.push_back(e);
+        selected.push_back(eit);
+      }
+
+      // take the selected edges out of the work list
+      for (auto& eit : selected)
+        short_edges.right.erase(eit);
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+      timer_select.stop();
+      ++n_waves;
+      n_scanned  += scanned;
+      n_accepted += wave.size();
+      n_stale    += selected.size() - wave.size();
+#endif
+
+      if (wave.empty())
+      {
+        if (selected.empty())
+          break; // no progress possible
+        continue; // the window held only stale entries, now dropped
+      }
+
+      deltas.clear();
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+      timer_par.start();
+#endif
+      tbb::parallel_for(tbb::blocked_range<std::size_t>(0, wave.size()),
+        [&](const tbb::blocked_range<std::size_t>& r)
+        {
+          Delta& delta = deltas.local();
+          for (std::size_t i = r.begin(); i != r.end(); ++i)
+            op.execute_operation(wave[i], c3t3, delta);
+        });
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+      timer_par.stop();
+      timer_replay.start();
+#endif
+
+      // Replay the wave's recorded work-list updates into the bimap, but
+      // deduplicate first. collapse() removes all six edges of every cell
+      // incident to the vertex it deletes, and adjacent cells share edges, so
+      // the same key is typically recorded several times per collapse. Each
+      // duplicate that survives to the bimap costs a tree descent and a node
+      // update, and this replay is serial, so it grew into the phase's
+      // bottleneck. Waves are conflict-free, so duplicate keys only ever come
+      // from a single collapse; keeping the last write recorded for a key is
+      // exactly what applying them all in order would leave behind.
+      replay.clear();
+      refresh_vertices.clear();
+      deltas.combine_each([&](Delta& delta)
+        {
+          replay.insert(replay.end(), delta.writes.begin(), delta.writes.end());
+          refresh_vertices.insert(refresh_vertices.end(),
+                                  delta.refresh_vertices.begin(),
+                                  delta.refresh_vertices.end());
+          delta.clear();
+        });
+
+      order.resize(replay.size());
+      std::iota(order.begin(), order.end(), std::size_t(0));
+      const Compare_vertex_pairs<Vertex_handle> less;
+      tbb::parallel_sort(order.begin(), order.end(),
+        [&](const std::size_t a, const std::size_t b)
+        {
+          if (less(replay[a].first, replay[b].first)) return true;
+          if (less(replay[b].first, replay[a].first)) return false;
+          return a < b; // ties keep the order the writes were recorded in
+        });
+
+      for (std::size_t i = 0; i < order.size(); ++i)
+      {
+        // within a run of equal keys, only the last write survives
+        if (i + 1 < order.size()
+            && !less(replay[order[i]].first, replay[order[i + 1]].first))
+          continue;
+        auto& w = replay[order[i]];
+        update_bimap(w.first, short_edges, w.second);
+      }
+
+      // The wave has joined, so the mesh is stable again : now re-evaluate the
+      // edges incident to each surviving vertex. This is the work deferred out
+      // of execute_operation (see refresh_incident_edges) because it walks the
+      // link vertices' stars, which no wave member claims. Running it here keeps
+      // the parallel phase's claim at the cheap endpoint/region level. The
+      // ordering matches the sequential path : collapse_edge's own work-list
+      // writes are replayed first, then the incident refresh overwrites them.
+      //
+      // The mesh is stable here, so this re-evaluation is read-only over the
+      // TDS : its only side effect is the work-list write. Evaluate every
+      // vertex's incident edges in parallel and apply the results serially,
+      // in index order, which is exactly the sequence the serial loop
+      // produced -- so last-write-wins on duplicate keys is preserved
+      // bit-for-bit.
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+      timer_refresh.start();
+#endif
+      if (use_par_refresh())
+      {
+        refresh_out.resize(refresh_vertices.size());
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, refresh_vertices.size()),
+          [&](const tbb::blocked_range<std::size_t>& r)
+          {
+            for (std::size_t i = r.begin(); i != r.end(); ++i)
+            {
+              refresh_out[i].clear();
+              const Vertex_handle vh = refresh_vertices[i];
+              if (!c3t3.triangulation().tds().vertices().is_used(vh))
+                continue; // paranoia: a later wave may already have consumed it
+              op.refresh_incident_edges(vh, c3t3, refresh_out[i]);
+            }
+          });
+        for (std::size_t i = 0; i < refresh_vertices.size(); ++i)
+          for (const auto& w : refresh_out[i].writes)
+            update_bimap(w.first, short_edges, w.second);
+      }
+      else
+      {
+        // CGAL_TR_PAR_REFRESH=0: old plain serial loop, kept for A/B timing.
+        for (const Vertex_handle& vh : refresh_vertices)
+        {
+          if (!c3t3.triangulation().tds().vertices().is_used(vh))
+            continue;
+          op.refresh_incident_edges(vh, c3t3, short_edges);
+        }
+      }
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+      timer_refresh.stop();
+      timer_replay.stop();
+#endif
+    }
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
+    timer.stop();
+    std::cout << op.operation_name() << " (parallel): " << timer.time()
+              << " sec [wave selection " << timer_select.time()
+              << " sec, parallel geometry " << timer_par.time()
+              << " sec, serial work-list replay " << timer_replay.time()
+              << " sec (of which deferred refresh " << timer_refresh.time() << ")"
+              << " sec]." << std::endl;
+    std::cout << "  [wave-yield] waves " << n_waves
+              << " | wave_size " << wave_size
+              << " | scanned " << n_scanned
+              << " | accepted " << n_accepted
+              << " | stale " << n_stale
+              << " | yield " << (n_scanned ? double(n_accepted) / double(n_scanned) : 0.)
+              << " | scanned/accepted "
+              << (n_accepted ? double(n_scanned) / double(n_accepted) : 0.)
+              << std::endl;
+#endif
+
+    return true;
+#endif
+  }
+
+private:
+  void ensure_lock_data_structure_initialized(C3t3& c3t3) const
+  {
+    auto& triangulation = c3t3.triangulation();
+    if (!triangulation.get_lock_data_structure())
+    {
+      static typename C3t3::Triangulation::Lock_data_structure lock_ds(
+        c3t3.bbox(), LOCK_GRID_SIZE);
+      triangulation.set_lock_data_structure(&lock_ds);
+    }
+  }
+};
+
+#endif // CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && CGAL_LINKED_WITH_TBB
 
 }
 }

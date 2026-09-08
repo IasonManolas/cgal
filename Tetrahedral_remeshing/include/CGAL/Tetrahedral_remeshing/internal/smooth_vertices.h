@@ -31,6 +31,7 @@
 #include <boost/container/small_vector.hpp>
 #include <boost/functional/hash.hpp>
 
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 #include <cmath>
@@ -102,14 +103,30 @@ public:
 
   const bool m_smooth_constrained_edges;
 
-  // the 2 following variables become useful and valid
+  // the following variable becomes useful and valid
   // just before flip/smooth steps, when no vertices get inserted
   // nor removed anymore
-  std::unordered_map<Vertex_handle, std::size_t> m_vertex_id;
   std::vector<bool> m_free_vertices{};
   bool m_flip_smooth_steps{false};
 
 public:
+  // The finite edges of the triangulation, collected once per refresh().
+  //
+  // All three smoothing operations used to walk the edges themselves : Internal
+  // and Surface preprocessing each iterated `tr.finite_edges()`, and ComplexEdge
+  // iterated `c3t3.edges_in_complex()`, which is a doubly-filtered walk over the
+  // very same range. That is three full O(E) traversals per smooth() call, each
+  // paying the cell circulator's canonical-owner dedup (`Time_stamper::less`),
+  // all on the main thread. Collecting once here -- in parallel, under
+  // Parallel_tag -- replaces them with one scan the three phases share.
+  //
+  // Safe to cache for the whole of smooth() : smoothing moves vertices but never
+  // changes the topology, so the stored Cell_handles and edge indices stay valid
+  // across the complex/surface/internal passes. refresh() is called at the top of
+  // smooth(), after split/collapse/flip have finished mutating the mesh.
+  std::vector<Edge> m_finite_edges{};
+  std::vector<Edge> m_complex_edges{};
+
   struct Move
   {
     Vector_3 move;
@@ -156,6 +173,90 @@ public:
     reset_vertex_id_map(c3t3.triangulation());
     reset_free_vertices(c3t3.triangulation());
     collect_incident_cells(c3t3.triangulation());
+    collect_edges(c3t3);
+  }
+
+  // Fills m_finite_edges / m_complex_edges. See their declaration for why they
+  // are cached. Under Parallel_tag the finite edges are enumerated by a cell
+  // scan (each edge visited exactly once, by its canonical minimum-handle cell),
+  // which is what removes the serial traversals; the sequential build keeps the
+  // iterator walk.
+  void collect_edges(const C3t3& c3t3)
+  {
+    const Tr& tr = c3t3.triangulation();
+    m_finite_edges.clear();
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible<typename Tr::Concurrency_tag,
+                                      CGAL::Parallel_tag>::value)
+    {
+      m_finite_edges = parallel_collect_finite_edges<Edge>(tr,
+        [](const Edge& e, std::vector<Edge>& local) { local.push_back(e); });
+    }
+    else
+#endif
+    {
+      m_finite_edges.reserve(tr.number_of_finite_cells());
+      for (const Edge& e : tr.finite_edges())
+        m_finite_edges.push_back(e);
+    }
+
+    // the complex (1-D feature) edges are a tiny subset : filtering the vector
+    // just collected is far cheaper than edges_in_complex()'s second full walk
+    m_complex_edges.clear();
+    for (const Edge& e : m_finite_edges)
+      if (c3t3.is_in_complex(e))
+        m_complex_edges.push_back(e);
+  }
+
+  // Accumulates a per-vertex Move contribution over `edges`.
+  //
+  // Every edge writes to the slots of BOTH its endpoints, so a plain parallel_for
+  // over edges would race on `m_moves`. Each worker accumulates into its own
+  // full-size Move vector instead, and they are reduced afterwards -- O(V x
+  // threads), which is small next to the per-edge work being parallelised
+  // (density_along_segment() walks the edge's cell circulator).
+  //
+  // `per_edge(e, moves_out)` must write only through `moves_out`.
+  template<typename PerEdge>
+  void accumulate_moves(const std::vector<Edge>& edges,
+                        const std::size_t nbv,
+                        PerEdge per_edge)
+  {
+    const Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible<typename Tr::Concurrency_tag,
+                                      CGAL::Parallel_tag>::value)
+    {
+      tbb::enumerable_thread_specific<std::vector<Move>> tl(
+        [nbv, default_move]() { return std::vector<Move>(nbv, default_move); });
+
+      tbb::parallel_for(tbb::blocked_range<std::size_t>(0, edges.size()),
+        [&](const tbb::blocked_range<std::size_t>& r)
+        {
+          std::vector<Move>& local = tl.local();
+          for (std::size_t i = r.begin(); i != r.end(); ++i)
+            per_edge(edges[i], local);
+        });
+
+      m_moves.assign(nbv, default_move);
+      for (const std::vector<Move>& local : tl)
+        for (std::size_t i = 0; i < nbv; ++i)
+        {
+          if (local[i].neighbors == 0)
+            continue;
+          m_moves[i].move += local[i].move;
+          m_moves[i].mass += local[i].mass;
+          m_moves[i].neighbors += local[i].neighbors;
+        }
+      return;
+    }
+#endif
+
+    m_moves.assign(nbv, default_move);
+    for (const Edge& e : edges)
+      per_edge(e, m_moves);
   }
 
   void start_flip_smooth_steps(const C3t3& c3t3)
@@ -165,15 +266,14 @@ public:
     reset_free_vertices(c3t3.triangulation());
 
     // once this variable is set to true,
-    // m_vertex_id becomes constant and
+    // vertex smoothing_id() becomes constant and
     // m_free_vertices can refer to it safely
     m_flip_smooth_steps = true;
   }
 
   std::size_t vertex_id(const Vertex_handle v) const
   {
-    CGAL_expensive_assertion(m_vertex_id.find(v) != m_vertex_id.end());
-    return m_vertex_id.at(v);
+    return v->smoothing_id();
   }
 
   bool is_free(const Vertex_handle v) const  { return m_free_vertices[vertex_id(v)]; }
@@ -194,7 +294,7 @@ private:
     return get(m_cell_selector, c);
   }
 
-  // this function can be used iff m_vertex_id
+  // this function can be used iff vertex smoothing_id()
   // has already been initialized
   void reset_free_vertices(const Tr& tr)
   {
@@ -495,18 +595,10 @@ private:
 
   void reset_vertex_id_map(const Tr& tr)
   {
-    // when flip-smooth steps start,
-    // m_vertex_id should already be initialized,
-    // done by the last smoothing step.
-    // Then, it does not need to be recomputed
-    // because no vertices are inserted nor removed anymore
-    if(m_flip_smooth_steps)
-      return;
-    m_vertex_id.clear();
     std::size_t id = 0;
     for (const Vertex_handle v : tr.finite_vertex_handles())
     {
-      m_vertex_id[v] = id++;
+      v->set_smoothing_id(id++);
     }
   }
 };
@@ -543,6 +635,12 @@ public:
       : m_context(context) {}
 
   void set_context(std::shared_ptr<Context> p_context) { m_context = p_context; }
+
+  Point_3 point_on_element(const Vertex_handle& v) const
+  {
+    auto cp = Gt().construct_point_3_object();
+    return cp(v->point());
+  }
 
 protected:
   Point_3 project_on_tangent_plane(const Point_3& gi, const Point_3& pi, const Vector_3& normal)
@@ -738,6 +836,21 @@ public:
     return BaseClass::check_inversion_and_move(v, new_pos, inc_cells, tr, m_context->m_total_move);
   }
 
+  bool lock_zone(const Element_type& v, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    std::vector<Cell_handle> inc_cells;
+    return tr.try_lock_and_get_incident_cells(v, inc_cells);
+  }
+
+  void locked_vertices(const Element_type& v, const C3t3&,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override
+  {
+    out = { v };
+  }
+
+  bool requires_ordered_processing() const override { return false; }
+
   std::string operation_name() const override { return "Vertex Smooth (Complex Edge Vertices)"; }
 
   void perform_global_preprocessing(const C3t3& c3t3) const
@@ -750,8 +863,14 @@ public:
     const Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
     moves.assign(nbv, default_move);
 
-    //collect neighbors
-    for (const Edge& e : c3t3.edges_in_complex())
+    // collect neighbors.
+    // Iterates the cached complex edges rather than c3t3.edges_in_complex():
+    // that range is Filter_iterator(Filter_iterator(finite_edges)), so it
+    // re-walks every finite edge -- with the circulator's canonical dedup -- to
+    // keep the handful that are in the complex. The set is tiny, so this loop
+    // stays serial; what cost was the traversal, and refresh() has already paid
+    // it once for all three smoothing passes.
+    for (const Edge& e : m_context->m_complex_edges)
     {
       const Vertex_handle vh0 = e.first->vertex(e.second);
       const Vertex_handle vh1 = e.first->vertex(e.third);
@@ -822,16 +941,17 @@ private:
   void perform_global_preprocessing(const C3t3& c3t3) const
   {
     auto& tr = c3t3.triangulation();
-    auto& moves = m_context->m_moves;
     using Move = typename BaseClass::Context::Move;
     const std::size_t nbv = tr.number_of_vertices();
-    const Move default_move{CGAL::NULL_VECTOR, 0/*neighbors*/, 0./*mass*/};
-    moves.assign(nbv, default_move);
 
-    for (const Edge& e : tr.finite_edges())
-    {
-      if (!c3t3.is_in_complex(e) && is_boundary(c3t3, e, m_context->m_cell_selector))
+    // one cached edge scan, accumulated in parallel -- see
+    // Vertex_smoothing_context::m_finite_edges / accumulate_moves()
+    m_context->accumulate_moves(m_context->m_finite_edges, nbv,
+      [&](const Edge& e, std::vector<Move>& out)
       {
+        if (c3t3.is_in_complex(e) || !is_boundary(c3t3, e, m_context->m_cell_selector))
+          return;
+
         const Vertex_handle vh0 = e.first->vertex(e.second);
         const Vertex_handle vh1 = e.first->vertex(e.third);
 
@@ -842,7 +962,7 @@ private:
         const bool vh1_moving = !is_on_feature(vh1) && m_context->is_free(i1);
 
         if (!vh0_moving && !vh1_moving)
-          continue;
+          return;
 
         const Point_3& p0 = point(vh0->point());
         const Point_3& p1 = point(vh1->point());
@@ -850,18 +970,17 @@ private:
 
         if (vh0_moving)
         {
-          moves[i0].move += density * Vector_3(p0, p1);
-          moves[i0].mass += density;
-          ++moves[i0].neighbors;
+          out[i0].move += density * Vector_3(p0, p1);
+          out[i0].mass += density;
+          ++out[i0].neighbors;
         }
         if (vh1_moving)
         {
-          moves[i1].move += density * Vector_3(p1, p0);
-          moves[i1].mass += density;
-          ++moves[i1].neighbors;
+          out[i1].move += density * Vector_3(p1, p0);
+          out[i1].mass += density;
+          ++out[i1].neighbors;
         }
-      }
-    }
+      });
   }
 
   std::optional<Point_3> project(const Surface_patch_index& si, const Point_3& gi)
@@ -1034,6 +1153,21 @@ public:
     return result;
   }
 
+  bool lock_zone(const Element_type& v, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    std::vector<Cell_handle> inc_cells;
+    return tr.try_lock_and_get_incident_cells(v, inc_cells);
+  }
+
+  void locked_vertices(const Element_type& v, const C3t3&,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override
+  {
+    out = { v };
+  }
+
+  bool requires_ordered_processing() const override { return false; }
+
   std::string operation_name() const override { return "Vertex Smooth (Surface Vertices)"; }
 };
 
@@ -1071,20 +1205,18 @@ public:
   void perform_global_preprocessing(const C3t3& c3t3) const
   {
     auto& tr = c3t3.triangulation();
-    auto& moves = m_context->m_moves;
-
     using Move = typename BaseClass::Context::Move;
     const std::size_t nbv = tr.number_of_vertices();
-    const Move default_move{CGAL::NULL_VECTOR, 0 /*neighbors*/, 0. /*mass*/};
-    moves.assign(nbv, default_move);
     /*for dim 3 vertices, start counting neighbors directly from 0*/
 
-    for (const Edge& e : tr.finite_edges())
-    {
-      if (is_outside(e, c3t3, m_context->m_cell_selector))
-        continue;
-      else
+    // one cached edge scan, accumulated in parallel -- see
+    // Vertex_smoothing_context::m_finite_edges / accumulate_moves()
+    m_context->accumulate_moves(m_context->m_finite_edges, nbv,
+      [&](const Edge& e, std::vector<Move>& out)
       {
+        if (is_outside(e, c3t3, m_context->m_cell_selector))
+          return;
+
         const auto [vh0, vh1] = make_vertex_pair(e);
 
         const std::size_t& i0 = m_context->vertex_id(vh0);
@@ -1094,7 +1226,7 @@ public:
         const bool vh1_moving = (c3t3.in_dimension(vh1) == 3 && m_context->is_free(i1));
 
         if (!vh0_moving && !vh1_moving)
-          continue;
+          return;
 
         const Point_3& p0 = point(vh0->point());
         const Point_3& p1 = point(vh1->point());
@@ -1102,18 +1234,17 @@ public:
 
         if (vh0_moving)
         {
-          moves[i0].move += density * Vector_3(p0, p1);
-          moves[i0].mass += density;
-          ++moves[i0].neighbors;
+          out[i0].move += density * Vector_3(p0, p1);
+          out[i0].mass += density;
+          ++out[i0].neighbors;
         }
         if (vh1_moving)
         {
-          moves[i1].move += density * Vector_3(p1, p0);
-          moves[i1].mass += density;
-          ++moves[i1].neighbors;
+          out[i1].move += density * Vector_3(p1, p0);
+          out[i1].mass += density;
+          ++out[i1].neighbors;
         }
-      }
-    }
+      });
   }
 
   Element_range get_elements(const C3t3& c3t3) const override
@@ -1140,6 +1271,21 @@ public:
     }
     return false;
   }
+
+  bool lock_zone(const Element_type& v, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    std::vector<Cell_handle> inc_cells;
+    return tr.try_lock_and_get_incident_cells(v, inc_cells);
+  }
+
+  void locked_vertices(const Element_type& v, const C3t3&,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override
+  {
+    out = { v };
+  }
+
+  bool requires_ordered_processing() const override { return false; }
 
   std::string operation_name() const override { return "Vertex Smooth (Internal Vertices)"; }
 };

@@ -34,6 +34,15 @@
 #include <boost/iterator/function_output_iterator.hpp>
 
 #include <optional>
+#include <vector>
+#include <mutex>
+#include <atomic>
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <tbb/enumerable_thread_specific.h>
+#endif
 
 namespace CGAL
 {
@@ -598,6 +607,61 @@ auto make_vertex_pair(const Edge& e)
   return make_vertex_pair(e.first->vertex(e.second), e.first->vertex(e.third));
 }
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+// Parallel enumeration of finite edges via a cell-scan, used for candidate
+// collection. Each finite edge is visited exactly once -- by its minimum-handle
+// (canonical) cell, the same rule the finite_edges() iterator uses -- so there is
+// no shared deduplication structure. For every canonical finite edge the callback
+// `fn(e, local)` is invoked and appends its results to the supplied thread-local
+// vector; the merged result is returned. The mesh must be read-only during the
+// call (candidate collection / preprocessing happens before the parallel phase).
+template<typename T, typename Tr, typename Fn>
+std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
+{
+  using Cell_handle = typename Tr::Cell_handle;
+  using Edge = typename Tr::Edge;
+  using Cell_circulator = typename Tr::Cell_circulator;
+
+  std::vector<Cell_handle> cells;
+  cells.reserve(tr.number_of_finite_cells() + 64);
+  for(auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+    cells.push_back(cit);
+
+  static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+  tbb::enumerable_thread_specific<std::vector<T>> tl;
+  tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+    [&](const tbb::blocked_range<std::size_t>& range)
+    {
+      std::vector<T>& local = tl.local();
+      for(std::size_t ci = range.begin(); ci != range.end(); ++ci)
+      {
+        const Cell_handle c = cells[ci];
+        for(int s = 0; s < 6; ++s)
+        {
+          const Edge e(c, edge_slots[s][0], edge_slots[s][1]);
+          if(tr.is_infinite(e))
+            continue;
+          // canonical-owner test: c owns the edge iff no ring cell has a smaller handle
+          Cell_circulator ccir = tr.incident_cells(e);
+          do { ++ccir; } while(c < Cell_handle(ccir));
+          if(Cell_handle(ccir) != c)
+            continue;
+          fn(e, local);
+        }
+      }
+    });
+
+  std::vector<T> result;
+  std::size_t total = 0;
+  for(const auto& l : tl) total += l.size();
+  result.reserve(total);
+  for(const auto& l : tl)
+    result.insert(result.end(), l.begin(), l.end());
+  return result;
+}
+#endif
+
 template<typename Edge>
 auto make_inv_vertex_pair(const Edge& e)
 {
@@ -614,6 +678,31 @@ struct Compare_edges
     return make_vertex_pair(e1) < make_vertex_pair(e2);
   }
 };
+
+// Orders (vertex, vertex) pairs regardless of their orientation, so the two
+// orientations of an edge denote the same key. Unlike Compare_edges it never
+// dereferences a cell, which matters wherever a key can outlive the cell the
+// edge was found in.
+template<typename Vh>
+struct Compare_vertex_pairs
+{
+  bool operator()(const std::pair<Vh, Vh>& p1, const std::pair<Vh, Vh>& p2) const
+  {
+    return std::minmax(p1.first, p1.second) < std::minmax(p2.first, p2.second);
+  }
+};
+
+// Single monotonic source of the wave claim stamps written to vertices by
+// set_wave_claim_stamp(). Every executor that assembles conflict-free waves
+// draws from it, so a stamp handed to one can never collide with a stamp
+// handed to another, and a stamp left over from an earlier wave is always
+// strictly below the current one and therefore reads as unclaimed. Never
+// wraps in practice : one increment per wave, not per element.
+inline std::size_t next_wave_claim_stamp()
+{
+  static std::atomic<std::size_t> counter{0};
+  return ++counter;
+}
 
 
 template<typename Vh>
@@ -1297,6 +1386,19 @@ bool topology_test(const typename C3t3::Edge& edge,
   // no incident non-boundary facet has 3 boundary edges
   // no incident boundary facet has 3 feature edges
 
+  // consecutive incident facets share a vertex, so the same `vi` comes back
+  // several times around the edge : its subdomains are counted once
+  boost::container::small_vector<std::pair<Vertex_handle, bool>, 32> several_subdomains;
+  const auto has_several_subdomains = [&](const Vertex_handle vi)
+  {
+    for (const auto& e : several_subdomains)
+      if (e.first == vi)
+        return e.second;
+    const bool several = (nb_incident_subdomains(vi, c3t3) > 1);
+    several_subdomains.emplace_back(vi, several);
+    return several;
+  };
+
   Facet_circulator fcirc = c3t3.triangulation().incident_facets(edge);
   Facet_circulator fdone = fcirc;
   do
@@ -1312,7 +1414,7 @@ bool topology_test(const typename C3t3::Edge& edge,
       for (int i = 1; i < 4; i++)
       {
         Vertex_handle vi = f.first->vertex((f.second + i) % 4);
-        if (vi != v0 && vi != v1 && nb_incident_subdomains(vi, c3t3) > 1)
+        if (vi != v0 && vi != v1 && has_several_subdomains(vi))
         {
           if (is_edge_in_complex(v0, vi, c3t3)
               && is_edge_in_complex(v1, vi, c3t3))
@@ -1678,23 +1780,28 @@ squared_lower_size_bound(const typename C3t3::Edge& e,
   using FT = typename Tr::Geom_traits::FT;
   using Vertex_handle = typename Tr::Vertex_handle;
 
-  const Vertex_handle u = e.first->vertex(e.second);
-  const Vertex_handle v = e.first->vertex(e.third);
-
-  const FT size_at_u = sizing(point(u->point()), u->in_dimension(), u->index());
-  const FT size_at_v = sizing(point(v->point()), v->in_dimension(), v->index());
-
-  // if e is on the boundary AND sizing at the boundary is set to 0,
-  // we take the minimum size of the incident cells
-  if ( (size_at_u == 0 || size_at_v == 0) && is_boundary(c3t3, e, cell_selector))
+  // `is_boundary()` is tested first : `size_at_u` and `size_at_v` are only
+  // needed for boundary edges, and each of them costs a sizing field query
+  if (is_boundary(c3t3, e, cell_selector))
   {
+    const Vertex_handle u = e.first->vertex(e.second);
+    const Vertex_handle v = e.first->vertex(e.third);
+
+    const FT size_at_u = sizing(point(u->point()), u->in_dimension(), u->index());
+    const FT size_at_v = sizing(point(v->point()), v->in_dimension(), v->index());
+
+    // if sizing at the boundary is set to 0,
+    // we take the minimum size of the incident cells
+    if (size_at_u == 0 || size_at_v == 0)
+    {
 #ifdef CGAL_MIN_SIZING_IN_IS_TOO_SHORT
-    FT size_at_uv = min_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
+      FT size_at_uv = min_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
 #else
-    FT size_at_uv = average_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
+      FT size_at_uv = average_sizing_in_incident_cells(e, sizing, c3t3, cell_selector);
 #endif
-    CGAL_assertion(size_at_uv > 0);
-    return CGAL::square(FT(4) / FT(5) * size_at_uv);
+      CGAL_assertion(size_at_uv > 0);
+      return CGAL::square(FT(4) / FT(5) * size_at_uv);
+    }
   }
 
   const auto mwi = midpoint_with_info(e, boundary_edge, c3t3);
@@ -1933,6 +2040,72 @@ update_bimap(typename EdgesBimap::left_map::key_type& e, //Edge
       edges.left.insert(typename EdgesBimap::left_map::value_type(e, sqlen.value()));
   }
 }
+
+// Detects the delta collector, so collapse can branch between "record the
+// vertex for later" (parallel) and "re-evaluate right now" (sequential bimap).
+//
+// Must stay OUTSIDE the concurrency guard below: collapse_short_edges.h uses it
+// unconditionally (`if constexpr (Defers_incident_refresh<...>::value)`), so
+// hiding it behind CGAL_CONCURRENT_TETRAHEDRAL_REMESHING breaks the sequential
+// build. It is a pure type trait with no TBB dependency, and resolves to
+// false_type for the sequential bimap, which is exactly the wanted behaviour.
+template<typename T, typename = void>
+struct Defers_incident_refresh : std::false_type {};
+template<typename T>
+struct Defers_incident_refresh<
+    T, std::void_t<decltype(std::declval<T&>().refresh_vertices)> >
+  : std::true_type {};
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+/**
+* A write-only stand-in for the shortest-first work list, used by the parallel
+* collapse executor. `collapse()` calls remove_from_bimap() for all six edges
+* of every cell incident to the vertex it deletes, and execute_operation()
+* calls update_bimap() for every edge incident to the vertex it keeps -- on
+* the order of a hundred work-list mutations per collapse. Serializing those
+* on a shared lock costs far more than the parallelism they sit inside, so
+* each worker records them here instead, in thread-local order, and the
+* executor replays them into the real bimap once the wave has joined.
+*
+* Replay must preserve per-thread order: an edge can be removed and then
+* re-inserted (or vice versa) during one collapse, and only the last write
+* wins. Keys are vertex pairs, exactly as in the work list itself, so a
+* recorded write stays meaningful after the cells it came from are gone.
+*/
+template<typename Key, typename FT>
+struct Short_edges_delta
+{
+  // sqlen == nullopt encodes a removal (matching update_bimap's convention)
+  std::vector<std::pair<Key, std::optional<FT>>> writes;
+
+  // Surviving vertices whose incident edges still need re-evaluating.
+  //
+  // Doing that re-evaluation inside the parallel phase is what forced the
+  // expensive 2-ring claim: it runs can_be_collapsed()/is_too_short() on every
+  // edge (vkept, x), and those walk the stars of the far endpoints x -- the LINK
+  // vertices, not the collapsed edge's own endpoints. Deferring it until the
+  // wave has joined (mesh stable) leaves the parallel phase touching only its
+  // own endpoints' stars, which the cheap O(1) endpoint claim already covers.
+  std::vector<typename Key::first_type> refresh_vertices;
+
+  void clear() { writes.clear(); refresh_vertices.clear(); }
+};
+
+// (Defers_incident_refresh is defined above, outside the concurrency guard.)
+
+template<typename Key, typename FT>
+void remove_from_bimap(const Key& e, Short_edges_delta<Key, FT>& delta)
+{
+  delta.writes.emplace_back(e, std::nullopt);
+}
+
+template<typename Key, typename FT, typename FT2>
+void update_bimap(const Key& e, Short_edges_delta<Key, FT>& delta,
+                  const std::optional<FT2> sqlen)
+{
+  delta.writes.emplace_back(e, sqlen);
+}
+#endif
 
 template<typename Tr>
 std::array<typename Tr::Edge, 6>

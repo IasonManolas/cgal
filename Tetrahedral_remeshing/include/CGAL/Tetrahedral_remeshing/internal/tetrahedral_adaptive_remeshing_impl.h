@@ -21,6 +21,8 @@
 
 #include <CGAL/Mesh_complex_3_in_triangulation_3.h>
 #include <CGAL/Triangulation_utils_3.h>
+#include <CGAL/tags.h>
+#include <CGAL/Real_timer.h>
 
 #include <CGAL/Tetrahedral_remeshing/internal/Elementary_operation.h>
 #include <CGAL/Tetrahedral_remeshing/internal/split_long_edges.h>
@@ -34,6 +36,7 @@
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 
 #include <optional>
+#include <type_traits>
 #include <boost/container/small_vector.hpp>
 
 namespace CGAL
@@ -42,6 +45,40 @@ namespace Tetrahedral_remeshing
 {
 namespace internal
 {
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_PHASE_TIMINGS
+// Accumulates wall-clock time per remeshing phase across all iterations, so the
+// breakdown can be read once at the end instead of per-iteration. Debug aid only.
+struct Phase_timers
+{
+  double split = 0., collapse = 0., flip = 0., smooth = 0.;
+
+  static Phase_timers& get()
+  {
+    static Phase_timers t;
+    return t;
+  }
+
+  struct Scope
+  {
+    double& acc;
+    CGAL::Real_timer t;
+    Scope(double& a) : acc(a) { t.start(); }
+    ~Scope() { t.stop(); acc += t.time(); }
+  };
+
+  void dump() const
+  {
+    std::cout << "[phases] split " << split << " s, collapse " << collapse
+              << " s, flip " << flip << " s, smooth " << smooth << " s"
+              << std::endl;
+  }
+};
+#  define CGAL_TR_TIME_PHASE(name) \
+     Phase_timers::Scope CGAL_tr_phase_scope_(Phase_timers::get().name)
+#else
+#  define CGAL_TR_TIME_PHASE(name) ((void)0)
+#endif
 
 class Default_remeshing_visitor
 {
@@ -88,6 +125,22 @@ class Adaptive_remesher
   typedef typename C3t3::Corner_index        Corner_index;
 
   typedef Vertex_smoothing_context<C3t3, SizingFunction, CellSelector> SmoothingContext;
+
+  // Phases run in this order: split() -> collapse() -> flip() -> smooth().
+  // Only split() and collapse() mutate the 1-D feature complex (c3t3's edges_);
+  // flip() and smooth() only read it. Under Parallel_tag, edges_ is a lock-free
+  // structure (Complex_edges_storage) that relies on this phase ordering: no
+  // phase mutates edges_ while another phase's workers might be reading it.
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  template <typename Operation>
+  using ExecutionPolicy = std::conditional_t<
+      std::is_convertible<typename Tr::Concurrency_tag, CGAL::Parallel_tag>::value,
+      Elementary_operation_execution_parallel<Operation>,
+      Elementary_operation_execution_sequential<Operation> >;
+#else
+  template <typename Operation>
+  using ExecutionPolicy = Elementary_operation_execution_sequential<Operation>;
+#endif
 
 private:
   C3t3 m_c3t3;
@@ -171,10 +224,11 @@ public:
 
   void split()
   {
+    CGAL_TR_TIME_PHASE(split);
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_split_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeSplitOp;
     EdgeSplitOp split_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
-    Elementary_operation_execution_sequential<EdgeSplitOp> executor;
+    ExecutionPolicy<EdgeSplitOp> executor;
     executor.execute(split_op, m_c3t3);
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
@@ -197,10 +251,11 @@ public:
 
   void collapse()
   {
+    CGAL_TR_TIME_PHASE(collapse);
     CGAL_assertion(check_vertex_dimensions());
     typedef Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeCollapseOp;
     EdgeCollapseOp collapse_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
-    Elementary_operation_execution_sequential<EdgeCollapseOp> executor;
+    ExecutionPolicy<EdgeCollapseOp> executor;
     executor.execute(collapse_op, m_c3t3);
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
@@ -221,6 +276,7 @@ public:
 
   void flip()
   {
+    CGAL_TR_TIME_PHASE(flip);
     typedef Internal_edge_flip_operation<C3t3, CellSelector, Visitor> InternalFlipOp;
     typedef Boundary_edge_flip_operation<C3t3, CellSelector, Visitor> BoundaryFlipOp;
 
@@ -228,13 +284,13 @@ public:
     typename InternalFlipOp::Incident_cells_map inc_cells;
 
     InternalFlipOp internal_flip_op(m_cell_selector, m_visitor, inc_cells);
-    Elementary_operation_execution_sequential<InternalFlipOp> internal_executor;
+    ExecutionPolicy<InternalFlipOp> internal_executor;
     internal_executor.execute(internal_flip_op, m_c3t3);
 
     if (!m_protect_boundaries)
     {
       BoundaryFlipOp boundary_flip_op(m_cell_selector, m_visitor, inc_cells);
-      Elementary_operation_execution_sequential<BoundaryFlipOp> boundary_executor;
+      ExecutionPolicy<BoundaryFlipOp> boundary_executor;
       boundary_executor.execute(boundary_flip_op, m_c3t3);
     }
 
@@ -256,6 +312,7 @@ public:
 
   void smooth()
   {
+    CGAL_TR_TIME_PHASE(smooth);
     m_smoothing_context->refresh(m_c3t3);
 
     // Order matches the former Tetrahedral_remeshing_smoother::smooth_vertices():
@@ -265,18 +322,18 @@ public:
       if (m_smoothing_context->m_smooth_constrained_edges)
       {
         Complex_edge_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
-        Elementary_operation_execution_sequential<decltype(op)> executor;
+        ExecutionPolicy<decltype(op)> executor;
         executor.execute(op, m_c3t3);
       }
       {
         Surface_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
-        Elementary_operation_execution_sequential<decltype(op)> executor;
+        ExecutionPolicy<decltype(op)> executor;
         executor.execute(op, m_c3t3);
       }
     }
     {
       Internal_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
-      Elementary_operation_execution_sequential<decltype(op)> executor;
+      ExecutionPolicy<decltype(op)> executor;
       executor.execute(op, m_c3t3);
     }
 
@@ -296,25 +353,93 @@ public:
 #endif
   }
 
-  bool resolution_reached()
+  // True iff no edge is out of resolution. `e` is skipped when it is protected.
+  bool edge_out_of_resolution(const Edge& e) const
+  {
+    // skip protected edges
+    const bool boundary =
+      m_c3t3.is_in_complex(e) || is_boundary(m_c3t3, e, m_cell_selector);
+    if (m_protect_boundaries && boundary)
+      return false;
+
+    return is_too_long(e, boundary, m_sizing, m_c3t3, m_cell_selector)
+        || is_too_short(e, boundary, m_sizing, m_c3t3, m_cell_selector);
+  }
+
+  bool resolution_reached_sequential() const
   {
     for (const Edge& e : tr().finite_edges())
-    {
-      // skip protected edges
-      const bool boundary =
-        m_c3t3.is_in_complex(e) || is_boundary(m_c3t3, e, m_cell_selector);
-      if (m_protect_boundaries && boundary)
-        continue;
-
-      if(  is_too_long(e, boundary, m_sizing, m_c3t3, m_cell_selector)
-        || is_too_short(e, boundary, m_sizing, m_c3t3, m_cell_selector))
+      if (edge_out_of_resolution(e))
         return false;
-    }
+    return true;
+  }
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  /**
+  * Parallel counterpart of `resolution_reached_sequential()`, run once per
+  * remeshing iteration before split+collapse.
+  *
+  * The serial version walks `finite_edges()`, whose iterator pays the cell
+  * circulator's canonical-owner dedup (`Time_stamper::less`) for every edge --
+  * O(E x ring) of pure main-thread work. Here the scan is over *cells* instead:
+  * every finite edge is incident to at least one finite cell, so testing the six
+  * edges of every finite cell visits each finite edge at least once, and that is
+  * all this predicate needs. No dedup is required precisely because the answer
+  * is a disjunction over edges and `edge_out_of_resolution()` is a pure read --
+  * seeing an edge ~6 times costs redundant work but cannot change the result.
+  *
+  * `out_of_resolution` doubles as an early exit: once any thread has found an
+  * offending edge the remaining ranges bail out on the next check.
+  */
+  bool resolution_reached_parallel() const
+  {
+    std::vector<Cell_handle> cells;
+    cells.reserve(tr().number_of_finite_cells() + 64);
+    for (auto cit = tr().finite_cells_begin(); cit != tr().finite_cells_end(); ++cit)
+      cells.push_back(cit);
+
+    static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
+
+    std::atomic<bool> out_of_resolution{false};
+    tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+      [&](const tbb::blocked_range<std::size_t>& range)
+      {
+        for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
+        {
+          if (out_of_resolution.load(std::memory_order_relaxed))
+            return;
+          const Cell_handle c = cells[ci];
+          for (int s = 0; s < 6; ++s)
+          {
+            if (edge_out_of_resolution(Edge(c, edge_slots[s][0], edge_slots[s][1])))
+            {
+              out_of_resolution.store(true, std::memory_order_relaxed);
+              return;
+            }
+          }
+        }
+      });
+
+    return !out_of_resolution.load(std::memory_order_relaxed);
+  }
+#endif
+
+  bool resolution_reached()
+  {
+    bool reached = true;
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible<typename Tr::Concurrency_tag,
+                                      CGAL::Parallel_tag>::value)
+      reached = resolution_reached_parallel();
+    else
+#endif
+      reached = resolution_reached_sequential();
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_VERBOSE
-    std::cout << "Resolution reached" << std::endl;
+    if (reached)
+      std::cout << "Resolution reached" << std::endl;
 #endif
-    return true;
+    return reached;
   }
 
   //peel off slivers
@@ -696,6 +821,13 @@ public:
     }
 
     postprocess(); //peel off boundary slivers
+
+#ifdef CGAL_TETRAHEDRAL_REMESHING_PHASE_TIMINGS
+    Phase_timers::get().dump();
+#endif
+#ifdef CGAL_TETRAHEDRAL_REMESHING_LOCK_STATS
+    lock_stats::dump();
+#endif
 
     finalize();
     //Warning : triangulation() is now empty

@@ -80,9 +80,20 @@ public:
   bool is_cache_valid() const { return sliver_cache_validity_; }
   void reset_cache_validity() const { sliver_cache_validity_ = false; }
 
+  // Transient stamp marking this cell as already visited while the parallel
+  // collapse executor claims a wave member's 2-ring. The stars of a region's
+  // ~15 vertices overlap heavily -- ~360 cell visits for a union of only ~60-80
+  // distinct cells -- so without this the claim re-walks and re-stamps the same
+  // cells about five times over. Drawn from the same monotonic counter as the
+  // vertex stamp (next_wave_claim_stamp()), so a stale value is always below the
+  // current one and reads as unvisited; never reset, never serialized.
+  std::size_t wave_visit_stamp() const { return wave_visit_stamp_; }
+  void set_wave_visit_stamp(const std::size_t s) { wave_visit_stamp_ = s; }
+
 private:
   FT sliver_value_ = 0.;
   mutable bool sliver_cache_validity_ = false;
+  std::size_t wave_visit_stamp_ = 0;
 };
 
 } // namespace Tetrahedral_remeshing

@@ -26,6 +26,10 @@
 #include <utility>
 #include <optional>
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <execution>
+#endif
+
 namespace CGAL
 {
 namespace Tetrahedral_remeshing
@@ -396,22 +400,37 @@ public:
     std::vector<Long_edge_with_length> long_edges_with_lengths;
     const Tr& tr = c3t3.triangulation();
 
-    for (Edge e : tr.finite_edges())
+    auto eval = [&](const Edge& e, std::vector<Long_edge_with_length>& out)
     {
       auto [splittable, boundary] = can_be_split(e, c3t3, m_protect_boundaries, m_cell_selector);
       if (!splittable)
-        continue;
+        return;
 
       const std::optional<FT> sqlen = is_too_long(e, boundary, m_sizing, c3t3, m_cell_selector);
       if (sqlen != std::nullopt)
-        long_edges_with_lengths.push_back(Long_edge_with_length{e, sqlen.value()});
-    }
+        out.push_back(Long_edge_with_length{e, sqlen.value()});
+    };
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    // Parallel cell-scan candidate collection (see parallel_collect_finite_edges).
+    long_edges_with_lengths = parallel_collect_finite_edges<Long_edge_with_length>(tr, eval);
+#else
+    for (Edge e : tr.finite_edges())
+      eval(e, long_edges_with_lengths);
+#endif
 
     // longest first; stable to match the original bimap's ordering
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    std::stable_sort(std::execution::par, long_edges_with_lengths.begin(), long_edges_with_lengths.end(),
+                     [](const Long_edge_with_length& a, const Long_edge_with_length& b) {
+                       return a.sqlength > b.sqlength;
+                     });
+#else
     std::stable_sort(long_edges_with_lengths.begin(), long_edges_with_lengths.end(),
                      [](const Long_edge_with_length& a, const Long_edge_with_length& b) {
                        return a.sqlength > b.sqlength;
                      });
+#endif
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
     {
@@ -432,6 +451,22 @@ public:
     for(const auto& ef : long_edges_with_lengths)
       long_edges.push_back(make_vertex_pair(ef.edge));
     return long_edges;
+  }
+
+  bool lock_zone(const Element_type& element, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    boost::container::small_vector<Cell_handle, 64> inc_cells_first, inc_cells_second;
+    return tr.try_lock_and_get_incident_cells(element.first, inc_cells_first)
+        && tr.try_lock_and_get_incident_cells(element.second, inc_cells_second);
+  }
+
+  bool requires_ordered_processing() const override { return true; }
+
+  typename Tr::Geom_traits::Point_3 point_on_element(const Element_type& e) const
+  {
+    auto cp = typename Tr::Geom_traits().construct_point_3_object();
+    return cp(e.first->point());
   }
 
   bool execute_operation(const Element_type& element, C3t3& c3t3) override

@@ -26,8 +26,20 @@
 
 #include <unordered_map>
 #include <unordered_set>
+#include <string>
+#include <iostream>
+#include <type_traits>
 #include <limits>
 #include <queue>
+#include <mutex>
+#include <algorithm>
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+#include <tbb/concurrent_unordered_map.h>
+#include <tbb/parallel_for.h>
+#include <tbb/blocked_range.h>
+#include <cstdlib>
+#endif
 
 namespace CGAL
 {
@@ -35,8 +47,189 @@ namespace Tetrahedral_remeshing
 {
 namespace internal
 {
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+// Candidate collection for both flip operations used to walk
+// Triangulation_3::finite_edges() serially. That iterator pays a
+// cell-circulator canonical-owner dedup per edge, and the walk dominates
+// get_elements() -- pure serial time inside an otherwise parallel phase, so it
+// is bounded by Amdahl rather than by the core count.
+// parallel_collect_finite_edges() (tetrahedral_remeshing_helpers.h) applies the
+// same canonical-owner rule from a parallel cell scan, and is already what
+// split and collapse use for their own candidate collection. Safe here because
+// get_elements() runs before the parallel apply pass, with the mesh static, and
+// the predicates involved (is_internal / is_boundary) only read.
+//
+// Runtime toggle rather than compile-time so both arms live in one binary and
+// can be interleaved ABBA within a single thermal state.
+inline bool par_flip_collect()
+{
+  static const bool on = []
+    {
+      const char* const e = std::getenv("CGAL_TR_PAR_FLIP_COLLECT");
+      return !(e != nullptr && *e == '0');
+    }();
+  return on;
+}
+
+#ifndef CGAL_TR_FLIP_BUCKETS_PER_THREAD_DEFAULT
+// Buckets per thread for the internal flip's kd-partition, overriding the
+// global LB_BUCKETS_PER_THREAD (which stays 1, the right value for smooth).
+//
+// The global default was tuned when "only 15.6% of lock attempts ever retry",
+// i.e. when the cost being minimised was the *number of locks acquired* and
+// extra buckets only added interface area. That premise no longer holds for
+// flip: since the crash fix, the internal flip is the one operation with
+// prefers_bucket_scoped_locks() == true, so a worker holds its locks for the
+// whole bucket and an interface element cannot acquire until the neighbouring
+// bucket completes -- roughly 100k elements of waiting at one bucket/thread.
+// Measured on bear at 4 threads, internal flip issues ~12 lock retries per
+// locked element while smooth, on the identical executor path, issues 0.03.
+// Splitting into many short-lived buckets bounds that wait.
+//
+// Set via CGAL_TR_FLIP_BUCKETS_PER_THREAD at run time; 0 falls back to the
+// global value, which is the A/B baseline arm.
+#  define CGAL_TR_FLIP_BUCKETS_PER_THREAD_DEFAULT 32
+#endif
+
+inline std::size_t flip_buckets_per_thread()
+{
+  static const std::size_t n = []() -> std::size_t
+    {
+      const char* const e = std::getenv("CGAL_TR_FLIP_BUCKETS_PER_THREAD");
+      if (e != nullptr)
+      {
+        const long v = std::strtol(e, nullptr, 10);
+        if (v >= 0)
+          return static_cast<std::size_t>(v);
+      }
+      return static_cast<std::size_t>(CGAL_TR_FLIP_BUCKETS_PER_THREAD_DEFAULT);
+    }();
+  return n;
+}
+#endif
+
 enum Flip_Criterion{ MIN_ANGLE_BASED, AVERAGE_ANGLE_BASED,
                      VALENCE_BASED, VALENCE_MIN_DH_BASED };
+
+// ---------------------------------------------------------------------------
+// [DEBUG-lk01] Lock-ownership probe.
+//
+// Diagnostic only: enable with -DCGAL_TR_FLIP_LOCK_PROBE.
+//
+// The internal-flip crash is a read of the cell star of a ring vertex `w` that
+// races a concurrent flip mutating those same cells. That race is timing
+// dependent and neither gdb nor TSan reproduce it (both serialise the run hard
+// enough that the workers never overlap). This probe sidesteps timing entirely:
+// instead of waiting to observe two accesses collide, it asserts the invariant
+// that would make a collision impossible -- "before I walk w's cell star, I
+// hold w's spatial lock". A violation is reported on the very first run that
+// executes the offending code path, whether or not another worker happened to
+// be in the window at that moment.
+//
+// Reports (does not abort) so a single run enumerates every distinct offending
+// site rather than stopping at the first.
+// ---------------------------------------------------------------------------
+#ifdef CGAL_TR_FLIP_LOCK_PROBE
+template<typename Tr, typename Vertex_handle>
+void tr_flip_lock_probe(const Tr& tr, Vertex_handle v, const char* site)
+{
+  using Lds = std::remove_pointer_t<decltype(tr.get_lock_data_structure())>;
+  if constexpr (std::is_void_v<Lds>)
+    return; // sequential triangulation: no lock grid to check against
+  else
+  {
+  auto* lds = tr.get_lock_data_structure();
+  if (lds == nullptr)
+    return; // locking disabled: nothing to check
+  if (lds->is_locked_by_this_thread(v->point()))
+    return;
+
+  const int mode = tr_probe_mode();
+  const char* mode_name = (mode == 1) ? "INTERIOR-elided"
+                        : (mode == 2) ? "LOCKED-ZONE"
+                        : (mode == 3) ? "WAVE"
+                                      : "other/serial";
+
+  // Rate-limit per (site, mode) so one hot loop cannot flood the log, but a
+  // rare LOCKED-ZONE violation is never hidden behind a common INTERIOR one.
+  static std::mutex probe_mutex;
+  static std::unordered_map<std::string, std::size_t> hits;
+  std::lock_guard<std::mutex> guard(probe_mutex);
+  const std::size_t n = ++hits[std::string(mode_name) + "|" + site];
+  if (n <= 3 || n % 5000 == 0)
+  {
+    std::cerr << "[DEBUG-lk01] UNLOCKED READ  mode=" << mode_name
+              << "  site=" << site
+              << "  (hit #" << n << ")"
+              << "  vertex=" << (&*v)
+              << "  locked_by_someone=" << lds->is_locked(v->point())
+              << std::endl;
+  }
+  }
+}
+#define CGAL_TR_LOCK_PROBE(tr, v, site) \
+  ::CGAL::Tetrahedral_remeshing::internal::tr_flip_lock_probe((tr), (v), (site))
+#else
+#define CGAL_TR_LOCK_PROBE(tr, v, site) CGAL_USE(tr)
+#endif
+
+// ---------------------------------------------------------------------------
+// Lock-on-demand for the flip footprint.
+//
+// The precomputed-footprint approach (Elementary_operation::locked_vertices(),
+// evaluated in Pass 1) cannot protect a flip: it is computed before any
+// parallel mutation has happened, but a flip's actual footprint at execute
+// time depends on the neighbourhood as it is *then*, which concurrent flips
+// have already reshaped. Widening that precomputed set does not help, because
+// the set is computed at the wrong time rather than merely being too small.
+//
+// Instead, every read of a vertex's cell star acquires that vertex's lock at
+// the moment of the read. If the lock is unavailable, the whole flip is
+// abandoned via Flip_lock_bail: flips are best-effort (the edge simply stays
+// unflipped and may be revisited on a later pass), so abandoning one costs
+// nothing but a little work. Crucially, all such reads happen during flip
+// *selection*, before any cell is created or deleted, so a bail can never
+// leave the triangulation partially modified.
+//
+// try_lock_vertex() never blocks, and the executor calls
+// unlock_all_elements() after each element, so this cannot deadlock.
+// ---------------------------------------------------------------------------
+struct Flip_lock_bail {};
+
+template<typename Tr, typename Vertex_handle>
+inline void tr_flip_require_lock(const Tr& tr, Vertex_handle v)
+{
+#ifdef CGAL_TR_FLIP_NO_LOCK_ON_DEMAND
+  // A/B switch: restores the pre-fix behaviour (precomputed footprint only)
+  // so the cost of lock-on-demand can be measured against it. Crashes.
+  CGAL_USE(tr); CGAL_USE(v);
+  return;
+#else
+  // A sequential triangulation has no lock grid at all and declares
+  // get_lock_data_structure() as returning void*, so the body below cannot
+  // even be compiled for it. Nothing can race us there either.
+  using Lds = std::remove_pointer_t<decltype(tr.get_lock_data_structure())>;
+  if constexpr (std::is_void_v<Lds>)
+  {
+    CGAL_USE(tr); CGAL_USE(v);
+  }
+  else
+  {
+    auto* lds = tr.get_lock_data_structure();
+    if (lds == nullptr)
+      return; // parallel build, but locking disabled for this run
+
+    if (lds->is_locked_by_this_thread(v->point()))
+      return;
+
+    if (!const_cast<Tr&>(tr).try_lock_vertex(v))
+      throw Flip_lock_bail{};
+  }
+#endif
+}
+#define CGAL_TR_REQUIRE_LOCK(tr, v) \
+  ::CGAL::Tetrahedral_remeshing::internal::tr_flip_require_lock((tr), (v))
 
 //outer_mirror_facets contains the set of facets of the outer hull
 //of the set of cells modified by the flip operation,
@@ -598,7 +791,11 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
 
     boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
     if (o_inc_vh.empty())
+    {
+      CGAL_TR_LOCK_PROBE(tr, vh, "find_best_flip_to_improve_dh:ring_vh");
+      CGAL_TR_REQUIRE_LOCK(tr, vh);
       tr.incident_cells(vh, std::back_inserter(o_inc_vh));
+    }
 
     Facet_circulator facet_circulator = curr_fcirc;
     Facet_circulator facet_done = curr_fcirc;
@@ -776,7 +973,11 @@ Sliver_removal_result flip_n_to_m(C3t3& c3t3,
 
   boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vh];
   if (o_inc_vh.empty())
+  {
+    CGAL_TR_LOCK_PROBE(tr, vh, "flip_n_to_m:vh");
+    CGAL_TR_REQUIRE_LOCK(tr, vh);
     tr.incident_cells(vh, std::back_inserter(o_inc_vh));
+  }
 
   do
   {
@@ -1201,7 +1402,10 @@ std::size_t flip_all_edges(const std::vector<VertexPair>& edges,
   {
     boost::container::small_vector<Cell_handle, 64>& o_inc_vh = inc_cells[vp.first];
     if (o_inc_vh.empty())
+    {
+      CGAL_TR_LOCK_PROBE(tr, vp.first, "flip_edges_loop:vp.first");
       tr.incident_cells(vp.first, std::back_inserter(o_inc_vh));
+    }
 
     Cell_handle ch;
     int i0, i1;
@@ -1268,6 +1472,18 @@ void collectBoundaryEdgesAndComputeVerticesValences(
   boundary_edges.clear();
   boundary_vertices_valences.clear();
 
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  if (par_flip_collect())
+  {
+    boundary_edges = parallel_collect_finite_edges<Edge>(tr,
+      [&c3t3, &cell_selector](const Edge& e, std::vector<Edge>& local)
+      {
+        if (is_boundary(c3t3, e, cell_selector))
+          local.push_back(e);
+      });
+  }
+  else
+#endif
   for (const Edge& e : tr.finite_edges())
   {
     if (is_boundary(c3t3, e, cell_selector))
@@ -1780,7 +1996,10 @@ std::size_t flipBoundaryEdges(C3T3& c3t3,
   for(const auto& [vh0, vh1] : candidate_edges_for_flip) {
     boost::container::small_vector<Cell_handle, 64>& inc_vh0 = inc_cells[vh0];
     if(inc_vh0.empty())
+    {
+      CGAL_TR_LOCK_PROBE(tr, vh0, "flip_all_edges:vh0");
       tr.incident_cells(vh0, std::back_inserter(inc_vh0));
+    }
 
     Cell_handle c;
     int i, j;
@@ -1954,7 +2173,22 @@ protected:
   using Edge          = typename Tr::Edge;
   using Facet         = typename Tr::Facet;
   using Cells_vector  = boost::container::small_vector<Cell_handle, 64>;
-  using Incident_cells_map = std::unordered_map<Vertex_handle, Cells_vector>;
+  // Per-worker incident-cell cache. It MUST be per-worker rather than one shared
+  // concurrent map: lock-elided interior flips run execute_operation lock-free,
+  // and find_best_flip lazily caches inc_cells[w] for the opposite/ring vertices w
+  // around the edge -- vertices the interior/boundary classification neither tags
+  // nor locks. Two elided flips in adjacent buckets that share such a w would
+  // otherwise concurrently mutate the same Cells_vector (a small_vector, not
+  // thread-safe) -> heap corruption -> rare, delayed segfault or a corrupted
+  // triangulation that only surfaces phases later. lock_zone (populate) and
+  // execute_operation (read/cache) run on the same worker, so a thread-local map
+  // keeps the whole cache benefit with no cross-thread sharing.
+  using Incident_cells_local = std::unordered_map<Vertex_handle, Cells_vector>;
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  using Incident_cells_map = tbb::enumerable_thread_specific<Incident_cells_local>;
+#else
+  using Incident_cells_map = Incident_cells_local;
+#endif
 
   CellSelector& m_cell_selector;
   Visitor& m_visitor;
@@ -1969,6 +2203,24 @@ protected:
       : m_cell_selector(cell_selector)
       , m_visitor(visitor)
       , inc_cells(incident_cells) {}
+
+  // This worker's slice of the shared cache (see Incident_cells_map above).
+  Incident_cells_local& inc_cells_map() const
+  {
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    return inc_cells.local();
+#else
+    return inc_cells;
+#endif
+  }
+
+public:
+  typename Tr::Geom_traits::Point_3
+  point_on_element(const std::pair<Vertex_handle, Vertex_handle>& vp) const
+  {
+    auto cp = typename Tr::Geom_traits().construct_point_3_object();
+    return cp(vp.first->point());
+  }
 };
 
 // Flip of internal (non-boundary) edges. Mirrors the former flip_all_edges():
@@ -1989,6 +2241,8 @@ class Internal_edge_flip_operation
   using BaseClass::m_cell_selector;
   using BaseClass::m_visitor;
   using BaseClass::inc_cells;
+  // Dependent base member: GCC/Clang need the using-declaration, MSVC does not.
+  using BaseClass::inc_cells_map;
 
 public:
   using Incident_cells_map = typename BaseClass::Incident_cells_map;
@@ -2005,6 +2259,34 @@ public:
 
   Element_range get_elements(const C3t3& c3t3) const override
   {
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+    if (par_flip_collect())
+    {
+      const auto& tr = c3t3.triangulation();
+
+      // we will use sliver_value to store the cos_dihedral_angle
+      std::vector<typename C3t3::Cell_handle> complex_cells;
+      complex_cells.reserve(c3t3.number_of_cells_in_complex() + 64);
+      for (auto c : c3t3.cells_in_complex())
+        complex_cells.push_back(c);
+      tbb::parallel_for(tbb::blocked_range<std::size_t>(0, complex_cells.size()),
+        [&complex_cells](const tbb::blocked_range<std::size_t>& r)
+        {
+          for (std::size_t i = r.begin(); i != r.end(); ++i)
+            complex_cells[i]->reset_cache_validity();
+        });
+
+      const CellSelector& sel = m_cell_selector;
+      return parallel_collect_finite_edges<Edge_vv>(tr,
+        [&c3t3, &sel](const typename C3t3::Triangulation::Edge& e,
+                      std::vector<Edge_vv>& local)
+        {
+          if (is_internal(e, c3t3, sel))
+            local.push_back(make_vertex_pair(e));
+        });
+    }
+#endif
+
     for (auto c : c3t3.cells_in_complex())
       c->reset_cache_validity();//we will use sliver_value
                                 //to store the cos_dihedral_angle
@@ -2016,20 +2298,402 @@ public:
 
   bool execute_operation(const Element_type& vp, C3t3& c3t3) override
   {
-    Cells_vector& o_inc_vh = inc_cells[vp.first];
-    if (o_inc_vh.empty())
-      c3t3.triangulation().incident_cells(vp.first, std::back_inserter(o_inc_vh));
+    // Any read of a vertex star that cannot acquire its lock throws
+    // Flip_lock_bail. All such reads happen during selection, before the
+    // triangulation is modified, so abandoning here is always safe: the edge
+    // is simply left unflipped for a later pass to retry.
+    try
+    {
+      auto& tr = c3t3.triangulation();
 
-    Cell_handle ch;
-    int i0, i1;
-    if (!is_edge_uv(vp.first, vp.second, o_inc_vh, ch, i0, i1))
+      // Both endpoints are read and modified by every flip on this edge.
+      CGAL_TR_REQUIRE_LOCK(tr, vp.first);
+      CGAL_TR_REQUIRE_LOCK(tr, vp.second);
+
+      // The per-worker cache only stays valid while this worker holds the
+      // locks under which it was built. unlock_all_elements() after the
+      // previous element dropped those, so any surviving entry may name a
+      // cell another worker has since deleted. Start each element clean.
+      // No flush needed per element: locks are held for the whole bucket
+      // (prefers_bucket_scoped_locks()), so entries cached under them stay
+      // valid until on_locks_released() drops them.
+      auto& inc_cells_l = inc_cells_map();
+
+      Cells_vector& o_inc_vh = inc_cells_l[vp.first];
+      if (o_inc_vh.empty())
+      {
+        CGAL_TR_LOCK_PROBE(tr, vp.first,
+                           "Internal_flip::execute_operation:vp.first");
+        tr.incident_cells(vp.first, std::back_inserter(o_inc_vh));
+      }
+
+      Cell_handle ch;
+      int i0, i1;
+      if (!is_edge_uv(vp.first, vp.second, o_inc_vh, ch, i0, i1))
+        return false;
+
+      Edge edge(ch, i0, i1);
+      const Sliver_removal_result res
+        = find_best_flip(edge, c3t3, MIN_ANGLE_BASED, inc_cells_l, m_cell_selector, m_visitor);
+      return (res == VALID_FLIP);
+    }
+    catch (const Flip_lock_bail&)
+    {
+      // Contended neighbourhood: give up on this edge, keep the mesh valid.
+      // Release what we hold so the contending worker can proceed; that
+      // invalidates everything cached under those locks.
+      CGAL_TR_COUNT(lock_retry);
+      c3t3.triangulation().unlock_all_elements();
+      on_locks_released();
       return false;
-
-    Edge edge(ch, i0, i1);
-    const Sliver_removal_result res
-      = find_best_flip(edge, c3t3, MIN_ANGLE_BASED, inc_cells, m_cell_selector, m_visitor);
-    return (res == VALID_FLIP);
+    }
   }
+
+  // Not used any more: prefers_conflict_free_waves() below routes this
+  // operation through apply_conflict_free_waves() instead of
+  // apply_unordered_processing(), so lock_zone() is never called. Kept in its
+  // original, simple, safe form rather than deleted -- two more elaborate
+  // versions were tried and rejected here earlier this session: locking only
+  // {e.first, e.second} left find_best_flip_to_improve_dh()/flip_n_to_m()'s
+  // ring-vertex reads unprotected regardless of classification (confirmed by
+  // a SIGSEGV backtrace inside find_best_flip_to_improve_dh on
+  // mesh3_243015); widening it to also lock ring vertices closed that but
+  // required either an unordered or an ordered multi-vertex acquisition, and
+  // both ran into the same problem: safely discovering *which* ring vertices
+  // to lock requires reading the triangulation around the edge, which is
+  // itself unsafe before any lock is held (confirmed by a SIGSEGV inside
+  // Triangulation_data_structure_3::is_edge(), called from inside a from-
+  // scratch lock_zone() attempt with no lock held yet). See the
+  // "mesh3_243015 flip defect" log entries (third and fourth occurrence) for
+  // both attempts and why apply_conflict_free_waves() sidesteps the
+  // bootstrapping problem entirely: its claim is computed serially during
+  // wave selection, before any parallel mutation starts, so there is nothing
+  // to race against yet.
+  bool lock_zone(const Element_type& e, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    Cells_vector inc_cells_first, inc_cells_second;
+    const bool locked = tr.try_lock_and_get_incident_cells(e.first, inc_cells_first)
+                      && tr.try_lock_and_get_incident_cells(e.second, inc_cells_second);
+    if (locked)
+    {
+      auto& inc_cells_l = inc_cells_map(); // per-worker cache
+      inc_cells_l[e.first] = inc_cells_first;
+      inc_cells_l[e.second] = inc_cells_second;
+    }
+    return locked;
+  }
+
+  // *** OPEN DEFECT, NOT CLOSED after SIX attempts -- see the "mesh3_243015
+  // flip defect" log entries for the full record. Restored (again) to the
+  // pre-session form: {e.first, e.second} only, no lock_zone_precomputed
+  // override (falls back to lock_zone() above, unchanged). Flip's true
+  // footprint DOES reach its edge's ring (opposite) vertices --
+  // find_best_flip_to_improve_dh() walks incident_cells(w) for every ring
+  // vertex w, and flip_n_to_m() rewrites cells incident to w (this file) --
+  // and this under-claims relative to that. What was tried and rejected,
+  // in order:
+  // 1. Widen this method to include ring vertices, keep
+  //    apply_unordered_processing()'s lock_zone() at {e.first, e.second}
+  //    only: classification correctly routes affected candidates to the
+  //    locked path, but lock_zone() itself only ever locks the edge's own
+  //    endpoints, so two "correctly classified" candidates sharing a ring
+  //    vertex can still race on it. Confirmed live: a SIGSEGV backtrace
+  //    inside find_best_flip_to_improve_dh().
+  // 2. Widen lock_zone() to also lock ring vertices, unordered (v0, v1, then
+  //    ring vertices in circulation order): genuine multi-GB memory growth
+  //    under contention (no consistent lock order across threads -> two
+  //    candidates can each hold what the other wants, both fail, unlock,
+  //    retry -- with every failed attempt still paying for each vertex's
+  //    incident-cell fetch before discovering the conflict).
+  // 3. Same, but with a fixed global order (sort the vertex set by &*v
+  //    before acquiring): the ordering fix is sound in principle, but
+  //    *discovering* the ring-vertex set itself requires reading the
+  //    triangulation around the edge, which is unsafe before any lock is
+  //    held. Confirmed live: a SIGSEGV inside
+  //    Triangulation_data_structure_3::is_edge(), called from lock_zone()
+  //    with no lock held yet.
+  // 4. Route through apply_conflict_free_waves() instead (its claim is
+  //    computed serially during wave selection, sidestepping lock_zone()'s
+  //    bootstrapping problem entirely, and is provably sound given a widened
+  //    locked_vertices()): correct, but impractically slow. Internal flip's
+  //    candidate set is essentially every internal edge (dense, unlike
+  //    collapse's short-edge subset), so claims overlap constantly and very
+  //    few candidates are accepted per wave -- over 2.5 CPU-minutes at
+  //    ~100% (wave selection is serial) without finishing one iteration's
+  //    flip phase on mesh3_243015, against a normal 10-40s run.
+  // 5. Widen only this method (classification), leave
+  //    apply_unordered_processing()'s original single-layer
+  //    footprint_needs_halo() growth as-is (attempt 1's premise, but
+  //    actually tested this time -- attempt 1 above was measured against a
+  //    version of this method that had been accidentally reverted mid-session
+  //    by an edit meant for Boundary_edge_flip_operation, so it never really
+  //    ran): still crashed with std::bad_alloc, preceded by a memory spike
+  //    (~10GB) far too large to be legitimate bookkeeping for a ~30K-vertex
+  //    mesh -- consistent with the same class of corruption as before,
+  //    meaning even the narrowest version of this widening does not close
+  //    the gap on its own.
+  //
+  // 6. Route Pass 3's boundary path through a NEW lock_zone_precomputed()
+  //    hook instead of lock_zone(), given the exact vertex small_vector Pass 1
+  //    already computed (safely, mesh read-only) via a widened
+  //    locked_vertices() -- so Pass 3 never re-discovers the ring set live,
+  //    only locks handles it already knows are valid. This does sidestep
+  //    attempt 3's SIGSEGV (no live is_edge() call at Pass-3 time). It still
+  //    hit std::bad_alloc, immediately, on every one of the first 10/10
+  //    validation runs. Root cause once reasoned through: this is
+  //    structurally the same scheme as attempt 2 (lock v0, v1, then every
+  //    ring vertex, unlock-all-and-retry on any single failure), just reached
+  //    by a different route -- and address-sorting the acquisition order,
+  //    which helped nothing here, only prevents deadlock in a *blocking*
+  //    lock-ordering scheme. try_lock_and_get_incident_cells() never blocks,
+  //    so ordering has no bearing on the actual failure mode: at internal
+  //    flip's candidate density (essentially every internal edge is a
+  //    candidate, so ring sets overlap constantly), many candidates
+  //    contending for overlapping vertex sets thrash -- fail, unlock, yield,
+  //    retry -- and each retry re-pays a fresh Cells_vector allocation per
+  //    ring vertex (up to ~8, small_vector<Cell_handle,64> each). That is a
+  //    genuine unbounded allocation-churn source under optimistic try-lock at
+  //    this contention level, not a bug in the ring-vertex computation
+  //    itself. The conclusion attempt 2 already reached stands, now
+  //    confirmed via a structurally different code path: optimistic
+  //    try-lock-and-retry cannot cheaply protect a multi-vertex footprint
+  //    when the candidate graph is this dense, regardless of how the vertex
+  //    set is discovered or ordered. A real fix needs either non-optimistic
+  //    locking (blocking acquire-in-order, not available on this triangulation's
+  //    lock primitive today) or restructuring flip's candidate scheduling so
+  //    contending candidates are never scheduled concurrently in the first
+  //    place.
+  //
+  // 8. prefers_boundary_waves(): scope the conflict-free-wave scheme
+  //    (attempt 4's mechanism) down to just the BOUNDARY subset instead of
+  //    the whole candidate set, so serial wave selection stays proportional
+  //    to the (small) boundary set rather than the whole mesh. First cut
+  //    (stamping/testing only lv's own 1-ring, like
+  //    apply_conflict_free_waves() does for non-halo operations) still
+  //    crashed (SIGSEGV) and livelocked (timeouts) on nearly every run:
+  //    flip's true footprint needs the same extra cell-layer that
+  //    footprint_needs_halo()/Pass 2b exists to cover for classification, and
+  //    the wave claim/test wasn't extended to match. Extending both the test
+  //    and the claim to that same one-hop-beyond-lv halo (matching Pass 2b's
+  //    semantics) fixed the SIGSEGV's specific cause in principle, but the
+  //    revalidation run still failed at a similar rate (still one SIGSEGV,
+  //    mostly livelock/timeout) -- meaning either a further, undiagnosed gap
+  //    remains in the halo-extended claim, or the per-candidate,
+  //    per-wave-retry cost of recomputing that extended set is itself now
+  //    the bottleneck (each pending candidate re-walks its halo on every wave
+  //    pass, not just once). Not fully root-caused before this session ran
+  //    out of budget to investigate further -- reverted rather than left in
+  //    a partially-diagnosed, still-crashing state. See the "mesh3_243015
+  //    flip defect" log entries (ATTEMPT 8 / 8b) for the two validation runs
+  //    and the exact rc breakdowns.
+  //
+  // *** ATTEMPT 8c: re-enabled 8b under crashbt_debug in-process backtrace
+  // instrumentation to root-cause the remaining SIGSEGV. Found it:
+  // find_best_flip()'s lazy population of the per-worker inc_cells_map cache
+  // was racing across threads because the wave's ACCEPTED members were
+  // still executed via a nested tbb::parallel_for -- meaning find_best_flip's
+  // real read footprint (it explores/caches vertices while evaluating
+  // candidate flip rotations) reaches further than any vertex-set claim
+  // computed ahead of time could practically capture.
+  //
+  // *** ATTEMPT 9: execute each wave's accepted members SEQUENTIALLY instead
+  // of via tbb::parallel_for (only the deferred boundary subset, not the
+  // whole phase). This did eliminate the crash -- 13/13 runs with no
+  // SIGSEGV/SIGABRT -- but all 13 timed out (rc=124). CPU usage during a run
+  // sat at ~100% (one core), not ~400%, meaning the "boundary" subset this
+  // scheme forces onto a single thread is NOT a small minority for internal
+  // flip: once locked_vertices() is widened to accurately reflect the real
+  // footprint, most internal-edge candidates end up classified boundary
+  // (their ring vertices are shared across bucket interfaces often enough,
+  // at this candidate density, that "boundary" is closer to "most of the
+  // mesh" than "the interface only"). Serializing that subset for
+  // correctness therefore serializes most of the flip phase -- not a fixable
+  // edge case, a direct consequence of how dense flip's candidate graph is.
+  //
+  // *** ATTEMPT 9b: before accepting that conclusion, fixed a separate real
+  // bug found by inspection: the wave claim's halo-growth step (see
+  // Elementary_operation.h) was growing from e.first/e.second's ENTIRE
+  // incident-cell star (every cell touching that vertex anywhere in the
+  // mesh), not just cells near this specific edge -- a severe over-claim
+  // that alone could explain excessive spurious conflicts. Added
+  // halo_growth_skip() to skip growing from the edge's own two endpoints,
+  // only from its ring vertices (see the base class's comment). Rebuilt,
+  // revalidated: still all timeouts, and the live process was still sitting
+  // at ~100% CPU -- confirming the over-broad-growth bug was real and worth
+  // fixing, but not the (or not the only) cause of the serialization; the
+  // "boundary is most of the mesh for this operation" conclusion above
+  // stands independent of it.
+  //
+  // *** CONCLUSION: attempt 8's whole category (claim scoped to a subset
+  // rather than the whole mesh) is now genuinely ruled out for internal
+  // flip, not just "found buggy in its first implementation" as attempt 7's
+  // writeup left it -- the scoping assumption it depends on (boundary is a
+  // small minority) does not hold for this operation's candidate density.
+  // Reverted (again) to the pre-session baseline: {e.first, e.second} only,
+  // no prefers_boundary_waves()/halo_growth_skip() override.
+  // *** ATTEMPT 10 (diagnostic): re-enabled with scoped halo_growth_skip()
+  // and PARALLEL wave execution (see Elementary_operation.h), to test the
+  // one combination not yet tried: scoped growth + parallel, isolating
+  // whether the scoping fix alone closes the gap 8b/8c's crash exposed.
+  // **It did not** -- run 1/20 crashed (`rc=134`) with the identical
+  // find_best_flip/inc_cells_map backtrace signature as 8c's crash (same
+  // call chain, offsets shifted only by the intervening code changes). This
+  // definitively separates two previously-conflated variables: growth
+  // scoping (broad vs. narrow) does not affect whether the crash occurs;
+  // only removing PARALLEL wave execution (attempt 9) does. The remaining
+  // gap is therefore not a matter of the claim being too narrow or too
+  // broad -- it is something a vertex-based claim (however computed) cannot
+  // express for this operation. Inspection of `flip_n_to_m`'s cell-adjacency
+  // stitching (~line 926-969: `ch->set_neighbor(v, facet.first)` writes into
+  // `facet.first`, a MIRRORED neighbor cell one hop across the ring boundary
+  // via `tr.mirror_facet()`) is the most likely site: that neighbor cell's
+  // own 4th vertex is not necessarily anything the claim stamps directly,
+  // even though the neighbor cell itself IS reachable through a ring
+  // vertex's incident-cell walk in principle -- suggesting either a subtle
+  // gap in that specific reachability argument, or unsynchronized
+  // `Concurrent_compact_container`-level cell creation/deletion contention
+  // that no per-vertex claim could ever cover. Not confirmed further within
+  // this session's remaining budget. Reverted (again) to the pre-session
+  // baseline: {e.first, e.second} only, no prefers_boundary_waves()/
+  // halo_growth_skip() override.
+  // *** ATTEMPT 11 (diagnostic, debug-symbol build): reproduced attempt 10's
+  // crash under -g, getting a line-level backtrace instead of function-name-
+  // only. New finding: the crash resolves to
+  // `Time_stamper<...>::hash_value()` -> `vertex->time_stamp()`
+  // (SMDS_3/include/CGAL/Simplicial_mesh_vertex_base_3.h:172), called from
+  // `CC_iterator::operator->()` (STL_Extension/include/CGAL/Compact_container.h:1121)
+  // -- i.e. the crash is inside HASHING a Vertex_handle key while inserting
+  // into the per-worker `inc_cells` unordered_map, not inside the
+  // incident-cells walk or the adjacency-stitching write theorized earlier.
+  // This points at a genuinely different mechanism than the "unclaimed
+  // mirrored-neighbor-cell write" hypothesis from attempt 10: either (a) the
+  // Vertex_handle being hashed is itself dangling/stale, or (b) time_stamp()
+  // unsafe to read concurrently. CORRECTED (external review, 2026-08-21):
+  // flip never deletes vertices (only cells -- tds().delete_cell() at
+  // :329/:979, tds().create_cell() at :899), so (b) is dead and (a) was
+  // mis-localized. The real mechanism: populating inc_cells[w] for an
+  // UNCLAIMED ring vertex w calls tr.incident_cells(vh, ...) (:607, :785,
+  // :1789, :2405), which walks w's cell star via a circulator following
+  // w->cell() -- unprotected against a *concurrent* set_cell() (:318, :964),
+  // delete_cell() (:329, :979), or create_cell() (:899) on exactly those
+  // cells, from another worker whose own ring overlaps this one's. The
+  // circulator can follow a pointer into freed/recycled
+  // Concurrent_compact_container storage, yield a garbage Cell_handle, and
+  // ch->vertex(v) off it hands a garbage Vertex_handle straight into the
+  // inc_cells[...] insert -- landing on the reported crash frame
+  // (hash_value -> CC_iterator::operator-> -> time_stamp()). The crash site
+  // is real but downstream; the corruption is in the unprotected star walk.
+  //
+  // *** ATTEMPT 12/12b: re-attempt #5 (lock_zone_precomputed(), locking the
+  // Pass-1-safely-discovered ring-vertex set instead of rediscovering it
+  // live), with contention mitigation for its earlier bad_alloc failure
+  // (bounded retry + backoff + serial fallback on cap -- 64 attempts in
+  // 12, 4 in 12b, see Elementary_operation.h's Pass 3 boundary branch).
+  // **Both still hit std::bad_alloc**, identically, on the very first run
+  // (`terminate called after throwing an instance of 'std::bad_alloc'`,
+  // right after the collapse phase). Tightening the retry cap from 64 to 4
+  // made no difference -- this rules out "retry-churn count" as the driver
+  // of the allocation pressure (attempt 2's original diagnosis). The cost
+  // is per-*attempt*, not cumulative-across-retries: at this candidate
+  // density (most candidates are boundary, per attempt 9), many threads
+  // simultaneously call try_lock_and_get_incident_cells() for overlapping
+  // ring vertices, and if any of those vertices has high valence, even a
+  // single attempt's Cells_vector can be large -- multiplied across many
+  // concurrently-contending threads, this plausibly reaches genuine
+  // multi-GB territory regardless of how few retries each candidate is
+  // allowed. The externally-reviewed mechanism (unprotected
+  // incident_cells(w) walk racing set_cell()/delete_cell()/create_cell() on
+  // an unclaimed ring vertex's cell star) is very likely still the correct
+  // explanation for the ORIGINAL crash; what this rules out is "lock every
+  // ring vertex, retry on contention" as a *viable implementation* of the
+  // fix it implies -- the locking itself is too expensive at this density
+  // to survive contention, independent of retry tuning. A real
+  // implementation of this mechanism's fix needs to reduce the PER-ATTEMPT
+  // cost (e.g. cache/reuse each vertex's incident-cell list across retries
+  // instead of re-fetching from scratch every attempt, or find a way to
+  // avoid materializing the incident-cell list at lock time at all -- only
+  // the *protection* is needed at this stage, not the list itself, which
+  // find_best_flip re-derives when it actually needs it). Reverted (again)
+  // to the pre-session baseline: {e.first, e.second} only, no
+  // prefers_boundary_waves()/halo_growth_skip() override, no
+  // lock_zone_precomputed() override (falls back to lock_zone() below).
+  // *** ATTEMPT 13: same widened-ring-vertex idea as 12/12b, but
+  // lock_zone_precomputed() now only *locks* each vertex (try_lock_vertex(),
+  // no cell-list fetch) instead of try_lock_and_get_incident_cells(). The
+  // incident-cell cache is left to execute_operation()'s existing lazy
+  // population (`if (o_inc_vh.empty()) tr.incident_cells(vh, ...)`,
+  // flip_edges.h ~605-607/783-785) -- now safe to run there because it only
+  // ever runs after every vertex in `lv` is already locked, so no other
+  // locked-path candidate can be concurrently mutating (set_cell/
+  // delete_cell/create_cell) any cell incident to those vertices. This
+  // directly targets attempt 12/12b's finding: the bad_alloc came from
+  // eagerly building a Cells_vector for every vertex on every lock attempt,
+  // not from the number of retries -- try_lock_vertex() does no allocation
+  // at all, so a failed attempt costs a lock CAS per vertex, not a cell walk.
+  // Locks are acquired on demand inside execute_operation(), so they must
+  // survive from one element to the next for the incident-cell cache built
+  // under them to stay usable. See Elementary_operation::prefers_bucket_scoped_locks().
+  bool prefers_bucket_scoped_locks() const override { return true; }
+
+  // The worker just dropped its locks: every cached cell star was derived
+  // from the triangulation while those locks were held and may now be stale.
+  void on_locks_released() override { inc_cells_map().clear(); }
+
+  void locked_vertices(const Element_type& e, const C3t3& c3t3,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override
+  {
+    out.push_back(e.first);
+    out.push_back(e.second);
+
+    auto& tr = c3t3.triangulation();
+    Cell_handle ch; int i0 = 0, i1 = 0;
+    if (!tr.tds().is_edge(e.first, e.second, ch, i0, i1))
+      return;
+
+    auto circ = tr.incident_cells(Edge(ch, i0, i1));
+    const auto done = circ;
+    do
+    {
+      for (int k = 0; k < 4; ++k)
+      {
+        const Vertex_handle w = circ->vertex(k);
+        if (w != e.first && w != e.second
+            && std::find(out.begin(), out.end(), w) == out.end())
+          out.push_back(w);
+      }
+    } while (++circ != done);
+  }
+
+  // Locks every vertex in `lv`, sorted by address, using the lock-only
+  // primitive (no incident-cell fetch -- see the comment above
+  // locked_vertices() for why that matters). On any failure, returns false
+  // without unlocking; the caller (Elementary_operation.h's Pass 3 boundary
+  // branch) unlocks everything acquired so far before retrying.
+  bool lock_zone_precomputed(const Element_type&, const C3t3& c3t3,
+                              const boost::container::small_vector<Vertex_handle, 2>& lv) const override
+  {
+    auto& tr = c3t3.triangulation();
+    boost::container::small_vector<Vertex_handle, 8> ordered(lv.begin(), lv.end());
+    std::sort(ordered.begin(), ordered.end(),
+              [](const Vertex_handle& a, const Vertex_handle& b) { return &*a < &*b; });
+
+    for (const Vertex_handle& v : ordered)
+      if (!tr.try_lock_vertex(v))
+        return false;
+    return true;
+  }
+
+  bool footprint_needs_halo() const override { return true; }
+
+  bool requires_ordered_processing() const override { return false; }
+
+#if defined CGAL_CONCURRENT_TETRAHEDRAL_REMESHING && defined CGAL_LINKED_WITH_TBB
+  // See flip_buckets_per_thread() above : flip holds bucket-scoped locks, so it
+  // wants many short-lived buckets where smooth wants few large ones.
+  std::size_t buckets_per_thread_hint() const override
+  { return flip_buckets_per_thread(); }
+#endif
 
   std::string operation_name() const override { return "Flip edges (internal)"; }
 };
@@ -2053,12 +2717,28 @@ class Boundary_edge_flip_operation
   using BaseClass::m_cell_selector;
   using BaseClass::m_visitor;
   using BaseClass::inc_cells;
+  // Dependent base member: GCC/Clang need the using-declaration, MSVC does not.
+  using BaseClass::inc_cells_map;
 
   using Subdomain_index = typename C3t3::Subdomain_index;
   using Surface_patch_index = typename C3t3::Surface_patch_index;
   using Spi_map = boost::unordered_map<Surface_patch_index, unsigned int>;
 
   mutable boost::unordered_map<Vertex_handle, Spi_map> m_boundary_vertices_valences;
+  // execute_operation() runs on Pass 3's parallel_for, where different
+  // buckets execute truly concurrently on different worker threads -- unlike
+  // the triangulation itself, m_boundary_vertices_valences is a plain,
+  // non-thread-safe boost::unordered_map, and flip_surface_edge() both reads
+  // it (to decide whether to flip) and writes it (to record the result) in
+  // one read-decide-write sequence. That sequence needs to be atomic as a
+  // whole -- a per-entry atomic wouldn't preserve the invariant the cost
+  // comparison relies on -- so it is serialized here rather than made
+  // lock-free. Boundary edges are a minority of flip candidates, so this
+  // does not serialize the bulk of the phase, only their processing among
+  // themselves. lock_zone()'s triangulation locking does not protect this
+  // map at all, so this hazard exists independently of any elision
+  // classification (locked_vertices()/footprint_needs_halo() above).
+  mutable std::mutex m_valence_mutex;
 
 public:
   using Incident_cells_map = typename BaseClass::Incident_cells_map;
@@ -2102,7 +2782,8 @@ public:
     const Vertex_handle vh1 = vp.second;
     typename C3t3::Triangulation& tr = c3t3.triangulation();
 
-    Cells_vector& inc_vh0 = inc_cells[vh0];
+    auto& inc_cells_l = inc_cells_map(); // per-worker cache
+    Cells_vector& inc_vh0 = inc_cells_l[vh0];
     if (inc_vh0.empty())
       tr.incident_cells(vh0, std::back_inserter(inc_vh0));
 
@@ -2118,13 +2799,53 @@ public:
     if (!on_boundary || boundary_facets.size() != 2)
       return false;
 
+    // flip_surface_edge() reads and then writes m_boundary_vertices_valences
+    // as one sequence; see the comment on m_valence_mutex above for why that
+    // needs to be atomic as a whole, independent of triangulation locking.
+    std::lock_guard<std::mutex> valence_lock(m_valence_mutex);
     return flip_surface_edge(c3t3, edge,
                               boundary_facets,
                               m_boundary_vertices_valences,
-                              inc_cells,
+                              inc_cells_l,
                               MIN_ANGLE_BASED,
                               m_visitor);
   }
+
+  bool lock_zone(const Element_type& e, const C3t3& c3t3) const override
+  {
+    auto& tr = c3t3.triangulation();
+    Cells_vector inc_cells_first, inc_cells_second;
+    const bool locked = tr.try_lock_and_get_incident_cells(e.first, inc_cells_first)
+                      && tr.try_lock_and_get_incident_cells(e.second, inc_cells_second);
+    if (locked)
+    {
+      auto& inc_cells_l = inc_cells_map(); // per-worker cache
+      inc_cells_l[e.first] = inc_cells_first;
+      inc_cells_l[e.second] = inc_cells_second;
+    }
+    return locked;
+  }
+
+  // Unlike Internal_edge_flip_operation, boundary flip's own triangulation
+  // footprint never reaches past its edge's two endpoints: flip_on_surface()
+  // and flip_n_to_m_on_surface() (this file) mutate only cells_around_edge --
+  // cells incident to the edge itself, already inside {e.first, e.second}'s
+  // own claim. No ring-vertex widening or halo growth needed. (This method
+  // briefly carried a ring-vertex widening copied from
+  // Internal_edge_flip_operation by analogy, without checking that
+  // assumption against boundary flip's own code -- it doesn't have
+  // find_best_flip()'s full-star read. Reverted; the real remaining hazard
+  // for boundary flip turned out to be m_boundary_vertices_valences, fixed
+  // above with m_valence_mutex, not a cell/vertex-star gap.)
+  void locked_vertices(const Element_type& e, const C3t3&,
+                       boost::container::small_vector<Vertex_handle, 2>& out) const override
+  {
+    out = { e.first, e.second };
+  }
+
+  bool footprint_needs_halo() const override { return false; }
+
+  bool requires_ordered_processing() const override { return false; }
 
   std::string operation_name() const override { return "Flip edges (boundary)"; }
 };
