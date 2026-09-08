@@ -28,6 +28,8 @@
 
 #ifdef CGAL_LINKED_WITH_TBB
 #include <tbb/concurrent_unordered_map.h>
+#include <tbb/blocked_range.h>
+#include <tbb/parallel_for.h>
 #endif
 
 #include <cstdlib>
@@ -2314,6 +2316,47 @@ public:
 
   Element_range get_elements(const C3t3& c3t3) const override
   {
+    // C7 -- `CGAL_TR_PARALLEL_IFLIP_SCAN=1`. Both halves of this function are
+    // single-threaded in the shipped arm, and together they are the largest
+    // identified serial section of the parallel run (VTune 2026-09-08; see
+    // Parallel_tuning::parallel_internal_flip). The cell snapshot is taken once
+    // and serves both, so the arm pays ONE walk of the compact container where
+    // the off arm pays a complex-cell walk plus a finite-edge walk.
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (std::is_convertible_v<typename C3t3::Triangulation::Concurrency_tag,
+                                        CGAL::Parallel_tag>)
+    {
+      if (Parallel_tuning::get().parallel_internal_flip)
+      {
+        const typename C3t3::Triangulation& tr = c3t3.triangulation();
+        const std::vector<Cell_handle> cells = gather_all_cells(tr);
+
+        tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
+          [&](const tbb::blocked_range<std::size_t>& range)
+          {
+            for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
+            {
+              const Cell_handle c = cells[ci];
+              if (c3t3.is_in_complex(c))
+                c->reset_cache_validity();//we will use sliver_value
+                                          //to store the cos_dihedral_angle
+            }
+          });
+
+        // Same edge set and same per-edge test as get_internal_edges(); only
+        // the traversal that reaches each edge exactly once differs, and it
+        // uses the same smallest-incident-cell rule the serial iterator does.
+        return parallel_collect_finite_edges<Edge_vv>(
+          tr, cells,
+          [&](const Edge& e, std::vector<Edge_vv>& out)
+          {
+            if (is_internal(e, c3t3, m_cell_selector))
+              out.push_back(make_vertex_pair(e));
+          });
+      }
+    }
+#endif
+
     for (auto c : c3t3.cells_in_complex())
       c->reset_cache_validity();//we will use sliver_value
                                 //to store the cos_dihedral_angle

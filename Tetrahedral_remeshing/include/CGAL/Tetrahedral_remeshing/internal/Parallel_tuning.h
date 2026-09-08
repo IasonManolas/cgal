@@ -163,6 +163,34 @@ struct Parallel_tuning
   bool parallel_surface_indices= false;
   bool parallel_boundary_flip  = false;
   bool parallel_candidate_sort = false;
+  /**
+  * C7. Collect the INTERNAL flip's candidates in parallel.
+  *
+  * `Internal_edge_flip_operation::get_elements()` was the one operation still
+  * building its work list single-threaded: a `reset_cache_validity()` pass over
+  * every complex cell, then `get_internal_edges()`, which walks
+  * `finite_edges_begin()..finite_edges_end()`. That iterator dedups an edge by
+  * circulating its incident cells and keeping only the smallest cell handle
+  * (`pos < ccir`), which is why `Time_stamper::less` shows up as 1.44 s of CPU
+  * with 0.02 s of it on any worker.
+  *
+  * Measured 2026-09-08, VTune threading, `cdt/409635 f0.5` at 4 threads: of a
+  * 38.95 s run the workers are idle for 14.94 s, and 9.12 s of that is CPU the
+  * main thread holds alone. `Triangulation_ds_edge_iterator_3::operator++`
+  * (0.90 s), `Time_stamper::less` (1.44 s) and `make_vertex_pair` (0.33 s) are
+  * ~100% main-thread and are all inside this one function.
+  *
+  * The replacement is the canonical-owner rule `parallel_collect_finite_edges`
+  * already applies for split, collapse and smooth -- the same "smallest cell
+  * handle around the edge owns it" test, evaluated from a parallel scan over a
+  * cell snapshot. Flip is `requires_ordered_processing == false` and its
+  * executor kd-partitions the candidates spatially before running them, so the
+  * order `get_elements()` returns is not observable; the SET it returns is
+  * identical.
+  *
+  * Off by default so both arms live in one binary (POLICY 0.2).
+  */
+  bool parallel_internal_flip  = false;
 
   // ---- Group D : partitioning --------------------------------------------
   // 0 equal-count kd (shipped), 1 Hilbert chunks, 2 METIS.
@@ -312,6 +340,7 @@ private:
     t.parallel_normals         = flag("CGAL_TR_PARALLEL_NORMALS");
     t.parallel_surface_indices = flag("CGAL_TR_PARALLEL_SURF_IDX");
     t.parallel_boundary_flip   = flag("CGAL_TR_PARALLEL_BFLIP_SCAN");
+    t.parallel_internal_flip   = flag("CGAL_TR_PARALLEL_IFLIP_SCAN");
     t.parallel_candidate_sort  = flag("CGAL_TR_PARALLEL_SORT");
     t.partitioner              = number("CGAL_TR_PARTITIONER", 0);
     t.reuse_partition          = flag("CGAL_TR_REUSE_PARTITION");

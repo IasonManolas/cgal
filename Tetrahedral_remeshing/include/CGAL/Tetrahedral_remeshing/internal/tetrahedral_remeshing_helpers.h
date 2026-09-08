@@ -314,17 +314,36 @@ std::vector<T> parallel_collect_finite_facets(const Tr& tr, Fn fn)
   return out;
 }
 
+/**
+* The single-threaded prologue both parallel collectors need: a random-access
+* snapshot of the cell handles, because a Concurrent_compact_container is a
+* linked walk and `tbb::blocked_range` needs indices. Exposed on its own so a
+* caller that wants BOTH a parallel cell pass and a parallel edge collection
+* pays this walk once instead of twice.
+*/
+template<typename Tr>
+std::vector<typename Tr::Cell_handle> gather_all_cells(const Tr& tr)
+{
+  std::vector<typename Tr::Cell_handle> cells;
+  cells.reserve(tr.number_of_finite_cells() + 64);
+  for (auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
+    cells.push_back(cit);
+  return cells;
+}
+
+/**
+* Overload taking a cell snapshot the caller already has. Same canonical-owner
+* rule and same output as the gathering version.
+*/
 template<typename T, typename Tr, typename Fn>
-std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
+std::vector<T> parallel_collect_finite_edges(
+    const Tr& tr,
+    const std::vector<typename Tr::Cell_handle>& cells,
+    Fn fn)
 {
   using Cell_handle = typename Tr::Cell_handle;
   using Edge = typename Tr::Edge;
   using Cell_circulator = typename Tr::Cell_circulator;
-
-  std::vector<Cell_handle> cells;
-  cells.reserve(tr.number_of_finite_cells() + 64);
-  for (auto cit = tr.all_cells_begin(); cit != tr.all_cells_end(); ++cit)
-    cells.push_back(cit);
 
   static constexpr int edge_slots[6][2] = { {0,1},{0,2},{0,3},{1,2},{1,3},{2,3} };
 
@@ -358,6 +377,12 @@ std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
   tl.combine_each([&out](const std::vector<T>& v)
                   { out.insert(out.end(), v.begin(), v.end()); });
   return out;
+}
+
+template<typename T, typename Tr, typename Fn>
+std::vector<T> parallel_collect_finite_edges(const Tr& tr, Fn fn)
+{
+  return parallel_collect_finite_edges<T>(tr, gather_all_cells(tr), fn);
 }
 
 #endif // CGAL_LINKED_WITH_TBB
