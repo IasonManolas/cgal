@@ -1167,6 +1167,81 @@ Located_edge<Vertex_handle, Cell_handle>& last_located_edge()
   return edge;
 }
 
+/**
+* Locks the minimum zone an operation on the edge (`v0`, `v1`) writes, and
+* records the edge it located in `last_located_edge()`.
+*
+* A flip rewrites the ring cells -- the cells around the edge -- and re-stitches
+* the cells across the ring's outer facets; a split writes the same ring, plus
+* the destinations it locks separately. Both are a strict subset of the two
+* endpoint stars, so taking the ring is enough where taking both stars is the
+* obvious but larger choice.
+*
+* ONE VERTEX PER CELL, not four. Both endpoints are already held, and a ring
+* cell shares three of its four vertices with the ring cell before it --
+* consecutive cells of the circulator are neighbours -- so only the fourth can
+* still be unheld. A cell across an outer facet shares that facet's three
+* vertices with the ring cell, which is held in full by the time it is reached,
+* so the same is true of it. The first ring cell has no predecessor and is
+* locked in full.
+*
+* Returns false, leaving partial locks for the caller to release, if any lock
+* is refused. A pair that is no longer an edge also returns true, with nothing
+* recorded, and the operation declines it later.
+*
+* PRECONDITION: `v0` and `v1` are already held by this thread.
+*/
+template<typename Tr>
+bool try_lock_edge_ring_zone(const Tr& tr,
+                             typename Tr::Vertex_handle v0,
+                             typename Tr::Vertex_handle v1)
+{
+  using Vertex_handle   = typename Tr::Vertex_handle;
+  using Cell_handle     = typename Tr::Cell_handle;
+  using Edge            = typename Tr::Edge;
+  using Cell_circulator = typename Tr::Cell_circulator;
+
+  Cell_handle edge_cell;
+  if (!tr.find_first_incident_cell_threadsafe(v0,
+        [v1](const Cell_handle c) { return c->has_vertex(v1); }, edge_cell))
+    return true; // no longer an edge
+
+  const int i0 = edge_cell->index(v0);
+  const int i1 = edge_cell->index(v1);
+  const Edge edge(edge_cell, i0, i1);
+
+  Cell_circulator circ = tr.incident_cells(edge);
+  const Cell_circulator done = circ;
+  Cell_handle previous_ring_cell;
+  do
+  {
+    const Cell_handle c = circ;
+    if (previous_ring_cell == Cell_handle())
+    {
+      if (!tr.try_lock_cell(c))
+        return false;
+    }
+    else if (!tr.try_lock_vertex(c->vertex(c->index(previous_ring_cell))))
+      return false;
+
+    // The two cells across the ring cell's outer facets. Each shares that
+    // facet's three vertices with the ring cell, so the only vertex of it not
+    // already held is the one opposite the shared facet, which is what
+    // index(c) names.
+    const Cell_handle across_first  = c->neighbor(c->index(v0));
+    const Cell_handle across_second = c->neighbor(c->index(v1));
+    if (!tr.try_lock_vertex(across_first->vertex(across_first->index(c)))
+     || !tr.try_lock_vertex(across_second->vertex(across_second->index(c))))
+      return false;
+
+    previous_ring_cell = c;
+  }
+  while (++circ != done);
+
+  last_located_edge<Vertex_handle, Cell_handle>().set(v0, v1, edge_cell, i0, i1);
+  return true;
+}
+
 // `nb_incident_subdomains(v, c3t3) > 1`, without counting the whole star. The
 // traversal is the one `TDS_3::incident_cells_3()` performs - from v's cell,
 // across the facets that contain v, marking cells as it goes - so it sees the

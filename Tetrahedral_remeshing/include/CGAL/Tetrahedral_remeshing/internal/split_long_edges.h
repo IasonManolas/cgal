@@ -604,7 +604,6 @@ public:
   */
   bool lock_zone(const Element_type& element, const C3t3& c3t3) const
   {
-    using Cell_circulator = typename Tr::Cell_circulator;
     const Tr& tr = c3t3.triangulation();
 
     last_located_edge<Vertex_handle, Cell_handle>().clear();
@@ -615,52 +614,7 @@ public:
     if (!lock_split_destinations(element, tr))
       return false;
 
-    Cell_handle edge_cell;
-    const Vertex_handle other = element.second;
-    if (!tr.find_first_incident_cell_threadsafe(element.first,
-          [other](const Cell_handle c) { return c->has_vertex(other); },
-          edge_cell))
-      return true; // no longer an edge; execute_operation() will decline it
-
-    const int i0 = edge_cell->index(element.first);
-    const int i1 = edge_cell->index(element.second);
-    const Edge edge(edge_cell, i0, i1);
-
-    // One vertex per cell, not four. Both endpoints are already held, and a
-    // ring cell shares three of its four vertices with the ring cell before
-    // it -- consecutive cells of the circulator are neighbours -- so only the
-    // fourth can still be unheld. A cell across an outer facet shares that
-    // facet's three vertices with the ring cell, which is held in full by the
-    // time it is reached, so the same is true of it. The first ring cell has
-    // no predecessor and is locked in full.
-    Cell_circulator circ = tr.incident_cells(edge);
-    const Cell_circulator done = circ;
-    Cell_handle previous_ring_cell;
-    do
-    {
-      const Cell_handle c = circ;
-      if (previous_ring_cell == Cell_handle())
-      {
-        if (!tr.try_lock_cell(c))
-          return false;
-      }
-      else if (!tr.try_lock_vertex(c->vertex(c->index(previous_ring_cell))))
-        return false;
-
-      // the two cells across the ring cell's outer facets
-      const Cell_handle m0 = c->neighbor(c->index(element.first));
-      const Cell_handle m1 = c->neighbor(c->index(element.second));
-      if (!tr.try_lock_vertex(m0->vertex(m0->index(c)))
-       || !tr.try_lock_vertex(m1->vertex(m1->index(c))))
-        return false;
-
-      previous_ring_cell = c;
-    }
-    while (++circ != done);
-
-    last_located_edge<Vertex_handle, Cell_handle>()
-      .set(element.first, element.second, edge_cell, i0, i1);
-    return true;
+    return try_lock_edge_ring_zone(tr, element.first, element.second);
   }
 
   // longest edge first is the point of the ordering built in get_elements()
