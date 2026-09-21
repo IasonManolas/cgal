@@ -1443,28 +1443,38 @@ std::size_t flip_all_edges(const std::vector<VertexPair>& edges,
 * fills it one vertex per thread.
 */
 template<typename C3T3>
+using Vertex_subdomains_t
+  = boost::container::small_vector<typename C3T3::Subdomain_index, 4>;
+
+// boost::unordered_map, not std::unordered_map: the concurrent alternative
+// below needs an explicit hash for Vertex_handle, and boost::hash is the one
+// CGAL's handles provide through hash_value().
+template<typename C3T3>
+using Sequential_vertex_subdomains_map_t
+  = boost::unordered_map<typename C3T3::Vertex_handle, Vertex_subdomains_t<C3T3> >;
+
+template<typename C3T3>
 using Vertex_subdomains_map_t = Concurrency_selected_container_t<
   typename C3T3::Triangulation::Concurrency_tag,
-  boost::unordered_map<typename C3T3::Vertex_handle,
-                       boost::container::small_vector<typename C3T3::Subdomain_index, 4> >,
+  Sequential_vertex_subdomains_map_t<C3T3>,
 #ifdef CGAL_LINKED_WITH_TBB
   tbb::concurrent_unordered_map<typename C3T3::Vertex_handle,
-                                boost::container::small_vector<typename C3T3::Subdomain_index, 4>,
+                                Vertex_subdomains_t<C3T3>,
                                 boost::hash<typename C3T3::Vertex_handle> >
 #else
-  boost::unordered_map<typename C3T3::Vertex_handle,
-                       boost::container::small_vector<typename C3T3::Subdomain_index, 4> >
+  Sequential_vertex_subdomains_map_t<C3T3>
 #endif
   >;
 
-// Records `si` for `v` if it is not there already.
-template<typename Subdomains, typename Subdomain_index>
-void record_subdomain(Subdomains& subdomains, const Subdomain_index& si)
+// Appends `value` unless the container already holds it. Linear, for the very
+// short sequences a vertex's subdomain set is.
+template<typename Container, typename Value>
+void push_back_unique(Container& container, const Value& value)
 {
-  for (const Subdomain_index& s : subdomains)
-    if (s == si)
+  for (const Value& present : container)
+    if (present == value)
       return;
-  subdomains.push_back(si);
+  container.push_back(value);
 }
 
 template<typename C3t3>
@@ -1477,7 +1487,7 @@ void collect_subdomains_on_boundary(const C3t3& c3t3,
     {
       const int dim = v->in_dimension();
       if(dim >= 0 && dim < 3)
-        record_subdomain(vertices_subdomain_indices[v], c->subdomain_index());
+        push_back_unique(vertices_subdomain_indices[v], c->subdomain_index());
     }
   }
 }
@@ -1505,7 +1515,6 @@ void collect_boundary_edges_and_subdomains_parallel(
   const typename C3T3::Triangulation& tr = c3t3.triangulation();
 
   using Cell_handle = typename C3T3::Cell_handle;
-  using Vertex_handle = typename C3T3::Vertex_handle;
   using Subdomain_index = typename C3T3::Subdomain_index;
 
   const std::vector<Cell_handle> cells = gather_all_cells(tr);
@@ -1514,19 +1523,15 @@ void collect_boundary_edges_and_subdomains_parallel(
   // the result is a SET per vertex, so it does not depend on the order the
   // cells were visited in, and only its size is ever read.
   //
-  // Building it BY VERTEX instead -- one owner per vertex, no merge at all --
-  // was tried and is slower: it trades this cell scan for a star walk per
-  // boundary vertex, and the pointer chasing costs more than the merge it
-  // removes (-1.116% instructions but +2.82% wall on 1146193_cdt_0.5). See
-  // `rejected/bsubmap_pervertex`.
-  using Vertex_subdomains_map
-    = boost::unordered_map<Vertex_handle,
-                           boost::container::small_vector<Subdomain_index, 4> >;
-  tbb::enumerable_thread_specific<Vertex_subdomains_map> tl_vsi;
+  // Building it by vertex instead -- one owner per vertex, no merge at all --
+  // trades this cell scan for a star walk per boundary vertex, and the pointer
+  // chasing costs more than the merge it removes.
+  using Vertex_subdomains_map = Sequential_vertex_subdomains_map_t<C3T3>;
+  tbb::enumerable_thread_specific<Vertex_subdomains_map> per_thread_subdomains;
   tbb::parallel_for(tbb::blocked_range<std::size_t>(0, cells.size()),
     [&](const tbb::blocked_range<std::size_t>& range)
     {
-      Vertex_subdomains_map& local = tl_vsi.local();
+      Vertex_subdomains_map& local = per_thread_subdomains.local();
       for (std::size_t ci = range.begin(); ci != range.end(); ++ci)
       {
         const Cell_handle c = cells[ci];
@@ -1534,17 +1539,17 @@ void collect_boundary_edges_and_subdomains_parallel(
         {
           const int dim = v->in_dimension();
           if (dim >= 0 && dim < 3)
-            record_subdomain(local[v], c->subdomain_index());
+            push_back_unique(local[v], c->subdomain_index());
         }
       }
     });
 
-  for (const Vertex_subdomains_map& local : tl_vsi)
-    for (const auto& vsi : local)
+  for (const Vertex_subdomains_map& local : per_thread_subdomains)
+    for (const auto& [vertex, subdomains] : local)
     {
-      auto& s = vertices_subdomain_indices[vsi.first];
-      for (const Subdomain_index& si : vsi.second)
-        record_subdomain(s, si);
+      auto& merged = vertices_subdomain_indices[vertex];
+      for (const Subdomain_index& si : subdomains)
+        push_back_unique(merged, si);
     }
 
   // Same per-edge test and the same edge set as the serial walk; the scan
