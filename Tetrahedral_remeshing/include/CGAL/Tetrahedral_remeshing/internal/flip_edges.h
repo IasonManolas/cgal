@@ -719,65 +719,36 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
   if (nb_cells_around_edge < 4)
     return;
 
-  //Each opposite vertex is judged on its angles FIRST, and only an opposite vertex that would be
-  //kept is then asked whether a chord disqualifies it.
+  // An opposite vertex is judged on its angles first, and only one that would
+  // be kept is then asked whether a chord disqualifies it. The angle fold is
+  // by far the more selective of the two and abandons most candidates on their
+  // first ring facet, so asking it first keeps the chord test off the majority.
   //
-  //The two tests used to run the other way round: every opposite vertex's star was
-  //gathered, every non-ring-adjacent pair of opposite vertices was asked whether it is
-  //joined by an edge -- a walk of one opposite vertex's whole star per pair -- and the
-  //survivors were then folded over the ring. The two refusal rates are two
-  //orders of magnitude apart. On `1146193_cdt_0.5` at four threads the chord
-  //test settles 3.8% of the 23.8 million pairs it is asked about, while the
-  //angle fold keeps 449 thousand of 17.8 million opposite vertices, 2.5% -- and the fold
-  //abandons an opposite vertex on its first ring facet most of the time, because its
-  //three exits (an inverted cell, a worst angle of one, an angle no better
-  //than the edge already has) are the common case.
+  // The order is free to change because the queue does not depend on it: an
+  // opposite vertex is pushed if and only if it is finite, unchorded and
+  // improves the edge's worst angle, three conditions independent of the order
+  // they are asked in, and the ring is still walked in ascending position. The
+  // chord relation is symmetric and is_edge_uv() reads a complete star, so
+  // asking from either end gives the same answer.
   //
-  //Asking in the cheap order leaves the queue exactly as it was. An opposite vertex is
-  //pushed if and only if it is finite, unchorded and improves the edge's worst
-  //angle; those three conditions are independent of the order they are asked
-  //in, and the opposite vertices are still visited in ascending ring position, so the
-  //pushes keep their order too. The chord relation is symmetric and
-  //`is_edge_uv` reads a complete star, so asking from the surviving opposite vertex gives
-  //the same answer the old loop got asking from whichever end it had not yet
-  //disqualified.
-  //
-  //What it costs: the fold now also runs on the opposite vertices a chord would have
-  //removed, 9% more folds. What it saves: the pairs asked about fall from
-  //every non-adjacent pair on the ring to at most (ring size - 3) per
-  //surviving opposite vertex -- on `1146193_cdt_0.5`, 23.8 million star scans to about
-  //1.0 million.
-  //
-  //Facets that will be used to create new cells
-  //    i.e. all the facets opposite to vh1 and don't have vh
-  //Facets that will be used to update cells
-  //    i.e. all the facets opposite to vh0 will be set to vh:
-  //    facet.first->set_vertex( facet.second, vh )
-  //
-  // The facets an opposite vertex is judged on are produced and judged in ONE pass.
-  //
-  // They used to be collected into a `small_vector<Facet, 60>` by a full turn
-  // of the ring, and only then evaluated -- and the evaluation abandons the
-  // opposite vertex on its FIRST facet most of the time. Every facet the turn collected
-  // past that point was collected for nothing.
-  //
-  // Same facets, in the same order -- the ring is circulated from the same
-  // cell for every opposite vertex, and a cell still yields the facet opposite `vh1`
-  // before the one opposite `vh0` -- and the same three exits, so `keep` and
-  // `max_flip_cos_dh` are what they were. `max_flip_cos_dh` is a max over the
-  // facets, and it is only READ when no exit was taken, i.e. when the fold ran
-  // over the whole ring either way.
-  for (int p = 0; p < n_opposite_vertices; ++p)
+  // The facets are produced and judged in one pass, rather than collected by a
+  // full turn of the ring and evaluated afterwards, since the fold usually
+  // exits on the first one. A cell yields the facet opposite vh1 before the one
+  // opposite vh0: the first kind is used to create new cells, the second to
+  // update existing ones via facet.first->set_vertex(facet.second, vh).
+  // max_flip_cos_dh is a max over the facets and is read only when no exit was
+  // taken, i.e. when the fold ran over the whole ring.
+  for (int ring_index = 0; ring_index < n_opposite_vertices; ++ring_index)
   {
     if constexpr (preserve_enumeration_order)
     {
-      if (opposite_star[p] == nullptr)
+      if (opposite_star[ring_index] == nullptr)
         continue;
     }
-    else if (!finite_opposite[p])
+    else if (!finite_opposite[ring_index])
       continue;
 
-    const Vertex_handle vh = ring_opposite_vertices[p];
+    const Vertex_handle opposite_vertex = ring_opposite_vertices[ring_index];
 
     bool keep = true;
     Dihedral_angle_cosine max_flip_cos_dh(CGAL::NEGATIVE, 1., 1.);
@@ -786,27 +757,27 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
     Cell_circulator done = cell_circulator;
     do
     {
-      //Cells that do not have vh are the ones the flip rewrites
-      if (!cell_circulator->has_vertex(vh))
+      //Cells that do not have opposite_vertex are the ones the flip rewrites
+      if (!cell_circulator->has_vertex(opposite_vertex))
       {
         //Facets opposite to vh1, then opposite to vh0
         const Facet ring_facets[2]
           = { Facet(cell_circulator, cell_circulator->index(vh1)),
               Facet(cell_circulator, cell_circulator->index(vh0)) };
 
-        for (const Facet& fi : ring_facets)
+        for (const Facet& facet : ring_facets)
         {
-          if (tr.is_infinite(fi.first))
+          if (tr.is_infinite(facet.first))
             continue;
 
-          if (is_well_oriented(tr, vh, fi.first->vertex(indices(fi.second, 0)),
-                               fi.first->vertex(indices(fi.second, 1)),
-                               fi.first->vertex(indices(fi.second, 2))))
+          if (is_well_oriented(tr, opposite_vertex, facet.first->vertex(indices(facet.second, 0)),
+                               facet.first->vertex(indices(facet.second, 1)),
+                               facet.first->vertex(indices(facet.second, 2))))
           {
             max_flip_cos_dh = (std::max)(max_flip_cos_dh,
-              max_cos_dihedral_angle(tr, vh, fi.first->vertex(indices(fi.second, 0)),
-                                             fi.first->vertex(indices(fi.second, 1)),
-                                             fi.first->vertex(indices(fi.second, 2))));
+              max_cos_dihedral_angle(tr, opposite_vertex, facet.first->vertex(indices(facet.second, 0)),
+                                             facet.first->vertex(indices(facet.second, 1)),
+                                             facet.first->vertex(indices(facet.second, 2))));
           }
           else
           {
@@ -845,32 +816,32 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
     //own star gives the same answer the old loop got asking from whichever end
     //it had not yet disqualified: 128 154 pairs were asked from both ends under
     //`CGAL_TR_CHORDSYM` and the two ends never disagreed.
-    if (opposite_star[p] == nullptr)
+    if (opposite_star[ring_index] == nullptr)
     {
-      Star& o_inc_vh = inc_cells[vh];
+      Star& o_inc_vh = inc_cells[opposite_vertex];
       if (o_inc_vh.empty())
-        incident_cells_tagged(tr, vh, std::back_inserter(o_inc_vh));
+        incident_cells_tagged(tr, opposite_vertex, std::back_inserter(o_inc_vh));
 
-      opposite_star[p] = &o_inc_vh;
+      opposite_star[ring_index] = &o_inc_vh;
     }
-    const Star& o_inc_vh = *opposite_star[p];
+    const Star& o_inc_vh = *opposite_star[ring_index];
 
     bool chorded = false;
     for (int j = 0; j < n_opposite_vertices && !chorded; ++j)
     {
-      if (j == p || j == p - 1 || j == p + 1)
+      if (j == ring_index || j == ring_index - 1 || j == ring_index + 1)
         continue;
-      if ((p == 0 && j == n_opposite_vertices - 1) || (p == n_opposite_vertices - 1 && j == 0))
+      if ((ring_index == 0 && j == n_opposite_vertices - 1) || (ring_index == n_opposite_vertices - 1 && j == 0))
         continue;
 
-      if (is_edge_uv(vh, ring_opposite_vertices[j], o_inc_vh))
+      if (is_edge_uv(opposite_vertex, ring_opposite_vertices[j], o_inc_vh))
         chorded = true;
     }
 
     if (!chorded)
     {
-      //std::cout << "vh " << vh->info() <<" old " << curr_max_cosdh << " min " << min_flip_tan_dh << std::endl;
-      candidates.push(std::make_pair(max_flip_cos_dh, std::make_pair(vh, e_id)));
+      //std::cout << "opposite_vertex " << opposite_vertex->info() <<" old " << curr_max_cosdh << " min " << min_flip_tan_dh << std::endl;
+      candidates.push(std::make_pair(max_flip_cos_dh, std::make_pair(opposite_vertex, e_id)));
     }
   }
 }
