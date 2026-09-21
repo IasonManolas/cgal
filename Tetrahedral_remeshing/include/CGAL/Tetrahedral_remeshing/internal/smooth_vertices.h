@@ -1257,6 +1257,48 @@ protected:
 
 #ifdef CGAL_LINKED_WITH_TBB
   /**
+  * The Laplacian pull `e` contributes to each of its movable endpoints. Shared
+  * by the serial accumulation and the parallel-filter one, which differ only
+  * in how they decide whether an edge is kept.
+  */
+  template <typename Moves, typename MovesVertex>
+  void accumulate_one_edge_move(const Edge& e,
+                                const C3t3& c3t3,
+                                const bool boundary_edge,
+                                Moves& moves,
+                                MovesVertex moves_vertex) const
+  {
+    const Vertex_handle vh0 = e.first->vertex(e.second);
+    const Vertex_handle vh1 = e.first->vertex(e.third);
+
+    const std::size_t i0 = m_context->vertex_id(vh0);
+    const std::size_t i1 = m_context->vertex_id(vh1);
+
+    const bool vh0_moving = moves_vertex(vh0, i0);
+    const bool vh1_moving = moves_vertex(vh1, i1);
+
+    if (!vh0_moving && !vh1_moving)
+      return;
+
+    const Point_3& p0 = point(vh0->point());
+    const Point_3& p1 = point(vh1->point());
+    const FT density = density_along_segment(e, c3t3, boundary_edge);
+
+    if (vh0_moving)
+    {
+      moves[i0].move += density * Vector_3(p0, p1);
+      moves[i0].mass += density;
+      ++moves[i0].neighbors;
+    }
+    if (vh1_moving)
+    {
+      moves[i1].move += density * Vector_3(p1, p0);
+      moves[i1].mass += density;
+      ++moves[i1].neighbors;
+    }
+  }
+
+  /**
   * The parallel form of `accumulate_edge_moves()` below: the same pass, with
   * `keep_edge` answered on every thread and the accumulation left serial.
   *
@@ -1307,34 +1349,7 @@ protected:
       if (!kept[edge_index++])
         continue;
 
-      const Vertex_handle vh0 = e.first->vertex(e.second);
-      const Vertex_handle vh1 = e.first->vertex(e.third);
-
-      const std::size_t i0 = m_context->vertex_id(vh0);
-      const std::size_t i1 = m_context->vertex_id(vh1);
-
-      const bool vh0_moving = moves_vertex(vh0, i0);
-      const bool vh1_moving = moves_vertex(vh1, i1);
-
-      if (!vh0_moving && !vh1_moving)
-        continue;
-
-      const Point_3& p0 = point(vh0->point());
-      const Point_3& p1 = point(vh1->point());
-      const FT density = density_along_segment(e, c3t3, boundary_edge);
-
-      if (vh0_moving)
-      {
-        moves[i0].move += density * Vector_3(p0, p1);
-        moves[i0].mass += density;
-        ++moves[i0].neighbors;
-      }
-      if (vh1_moving)
-      {
-        moves[i1].move += density * Vector_3(p1, p0);
-        moves[i1].mass += density;
-        ++moves[i1].neighbors;
-      }
+      accumulate_one_edge_move(e, c3t3, boundary_edge, moves, moves_vertex);
     }
   }
 #endif // CGAL_LINKED_WITH_TBB
@@ -1378,34 +1393,7 @@ protected:
       if (!keep_edge(e, edge_index++))
         continue;
 
-      const Vertex_handle vh0 = e.first->vertex(e.second);
-      const Vertex_handle vh1 = e.first->vertex(e.third);
-
-      const std::size_t i0 = m_context->vertex_id(vh0);
-      const std::size_t i1 = m_context->vertex_id(vh1);
-
-      const bool vh0_moving = moves_vertex(vh0, i0);
-      const bool vh1_moving = moves_vertex(vh1, i1);
-
-      if (!vh0_moving && !vh1_moving)
-        continue;
-
-      const Point_3& p0 = point(vh0->point());
-      const Point_3& p1 = point(vh1->point());
-      const FT density = density_along_segment(e, c3t3, boundary_edge);
-
-      if (vh0_moving)
-      {
-        moves[i0].move += density * Vector_3(p0, p1);
-        moves[i0].mass += density;
-        ++moves[i0].neighbors;
-      }
-      if (vh1_moving)
-      {
-        moves[i1].move += density * Vector_3(p1, p0);
-        moves[i1].mass += density;
-        ++moves[i1].neighbors;
-      }
+      accumulate_one_edge_move(e, c3t3, boundary_edge, moves, moves_vertex);
     }
   }
 
