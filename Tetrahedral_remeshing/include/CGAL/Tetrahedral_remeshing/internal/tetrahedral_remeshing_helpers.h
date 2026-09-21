@@ -2466,16 +2466,16 @@ std::vector<T> parallel_collect_from_finite_facets(
 //
 // It is TWO things that are traded away, not one. Besides the identical
 // output, the spatial sort below costs peak memory -- it holds a second copy
-// of the TDS while it rebuilds -- and buys wall time with it: measured at
-// -11.5% wall for +4.3% median peak memory over 24 configs, worst case +16.4%
-// memory on a config that ran 20.6% faster. A caller whose limit is RAM rather
-// than time should leave this macro undefined for that reason alone, and a
-// caller who defines it should know it is not free in memory.
+// of the TDS while it rebuilds -- and buys wall time with it, of the order of
+// ten percent off the wall time for a few percent of peak memory. A caller
+// whose limit is RAM rather than time should leave this macro undefined for
+// that reason alone, and a caller who defines it should know it is not free in
+// memory.
 //
 // Under Parallel_tag they are ALWAYS on and the macro is ignored, because
 // there is no output to preserve: which thread takes which element decides the
 // order, and two runs of one binary on one input already produce different
-// meshes (the measured within-arm cell-count spread is ~0.9%). Honouring the
+// meshes. Honouring the
 // macro there would pay the optimization's whole cost for a guarantee that
 // cannot hold.
 //
@@ -2496,16 +2496,10 @@ std::vector<T> parallel_collect_from_finite_facets(
 // which is what `copy_tds` does except for the iteration order. It is O(n).
 //
 // IT BUYS WALL TIME WITH MEMORY, and the trade is not small in either
-// direction. Measured over 24 configs at 4 threads (setup sort plus a re-sort
-// every 2nd split pass, against the same branch without either):
-//
-//     wall time                 -11.5%, faster on 24 of 24 configs
-//     wall, time-weighted       -20.2%  (the win grows with mesh size:
-//                                        -27.2% on the largest config)
-//     instructions               +0.9%  (it does MORE work and still wins --
-//                                        the saving is cache misses, not work)
-//     peak memory, gated metric  +4.3% median, +16.4% worst
-//     peak RSS                   +4% to +27%, up on every config
+// direction. It is faster on every mesh of the benchmark and the win grows
+// with mesh size, while peak memory rises on every one of them. It executes
+// slightly MORE instructions than the unsorted build and still wins, so what
+// it saves is cache misses rather than work.
 //
 // The memory is spent in the rebuild below: the new containers are filled from
 // the old ones, so BOTH triangulations are live at once and peak memory
@@ -2513,14 +2507,14 @@ std::vector<T> parallel_collect_from_finite_facets(
 // irreducible for a rebuild-based sort -- the wiring loop reads all four
 // vertex and all four neighbour pointers of every old cell, so the old
 // containers cannot be released early. The auxiliary arrays around it are
-// freed the moment they die (see below), which was measured at 2.8 MB of a
-// 30.3 MB excess, i.e. 9% of it: the rest is the second TDS.
+// freed the moment they die (see below), but they are a small part of the
+// excess: the rest is the second TDS.
 //
 // Where the cost lands is exactly where the win lands. The meshes that gain
 // most are the ones the run REFINES, and they are also the ones that carry the
-// largest transient, because the rebuild then happens on the biggest mesh --
-// e.g. 409635_cdt_0.5 is -20.6% wall and +16.4% memory, while the coarsening
-// configs are within a few percent on both. A caller who is memory-bound
+// largest transient, because the rebuild then happens on the biggest mesh,
+// while the coarsening cases are within a few percent on both. A caller who is
+// memory-bound
 // rather than time-bound wants this off; see
 // CGAL_TETRAHEDRAL_REMESHING_ALLOW_REORDERING, which is how they turn it off
 // under Sequential_tag.
@@ -2561,9 +2555,8 @@ inline std::uint32_t morton_quantize(double v, double lo, double inv_span)
 * (`Mesh_complex_3_in_triangulation_3.h`), so walking it enumerates EVERY
 * finite edge of the triangulation and tests each one -- O(edges in the
 * triangulation), however small the 1D complex is. The c3t3 already stores the
-* complex edges; this reads that storage and is O(edges in the complex).
-* Measured on 1146193_cdt_0.5 at 4 threads, one such walk cost 0.22 s, and the
-* spatial sort alone did six of them.
+* complex edges; this reads that storage and is O(edges in the complex). The
+* spatial sort alone did six such walks per run.
 *
 * THE ORDER IS THE STORAGE'S, not the triangulation's: under `Parallel_tag`
 * that is a hash map's order. Use this only where the order does not matter --
@@ -2813,10 +2806,9 @@ bool spatial_sort_c3t3(C3t3& c3t3,
 
   // Read the complex's own storage, NOT `c3t3.edges_in_complex()`: that range
   // is a filter over `finite_edges()`, so snapshotting the 1D complex through
-  // it walks every finite edge of the mesh and tests each one. Measured on
-  // 1146193_cdt_0.5 at 4 threads, it was 1.317 s of the 1.854 s this whole
-  // routine costs across a run -- 71% of it, and four times the Morton rebuild
-  // below. The snapshot only has to round-trip through `remove_from_complex` /
+  // it walks every finite edge of the mesh and tests each one, which dominated
+  // this routine's cost and outweighed the Morton rebuild below several times
+  // over. The snapshot only has to round-trip through `remove_from_complex` /
   // `add_to_complex`, which are keyed lookups, so the order it comes back in
   // does not matter.
   std::vector<std::tuple<Vertex_handle, Vertex_handle, Curve_index>> edges;

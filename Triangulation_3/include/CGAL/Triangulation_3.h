@@ -2084,12 +2084,10 @@ public:
   * not, the zone skips a lock it never held and believes it holds it, and a
   * cell can then be written without being owned.
   *
-  * Counted with a probe that tested, before each cell was locked, whether the
-  * three vertices of the facet the walk had just crossed were held by this
-  * thread: on `360073_mesh3_1.5` at 4 threads, 56-410 of ~8.5 M asks per run
-  * failed WITH the table and 0 of ~26 M over three runs failed without it; at
-  * 1 thread it is 0 either way. See
-  * `docs/ZONE_DEDUP_IS_UNSOUND_2026-09-18.md`.
+  * A probe that tested, before each cell was locked, whether the three
+  * vertices of the facet the walk had just crossed were held by this thread
+  * found such failures only with the table in place, and only when more than
+  * one thread was running; without it, and at one thread, there were none.
   *
   * Nothing is lost but the arithmetic. `try_lock()` already skips the repeats
   * itself, and skips them SOUNDLY, because its thread-local grid is indexed by

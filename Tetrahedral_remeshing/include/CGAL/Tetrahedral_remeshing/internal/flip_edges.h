@@ -96,10 +96,10 @@ void update_c3t3_facets(C3t3& c3t3,
 * Keep a cached star up to date instead of throwing it away.
 *
 * A flip changes the star of about eighteen vertices, and dropping each one
-* meant walking all ~29 of its cells again the next time it was asked for:
-* 94.4% of this pass's star fills are refills, 68 million cell visits on
-* `1146193_cdt_0.5`. The flip knows exactly which one or two cells each
-* affected vertex gained or lost, so it can say so.
+* meant walking all ~29 of its cells again the next time it was asked for, and
+* nearly all of this pass's star fills were such refills. The flip knows
+* exactly which one or two cells each affected vertex gained or lost, so it can
+* say so.
 *
 * An EMPTY entry means "not cached" and must stay empty -- a partial star
 * would be read as a complete one. So both helpers do nothing to a vertex
@@ -1542,10 +1542,10 @@ void collect_boundary_edges_and_subdomains_parallel(
 *
 * The cost of the serial loop below is the facet circulator and the
 * `is_in_complex()` test it runs per incident facet; the map increments
-* themselves are two hash lookups per qualifying facet. `bflip_valence_parallel`
-* (rejected 2026-09-16) reduced per-thread maps and paid for the merge with
-* instructions the serial loop never spends -- +0.7 to +2.4% on the small
-* configs. Here the parallel pass only walks the circulators, writing the
+* themselves are two hash lookups per qualifying facet. Reducing per-thread
+* maps instead was tried and pays for the merge with instructions the serial
+* loop never spends, which costs more than it saves on the small meshes. Here
+* the parallel pass only walks the circulators, writing the
 * patches it would have counted into a slot it owns, and the map is then filled
 * by a serial pass that does exactly the increments the serial loop does, in
 * the same order. Nothing is merged, and nothing is allocated per thread.
@@ -2320,9 +2320,8 @@ bool flip_surface_edge(C3t3& c3t3,
     // already share an edge second. Both are pure, so which runs first
     // cannot change which edges flip -- but the criterion is four lookups
     // and a dozen integer operations, while the question walks vh2's star.
-    // Counted on 1146193_cdt_0.5 at four threads: of 1 388 466 candidates
-    // offered, the criterion refuses 1 241 243 -- 89.4% -- and the walk
-    // refuses 51 343. The walk now runs on the tenth that survive the
+    // The criterion refuses the large majority of the candidates offered, so
+    // the walk now runs only on the small fraction that survive the
     // arithmetic.
     {
       const Surface_patch_index surfi = c3t3.surface_patch_index(boundary_facets[0]);

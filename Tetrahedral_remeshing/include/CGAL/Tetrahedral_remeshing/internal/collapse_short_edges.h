@@ -1720,12 +1720,10 @@ public:
     // thread would compute.
     tbb::enumerable_thread_specific<Vertex_patch_cache<C3t3> > patch_caches;
 
-    // The per-edge test below is the serial walk's, written out again
-    // rather than shared with it. Routing the serial loop through a common
-    // predicate changed its codegen -- byte-identical output, +0.04% to
-    // +0.055% sequential instructions over four configs -- and this is a
-    // parallel-scope change: the Sequential_tag binary has to rebuild
-    // byte-identical, which it does. The two copies are the two arms of
+    // The per-edge test below is the serial walk's, written out again rather
+    // than shared with it: routing the serial loop through a common predicate
+    // left its output byte-identical but moved its codegen, which a
+    // parallel-scope change must not do. The two copies are the two arms of
     // one if/else and must be kept in step.
     auto collected
       = parallel_collect_from_finite_edges<Short_edge_with_length>(tr,
@@ -1832,9 +1830,9 @@ public:
     // `collapse_edge()` declines.
     //
     // The same verdict is reached here from the two dimensions and one
-    // complex-edge lookup, before the two stars are walked to lock them --
-    // 41.6% of the candidates offered on 1146193_cdt_0.5, every one of them
-    // refused. Both endpoints are held, so their dimensions are safe to
+    // complex-edge lookup, before the two stars are walked to lock them, and
+    // it refuses a large fraction of the candidates offered. Both endpoints
+    // are held, so their dimensions are safe to
     // read; the complex-edge lookup is the same one `topology_test()`
     // already makes from inside this zone.
     if (c3t3.in_dimension(e.first) < 2
@@ -2171,10 +2169,9 @@ public:
   // re-queues into a live work list and the phase ends when that list is
   // empty. This is the same convergence, reached in steps.
   //
-  // The cap is a backstop, not the expected exit. `collapse2x` -- one extra
-  // round, delivered by re-collecting the WHOLE mesh -- cost 11.79% of wall
-  // on the big inputs because it paid for the mesh's size rather than for
-  // the work it found (`rejected/collapse2x/REJECTED.md`).
+  // The cap is a backstop, not the expected exit. Buying one extra round by
+  // re-collecting the WHOLE mesh was tried and is expensive on the big inputs,
+  // because it pays for the mesh's size rather than for the work it finds.
   static constexpr std::size_t max_rounds = 8;
 
   bool execute(Operation& op, C3t3& c3t3) const

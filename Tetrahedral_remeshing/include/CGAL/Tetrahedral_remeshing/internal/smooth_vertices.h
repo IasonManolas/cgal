@@ -170,8 +170,8 @@ public:
   std::vector<std::vector<Surface_patch_index>> m_vertices_surface_indices_by_id;
 
   // The vertices `compute_vertices_normals()` actually wrote, in the order it
-  // first touched them. Only surface vertices carry a normal -- 102 k of the
-  // 774 k facets of `1146193_cdt_0.5` are boundary facets -- so emptying and
+  // first touched them. Only surface vertices carry a normal, and boundary
+  // facets are a small fraction of a volume mesh's facets, so emptying and
   // normalizing through this list keeps both passes proportional to the
   // SURFACE, where walking `m_vertices_normals` end to end would make them
   // proportional to the whole mesh, once per `refresh()`.
@@ -487,9 +487,8 @@ private:
     // number of finite edges, and an O(1) one -- both are container sizes.
     // Euler on the triangulated 3-sphere the TDS holds (the infinite vertex
     // included) gives V - E + F - C = 0 with F = 2C, hence E = V + C; the
-    // finite edges are that less the edges to the infinite vertex. Measured
-    // over 56 smooth phases on four configs the bound held every time, with
-    // 0.3% to 6.9% of slack.
+    // finite edges are that less the edges to the infinite vertex. The bound
+    // held on every smooth phase measured, with a few percent of slack.
     //
     // Reserving matters only for the FIRST smooth phase: `clear()` keeps the
     // capacity, so later phases reuse it and allocate only when the mesh has
@@ -611,9 +610,9 @@ private:
   *
   * Pass 1 collects every boundary facet's area-weighted normal, with the ids
   * and handles of its three vertices, on all threads. The serial form puts
-  * these in an `unordered_map<Facet, Vector_3>` and then walks that map --
-  * 102 k random-access reads on `1146193_cdt_0.5` -- for no reason other than
-  * that it is where the first loop happened to leave them. Here they stay in
+  * these in an `unordered_map<Facet, Vector_3>` and then walks that map, one
+  * random-access read per boundary facet, for no reason other than that it is
+  * where the first loop happened to leave them. Here they stay in
   * the flat vector the collector returns.
   *
   * Passes 2 and 3 group the facets by vertex: a count per vertex, a prefix sum
@@ -1075,11 +1074,9 @@ public:
   *
   * Every smoothing pass used to offer EVERY finite vertex, and each
   * candidate had its whole star locked before `compute_target_position()`
-  * looked at it and, for most of them, declined. Measured on
-  * `1146193_cdt_0.5`: all three passes locked 1 007 886 zones, and the
-  * surface pass wanted 51 111 of them -- it locked a million vertices'
-  * stars to move fifty thousand. The spatial locking cost about 1.2
-  * core-seconds in each pass.
+  * looked at it and, for most of them, declined: the surface pass locked
+  * roughly twenty stars for every vertex it went on to move, and the spatial
+  * locking was a large part of each pass's cost.
   *
   * `handles()` is the front of `compute_target_position()`'s own test, and
   * it reads two cached fields -- no lock, no star. Asking it here costs one
@@ -1273,10 +1270,10 @@ protected:
   * original loop, in the original edge order, and reads the answers pass 1
   * stored. Same additions, same order, bit for bit.
   *
-  * The filter is where the time is. On `1146193_cdt_0.5` at 4 threads the
-  * surface operation scans 8.06 M edges to keep 1.41 M, and its loop costs
-  * 0.88 s against the internal operation's 0.44 s over the same edges for 4.5x
-  * as many kept -- the `is_boundary()` circulation, not the accumulation.
+  * The filter is where the time is: the surface operation scans several times
+  * as many edges as it keeps, and costs about twice what the internal
+  * operation costs over the same edges while keeping far more of them. What it
+  * spends the time on is the `is_boundary()` circulation, not the accumulation.
   */
   template <typename EdgeRange, typename KeepEdge, typename MovesVertex>
   void accumulate_edge_moves_parallel_filter(const EdgeRange& edges,
