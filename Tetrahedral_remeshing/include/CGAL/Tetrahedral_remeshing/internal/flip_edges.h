@@ -446,7 +446,7 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
   Facet_circulator curr_fdone = curr_fcirc;
 
   //Only keep the possible flips. The ring around an edge holds a handful of
-  //apices, so this never needs the heap.
+  //opposite vertices, so this never needs the heap.
   boost::container::small_vector<Vertex_handle, 32> opposite_vertices;
   int nb_cells_around_edge = 0;
   do
@@ -631,11 +631,11 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
 
   //Collect the vertex opposite to the edge in each facet around it, in
   //circulation order. The chord test below used to re-circulate the facets
-  //around the edge once per such vertex to enumerate the other apices; those
+  //around the edge once per such vertex to enumerate the other opposite vertices; those
   //are the same vertices collected here, so the tests can be indexed on the
   //ring instead. is_edge_uv is read-only, so stopping at the first chord
   //found yields the same verdict as running the ring to its end.
-  boost::container::small_vector<Vertex_handle, 32> ring_apices;
+  boost::container::small_vector<Vertex_handle, 32> ring_opposite_vertices;
   do
   {
     //Get the id of the opposite vertex
@@ -645,38 +645,38 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
                                     indices(curr_fcirc->second, i));
       if (curr_vertex != vh0 && curr_vertex != vh1)
       {
-        ring_apices.push_back(curr_vertex);
+        ring_opposite_vertices.push_back(curr_vertex);
         break;
       }
     }
   }
   while (++curr_fcirc != curr_fdone);
 
-  const int n_apices = static_cast<int>(ring_apices.size());
+  const int n_opposite_vertices = static_cast<int>(ring_opposite_vertices.size());
 
-  //An infinite apex has no star and is never a candidate, but it keeps its
-  //place on the ring because it can still be the far end of a chord.
+  //An infinite opposite vertex has no star and is never a candidate, but it
+  //keeps its place on the ring because it can still be the far end of a chord.
   //
-  //Whether the star of EVERY finite apex is gathered here, or only the star of
-  //an apex the chord test below actually asks about, is an ORDER decision, not
-  //a caching one. `inc_cells` is a cache the whole flip phase shares: a vertex
-  //whose star is in it has that star maintained incrementally as cells are
-  //created and destroyed, while a vertex whose star is absent has it walked
-  //fresh when someone next needs it. The two hold the same cells in a
-  //DIFFERENT ORDER, and that order is observable -- `execute_operation()`
-  //takes the first cell of the cached star that carries the edge, and that
-  //cell is where the ring circulation starts. So which vertices happen to be
-  //cached selects which flips are performed: skipping the gathers made the
-  //remeshed mesh differ on two of the four sequential gate configurations.
+  //Whether the star of EVERY finite opposite vertex is gathered here, or only
+  //the star of an opposite vertex the chord test below actually asks about, is
+  //an ORDER decision, not a caching one. `inc_cells` is a cache the whole flip
+  //phase shares: a vertex whose star is in it has that star maintained
+  //incrementally as cells are created and destroyed, while a vertex whose star
+  //is absent has it walked fresh when someone next needs it. The two hold the
+  //same cells in a DIFFERENT ORDER, and that order is observable --
+  //`execute_operation()` takes the first cell of the cached star that carries
+  //the edge, and that cell is where the ring circulation starts. So which
+  //vertices happen to be cached selects which flips are performed: skipping the
+  //gathers made the remeshed mesh differ on two of the four sequential gate
+  //configurations.
   //
   //It is therefore guarded exactly as the spatial sort is, and for the same
   //reason -- see CGAL_TETRAHEDRAL_REMESHING_ALLOW_REORDERING in
-  //tetrahedral_remeshing_helpers.h. Under Parallel_tag the enumeration order
-  //is a scheduling artefact and there is no output to preserve, so the
-  //gathers are skipped and only the survivors' stars are walked. Under
-  //Sequential_tag they are kept unless the macro says otherwise, and the
-  //default sequential build emits, element for element, the mesh it emitted
-  //before.
+  //tetrahedral_remeshing_helpers.h. Under Parallel_tag the enumeration order is
+  //a scheduling artefact and there is no output to preserve, so the gathers are
+  //skipped and only the survivors' stars are walked. Under Sequential_tag they
+  //are kept unless the macro says otherwise, and the default sequential build
+  //emits, element for element, the mesh it emitted before.
 #ifdef CGAL_TETRAHEDRAL_REMESHING_ALLOW_REORDERING
   constexpr bool preserve_enumeration_order = false;
 #else
@@ -684,19 +684,20 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
 #endif
 
   using Star = boost::container::small_vector<Cell_handle, 64>;
-  boost::container::small_vector<Star*, 32> apex_star(n_apices, nullptr);
+  boost::container::small_vector<Star*, 32> opposite_star(n_opposite_vertices, nullptr);
 
   // Where the stars are gathered up front, a non-null star IS the record that
-  // the apex is finite, and no second array is needed; where they are not,
-  // one byte per apex carries it. Only one of the two exists in any build.
-  boost::container::small_vector<char, 32> finite_apex;
+  // the opposite vertex is finite, and no second array is needed; where they are
+  // not, one byte per opposite vertex carries it. Only one of the two exists in
+  // any build.
+  boost::container::small_vector<char, 32> finite_opposite;
   if constexpr (!preserve_enumeration_order)
-    finite_apex.resize(n_apices, 0);
+    finite_opposite.resize(n_opposite_vertices, 0);
 
   int nb_cells_around_edge = 0;
-  for (int p = 0; p < n_apices; ++p)
+  for (int p = 0; p < n_opposite_vertices; ++p)
   {
-    const Vertex_handle vh = ring_apices[p];
+    const Vertex_handle vh = ring_opposite_vertices[p];
 
     if(tr.is_infinite(vh))
       continue;
@@ -709,42 +710,42 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
       if (o_inc_vh.empty())
         incident_cells_tagged(tr, vh, std::back_inserter(o_inc_vh));
 
-      apex_star[p] = &o_inc_vh;
+      opposite_star[p] = &o_inc_vh;
     }
     else
-      finite_apex[p] = 1;
+      finite_opposite[p] = 1;
   }
 
   if (nb_cells_around_edge < 4)
     return;
 
-  //Each apex is judged on its angles FIRST, and only an apex that would be
+  //Each opposite vertex is judged on its angles FIRST, and only an opposite vertex that would be
   //kept is then asked whether a chord disqualifies it.
   //
-  //The two tests used to run the other way round: every apex's star was
-  //gathered, every non-ring-adjacent pair of apices was asked whether it is
-  //joined by an edge -- a walk of one apex's whole star per pair -- and the
+  //The two tests used to run the other way round: every opposite vertex's star was
+  //gathered, every non-ring-adjacent pair of opposite vertices was asked whether it is
+  //joined by an edge -- a walk of one opposite vertex's whole star per pair -- and the
   //survivors were then folded over the ring. The two refusal rates are two
   //orders of magnitude apart. On `1146193_cdt_0.5` at four threads the chord
   //test settles 3.8% of the 23.8 million pairs it is asked about, while the
-  //angle fold keeps 449 thousand of 17.8 million apices, 2.5% -- and the fold
-  //abandons an apex on its first ring facet most of the time, because its
+  //angle fold keeps 449 thousand of 17.8 million opposite vertices, 2.5% -- and the fold
+  //abandons an opposite vertex on its first ring facet most of the time, because its
   //three exits (an inverted cell, a worst angle of one, an angle no better
   //than the edge already has) are the common case.
   //
-  //Asking in the cheap order leaves the queue exactly as it was. An apex is
+  //Asking in the cheap order leaves the queue exactly as it was. An opposite vertex is
   //pushed if and only if it is finite, unchorded and improves the edge's worst
   //angle; those three conditions are independent of the order they are asked
-  //in, and the apices are still visited in ascending ring position, so the
+  //in, and the opposite vertices are still visited in ascending ring position, so the
   //pushes keep their order too. The chord relation is symmetric and
-  //`is_edge_uv` reads a complete star, so asking from the surviving apex gives
+  //`is_edge_uv` reads a complete star, so asking from the surviving opposite vertex gives
   //the same answer the old loop got asking from whichever end it had not yet
   //disqualified.
   //
-  //What it costs: the fold now also runs on the apices a chord would have
+  //What it costs: the fold now also runs on the opposite vertices a chord would have
   //removed, 9% more folds. What it saves: the pairs asked about fall from
   //every non-adjacent pair on the ring to at most (ring size - 3) per
-  //surviving apex -- on `1146193_cdt_0.5`, 23.8 million star scans to about
+  //surviving opposite vertex -- on `1146193_cdt_0.5`, 23.8 million star scans to about
   //1.0 million.
   //
   //Facets that will be used to create new cells
@@ -753,30 +754,30 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
   //    i.e. all the facets opposite to vh0 will be set to vh:
   //    facet.first->set_vertex( facet.second, vh )
   //
-  // The facets an apex is judged on are produced and judged in ONE pass.
+  // The facets an opposite vertex is judged on are produced and judged in ONE pass.
   //
   // They used to be collected into a `small_vector<Facet, 60>` by a full turn
   // of the ring, and only then evaluated -- and the evaluation abandons the
-  // apex on its FIRST facet most of the time. Every facet the turn collected
+  // opposite vertex on its FIRST facet most of the time. Every facet the turn collected
   // past that point was collected for nothing.
   //
   // Same facets, in the same order -- the ring is circulated from the same
-  // cell for every apex, and a cell still yields the facet opposite `vh1`
+  // cell for every opposite vertex, and a cell still yields the facet opposite `vh1`
   // before the one opposite `vh0` -- and the same three exits, so `keep` and
   // `max_flip_cos_dh` are what they were. `max_flip_cos_dh` is a max over the
   // facets, and it is only READ when no exit was taken, i.e. when the fold ran
   // over the whole ring either way.
-  for (int p = 0; p < n_apices; ++p)
+  for (int p = 0; p < n_opposite_vertices; ++p)
   {
     if constexpr (preserve_enumeration_order)
     {
-      if (apex_star[p] == nullptr)
+      if (opposite_star[p] == nullptr)
         continue;
     }
-    else if (!finite_apex[p])
+    else if (!finite_opposite[p])
       continue;
 
-    const Vertex_handle vh = ring_apices[p];
+    const Vertex_handle vh = ring_opposite_vertices[p];
 
     bool keep = true;
     Dihedral_angle_cosine max_flip_cos_dh(CGAL::NEGATIVE, 1., 1.);
@@ -838,31 +839,31 @@ void find_best_flip_to_improve_dh(C3t3& c3t3,
     if (!keep || !(max_flip_cos_dh < curr_max_cosdh || !is_sliver_well_oriented))
       continue;
 
-    //This apex improves the edge. Now, and only now, ask whether a chord --
-    //an edge joining it to an apex that is not its neighbour on the ring --
-    //rules it out. Asking from this apex's own star gives the same answer the
-    //old loop got asking from whichever end it had not yet disqualified:
-    //128 154 pairs were asked from both ends under `CGAL_TR_CHORDSYM` and the
-    //two ends never disagreed.
-    if (apex_star[p] == nullptr)
+    //This opposite vertex improves the edge. Now, and only now, ask whether a
+    //chord -- an edge joining it to an opposite vertex that is not its
+    //neighbour on the ring -- rules it out. Asking from this opposite vertex's
+    //own star gives the same answer the old loop got asking from whichever end
+    //it had not yet disqualified: 128 154 pairs were asked from both ends under
+    //`CGAL_TR_CHORDSYM` and the two ends never disagreed.
+    if (opposite_star[p] == nullptr)
     {
       Star& o_inc_vh = inc_cells[vh];
       if (o_inc_vh.empty())
         incident_cells_tagged(tr, vh, std::back_inserter(o_inc_vh));
 
-      apex_star[p] = &o_inc_vh;
+      opposite_star[p] = &o_inc_vh;
     }
-    const Star& o_inc_vh = *apex_star[p];
+    const Star& o_inc_vh = *opposite_star[p];
 
     bool chorded = false;
-    for (int j = 0; j < n_apices && !chorded; ++j)
+    for (int j = 0; j < n_opposite_vertices && !chorded; ++j)
     {
       if (j == p || j == p - 1 || j == p + 1)
         continue;
-      if ((p == 0 && j == n_apices - 1) || (p == n_apices - 1 && j == 0))
+      if ((p == 0 && j == n_opposite_vertices - 1) || (p == n_opposite_vertices - 1 && j == 0))
         continue;
 
-      if (is_edge_uv(vh, ring_apices[j], o_inc_vh))
+      if (is_edge_uv(vh, ring_opposite_vertices[j], o_inc_vh))
         chorded = true;
     }
 
@@ -1306,7 +1307,7 @@ Sliver_removal_result find_best_flip(typename C3t3::Edge& edge,
   Facet_circulator circ = tr.incident_facets(edge);
   Facet_circulator done = circ;
 
-  //Identify the vertices around this edge. The ring of apices around an edge
+  //Identify the vertices around this edge. The ring of opposite vertices around an edge
   //holds a handful of distinct vertices, so they are kept inline and scanned
   //rather than hashed. flip_3_to_2 does not depend on their order : it picks
   //vh2/vh3 by testing each vertex against ch0/ch1 individually, and is_facet
@@ -2381,7 +2382,7 @@ bool flip_surface_edge(C3t3& c3t3,
       // visits, and it visits the stars of vh2 and vh3, which no lock zone
       // covers -- the same reason the split and the collapse keep it off the
       // parallel path. Both vertices are corners of cells of the zone, so the
-      // non-marking walk reads a star this thread holds the apex of.
+      // non-marking walk reads a star this thread holds the opposite vertex of.
       bool vh2_vh3_share_an_edge = false;
       if (initial_cost > final_cost)
       {
@@ -2686,7 +2687,7 @@ public:
   * A flip rewrites the RING -- the cells around the flipped edge -- in full,
   * and re-stitches the MIRROR cells across the ring's outer facets through
   * `set_neighbor()` and `update_c3t3_facets()`. Cells created by the flip have
-  * only ring vertices and one ring apex as corners. Nothing else is written:
+  * only ring vertices and one ring opposite vertex as corners. Nothing else is written:
   * the rest of the two endpoint stars is read, never modified.
   *
   * A cell is protected by holding its four vertices, so the zone is the vertex
@@ -2879,7 +2880,7 @@ public:
   * own locks cover. The valences of the four vertices are updated in place,
   * and all four are corners of ring cells. The two reads that leave the ring
   * -- whether `vh2` and `vh3` already share an edge, and `is_boundary_edge()`
-  * -- either stay on the ring and its mirrors or walk a star whose apex this
+  * -- either stay on the ring and its mirrors or walk a star whose opposite vertex this
   * zone holds, which is why the first of them had to stop marking.
   *
   * The two whole endpoint stars this used to take were never the write set.

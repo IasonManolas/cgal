@@ -561,7 +561,7 @@ public:
   * The zone taken by default is the union of the two endpoint stars. A split
   * destroys and recreates the RING -- the cells incident to the edge -- and
   * re-stitches the MIRROR cells across the ring's outer facets through
-  * `set_neighbor()`; the cells created have only ring vertices, one ring apex
+  * `set_neighbor()`; the cells created have only ring vertices, one ring opposite vertex
   * and the new vertex as corners. Nothing outside ring u mirror is written,
   * and, once the edge has been located here, nothing outside it is read
   * either: `can_be_split()` and `split_edge()` both work off a
