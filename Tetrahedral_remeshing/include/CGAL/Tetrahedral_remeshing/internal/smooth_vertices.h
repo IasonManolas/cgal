@@ -1613,7 +1613,6 @@ protected:
   using typename BaseClass::Vertex_handle;
 
 private:
-private:
   void compute_vertex_moves(const C3t3& c3t3) const override
   {
     BaseClass::accumulate_edge_moves(
