@@ -972,117 +972,108 @@ private:
 #endif
   }
 
-  // Star gather that never writes to the cells it visits, so overlapping
-  // stars can be walked concurrently.
+  // Star walks that never write to the cells they visit, so overlapping stars
+  // can be walked concurrently.
+
+  // Which cells such a walk has already seen.
   //
-  /**
-  * The answer for a star too large for the open-addressed table of 8-bit
-  * indices the two threadsafe walks below use.
-  *
-  * Past `MAXIDX` that table can no longer address its entries, and the walk
-  * used to answer "have I already visited this cell?" with a LINEAR SCAN of
-  * the cells found so far, which makes the walk quadratic exactly where the
-  * star is biggest. Counted on `409635_cdt_0.5` (1 thread, whole run): 0.98%
-  * of the 223.6 M asks took that branch and they compared 5.54 BILLION cell
-  * handles between them -- a mean of 2534 comparisons per ask, on a star
-  * reaching 8004 cells. That one branch was the largest single symbol in the
-  * profile, at 15% of the run's instructions.
-  *
-  * The set is thread-local and keeps its capacity between walks, so its
-  * allocation is paid once per thread rather than once per star -- which is
-  * what makes a library container affordable here and not at the small table,
-  * where a set constructed and destroyed per walk screened +6.953% wall. It
-  * is filled the first time a walk passes `MAXIDX`, from the cells found so
-  * far, and answers every later ask of that walk in constant time. A walk
-  * that never passes `MAXIDX` never touches it.
-  *
-  * Returns what the linear scan it replaces returned: TRUE when `ch` has NOT
-  * been seen, i.e. when the caller should record and push it.
-  */
-  template <typename CellsContainer, typename CH>
-  static bool wide_not_seen(const CellsContainer& cells, CH ch, bool& active)
+  // An open-addressed table of 8-bit indices into the walk's own `cells`
+  // container (0 = empty, k = cells[k-1]). The table is 256 bytes, so clearing
+  // it costs four cache lines, and a probe is one multiply-shift plus, at the
+  // load factor a vertex star reaches, almost always a single slot read.
+  // Storing indices rather than handles lets `cells` reallocate freely.
+  //
+  // A star too large for an 8-bit index spills into a thread-local hash set,
+  // filled once from the cells found so far. The set keeps its capacity
+  // between walks, so its allocation is paid once per thread rather than once
+  // per star.
+  template <typename CellsContainer>
+  class Visited_cells
   {
-    using Wide_set = CGAL::unordered_flat_set<CH,
-                                              CGAL::Hash_handles_with_or_without_timestamps>;
-    static thread_local Wide_set wide;
-    if(!active)
+    static constexpr unsigned    table_size = 256;   // power of two
+    static constexpr std::size_t max_index  = 192;   // keeps the load <= 0.75
+
+    unsigned char m_table[table_size];
+    bool m_has_spilled;
+
+  public:
+    Visited_cells() : m_has_spilled(false)
     {
-      wide.clear();
-      wide.insert(cells.begin(), cells.end());
-      active = true;
+      std::memset(m_table, 0, sizeof(m_table));
     }
-    return wide.insert(ch).second;
+
+    // True when `c` had not been visited yet, i.e. when the caller should
+    // append it to `cells`. `index` is the position it would be appended at.
+    bool visit(const CellsContainer& cells, Cell_handle c, std::size_t index)
+    {
+      if(index > max_index)
+        return spill(cells, c);
+
+      const std::uintptr_t address = reinterpret_cast<std::uintptr_t>(&*c);
+      unsigned slot = unsigned((address * 0x9E3779B97F4A7C15ull) >> 56) & (table_size - 1);
+      for(;;) {
+        const unsigned char entry = m_table[slot];
+        if(entry == 0) {
+          m_table[slot] = static_cast<unsigned char>(index + 1);
+          return true;
+        }
+        if(cells[entry - 1] == c)
+          return false;
+        slot = (slot + 1) & (table_size - 1);
+      }
+    }
+
+  private:
+    bool spill(const CellsContainer& cells, Cell_handle c)
+    {
+      using Spilled_cells
+        = CGAL::unordered_flat_set<Cell_handle,
+                                   CGAL::Hash_handles_with_or_without_timestamps>;
+      static thread_local Spilled_cells spilled;
+      if(!m_has_spilled) {
+        spilled.clear();
+        spilled.insert(cells.begin(), cells.end());
+        m_has_spilled = true;
+      }
+      return spilled.insert(c).second;
+    }
+  };
+
+  // The four neighbours of `c`, their cache misses issued together. Each
+  // neighbour's address is only reachable through its handle, so fetching them
+  // one at a time serialises four full memory latencies.
+  static std::array<Cell_handle, 4> prefetched_neighbors(Cell_handle c)
+  {
+    std::array<Cell_handle, 4> neighbors;
+    for(int i = 0; i < 4; ++i) {
+      neighbors[i] = c->neighbor(i);
+      prefetch_read(&*neighbors[i]);
+    }
+    return neighbors;
   }
 
-  // The visited set used to be
-  //     boost::container::flat_set<Cell_handle, std::less<>,
-  //                                small_vector<Cell_handle, 128>>
-  // whose insert is a lower_bound followed by a memmove of up to 128 handles:
-  // O(n^2) byte traffic in the star size, on a branch the predictor cannot
-  // learn, executed ~3n times per gather. It is replaced by an open-addressed
-  // table of 8-BIT INDICES into `cells` (0 = empty, k = cells[k-1]). The table
-  // is 256 bytes, so clearing it is four cache lines rather than 128 handle
-  // constructions, and a probe is one multiply-shift plus -- at the load
-  // factor a vertex star actually reaches (typically 20-40 cells, <= 0.16) --
-  // almost always a single slot read. Indices rather than handles let `cells`
-  // reallocate freely.
-  //
-  // Stars larger than the 8-bit index can address fall back to a linear scan
-  // of `cells`, which is correct because that scan sees every cell found so
-  // far, whether or not it was also recorded in the table.
-  //
-  // Same BFS, same push order, same dedup outcome; only the structure
-  // answering "seen?" differs.
   template <class IncidentFacetIterator, typename CellsContainers>
   void
   incident_cells_3_threadsafe(Vertex_handle v, Cell_handle d,
                               CellsContainers &cells,
                               IncidentFacetIterator facet_it) const
   {
-    constexpr unsigned    TSIZE  = 256;   // power of two
-    constexpr std::size_t MAXIDX = 192;   // keeps the table's load <= 0.75
-    unsigned char table[TSIZE];
-    std::memset(table, 0, sizeof(table));
-    bool wide_active = false;
+    Visited_cells<CellsContainers> visited;
 
-    auto seen_or_record = [&](Cell_handle ch, std::size_t idx) -> bool
-    {
-      if (idx > MAXIDX)
-        return wide_not_seen(cells, ch, wide_active);
-      const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(&*ch);
-      unsigned s = unsigned((p * 0x9E3779B97F4A7C15ull) >> 56) & (TSIZE - 1);
-      for (;;) {
-        const unsigned char k = table[s];
-        if (k == 0) { table[s] = static_cast<unsigned char>(idx + 1); return true; }
-        if (cells[k - 1] == ch) return false;
-        s = (s + 1) & (TSIZE - 1);
-      }
-    };
-
-    seen_or_record(d, 0);
+    visited.visit(cells, d, 0);
     cells.push_back(d);
     std::size_t head = 0;
     do {
       Cell_handle c = cells[head];
-
-      // &*next is needed by the dedup probe below and is reached through
-      // c->neighbor(i), so the four neighbours otherwise serialise into four
-      // full memory latencies. The neighbour handles all live in c, which is
-      // already hot; issuing their addresses up front lets the four cache
-      // misses overlap instead.
-      Cell_handle nb_[4];
-      for (int i_ = 0; i_ < 4; ++i_) {
-        nb_[i_] = c->neighbor(i_);
-        prefetch_read(&*nb_[i_]);
-      }
+      const std::array<Cell_handle, 4> neighbors = prefetched_neighbors(c);
 
       for (int i=0; i<4; ++i) {
         if (c->vertex(i) == v)
           continue;
-        Cell_handle next = nb_[i];
+        Cell_handle next = neighbors[i];
         if (c < next)
           *facet_it++ = Facet(c, i); // Incident facet
-        if (! seen_or_record(next, cells.size()) )
+        if (! visited.visit(cells, next, cells.size()) )
           continue;
         cells.push_back(next);
       }
@@ -1340,60 +1331,25 @@ public:
   {
     CGAL_precondition(dimension() == 3);
 
-    // Same open-addressed table of 8-bit indices as
-    // `incident_cells_3_threadsafe()`, for the same reason: the `flat_set`
-    // this replaces paid a lower_bound plus a memmove of up to 128 handles on
-    // every one of the ~3n asks per walk. Kept as its own copy rather than a
-    // shared utility -- the two sites differ in their overflow policy and
-    // sharing them measured slower.
-    constexpr unsigned    TSIZE  = 256;   // power of two
-    constexpr std::size_t MAXIDX = 192;   // keeps the table's load <= 0.75
-    unsigned char table[TSIZE];
-    std::memset(table, 0, sizeof(table));
-
-    boost::container::small_vector<Cell_handle, 128> cells;
-    bool wide_active = false;
-
-    // Past the 8-bit index the probe moves to the thread-local wide set above,
-    // which is exact for the same reason the scan it replaces was: it holds
-    // every cell found so far, whether or not it was also recorded in the
-    // table.
-    auto seen_or_record = [&](Cell_handle ch, std::size_t idx) -> bool
-    {
-      if (idx > MAXIDX)
-        return wide_not_seen(cells, ch, wide_active);
-      const std::uintptr_t p = reinterpret_cast<std::uintptr_t>(&*ch);
-      unsigned s = unsigned((p * 0x9E3779B97F4A7C15ull) >> 56) & (TSIZE - 1);
-      for (;;) {
-        const unsigned char k = table[s];
-        if (k == 0) { table[s] = static_cast<unsigned char>(idx + 1); return true; }
-        if (cells[k - 1] == ch) return false;
-        s = (s + 1) & (TSIZE - 1);
-      }
-    };
+    using Cells = boost::container::small_vector<Cell_handle, 128>;
+    Cells cells;
+    Visited_cells<Cells> visited;
 
     const Cell_handle d = v->cell();
-    seen_or_record(d, 0);
+    visited.visit(cells, d, 0);
     cells.push_back(d);
     if(pred(d)) { found = d; return true; }
 
     std::size_t head = 0;
     while(head != cells.size()) {
       const Cell_handle c = cells[head++];
-
-      // The dedup probe needs &*next, so issue the four neighbour addresses up
-      // front and let their cache misses overlap.
-      Cell_handle nb_[4];
-      for(int i_=0; i_<4; ++i_) {
-        nb_[i_] = c->neighbor(i_);
-        prefetch_read(&*nb_[i_]);
-      }
+      const std::array<Cell_handle, 4> neighbors = prefetched_neighbors(c);
 
       for(int i=0; i<4; ++i) {
         if(c->vertex(i) == v)
           continue;
-        const Cell_handle next = nb_[i];
-        if(! seen_or_record(next, cells.size()))
+        const Cell_handle next = neighbors[i];
+        if(! visited.visit(cells, next, cells.size()))
           continue;
         cells.push_back(next);
         if(pred(next)) { found = next; return true; }
