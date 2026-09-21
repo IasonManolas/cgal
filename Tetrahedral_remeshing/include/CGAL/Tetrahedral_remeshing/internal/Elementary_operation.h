@@ -225,7 +225,7 @@ private:
   * failed lock means another thread holds part of this zone, and every zone
   * is released as soon as its operation ends, so the wait is finite.
   */
-  static void apply_one(const Element_type& element, Operation& op, C3t3& c3t3)
+  static void lock_and_execute(const Element_type& element, Operation& op, C3t3& c3t3)
   {
 #ifdef CGAL_TR_LOCKCOUNT
     Lockcount_counters& lc = lockcount_counters();
@@ -269,7 +269,7 @@ private:
                         std::vector<Element_type> postponed;
                         while (queue.try_pop(element))
                         {
-                          if (!try_apply_one(element, op, c3t3))
+                          if (!try_lock_and_execute(element, op, c3t3))
                             postponed.push_back(element);
 
                           if (postponed.size() >= max_postponed)
@@ -279,7 +279,7 @@ private:
                         // waiting form: the pass is over for this worker, so
                         // there is nothing else for it to do meanwhile.
                         for (const Element_type& e : postponed)
-                          apply_one(e, op, c3t3);
+                          lock_and_execute(e, op, c3t3);
                       });
   }
 
@@ -291,18 +291,18 @@ private:
     std::size_t kept = 0;
     for (std::size_t i = 0; i < postponed.size(); ++i)
     {
-      if (!try_apply_one(postponed[i], op, c3t3))
+      if (!try_lock_and_execute(postponed[i], op, c3t3))
         postponed[kept++] = postponed[i];
     }
     postponed.resize(kept);
   }
 
   /**
-  * One attempt at `element`. Unlike `apply_one()` it does not wait: a zone it
+  * One attempt at `element`. Unlike `lock_and_execute()` it does not wait: a zone it
   * cannot take is given back and the element reported undone, for the caller
   * to come back to.
   */
-  static bool try_apply_one(const Element_type& element, Operation& op, C3t3& c3t3)
+  static bool try_lock_and_execute(const Element_type& element, Operation& op, C3t3& c3t3)
   {
 #ifdef CGAL_TR_LOCKCOUNT
     Lockcount_counters& lc = lockcount_counters();
@@ -343,28 +343,28 @@ private:
   * given, the rest is done serially, where a zone cannot fail for want of
   * another thread and every element is taken exactly once.
   */
-  static void run_deferred(std::vector<Element_type> todo,
+  static void run_deferred(std::vector<Element_type> deferred_elements,
                            Operation& op, C3t3& c3t3)
   {
-    while(!todo.empty())
+    while(!deferred_elements.empty())
     {
-      tbb::enumerable_thread_specific<std::vector<Element_type>> again;
-      tbb::parallel_for_each(todo,
+      tbb::enumerable_thread_specific<std::vector<Element_type>> conflicted_again;
+      tbb::parallel_for_each(deferred_elements,
                              [&](const Element_type& element)
                              {
-                               if(!try_apply_one(element, op, c3t3))
-                                 again.local().push_back(element);
+                               if(!try_lock_and_execute(element, op, c3t3))
+                                 conflicted_again.local().push_back(element);
                              });
-      std::vector<Element_type> next = gather(again);
-      if(next.empty())
+      std::vector<Element_type> still_conflicted = gather(conflicted_again);
+      if(still_conflicted.empty())
         return;
-      if(2 * next.size() > todo.size())   // the round cleared less than half
+      if(2 * still_conflicted.size() > deferred_elements.size())   // the round cleared less than half
       {
-        for(const Element_type& element : next)
-          apply_one(element, op, c3t3);
+        for(const Element_type& element : still_conflicted)
+          lock_and_execute(element, op, c3t3);
         return;
       }
-      todo.swap(next);
+      deferred_elements.swap(still_conflicted);
     }
   }
 
@@ -406,7 +406,7 @@ private:
     tbb::parallel_for_each(candidates,
                            [&](const Element_type& element)
                            {
-                             if(!try_apply_one(element, op, c3t3))
+                             if(!try_lock_and_execute(element, op, c3t3))
                                deferred.local().push_back(element);
                            });
     run_deferred(gather(deferred), op, c3t3);
