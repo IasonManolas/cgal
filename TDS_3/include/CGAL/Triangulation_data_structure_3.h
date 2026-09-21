@@ -49,10 +49,13 @@
 #include <memory_resource>
 #endif
 
+#if defined(_MSC_VER) && !defined(__clang__) && (defined(_M_X64) || defined(_M_IX86))
+#include <xmmintrin.h>
+#endif
+
 #include <CGAL/assertions.h>
 #include <CGAL/config.h>
 #include <CGAL/Handle_hash_function.h>
-#include <CGAL/unordered_flat_map.h>
 #include <CGAL/IO/io.h>
 #include <CGAL/Iterator_range.h>
 #include <CGAL/iterator.h>
@@ -957,6 +960,18 @@ private:
         return it;
   }
 
+  // A hint to start loading `p` into cache; ignored where unavailable.
+  static void prefetch_read(const void* p)
+  {
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_prefetch(p);
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+    _mm_prefetch(static_cast<const char*>(p), _MM_HINT_T0);
+#else
+    CGAL_USE(p);
+#endif
+  }
+
   // Star gather that never writes to the cells it visits, so overlapping
   // stars can be walked concurrently.
   //
@@ -1058,7 +1073,7 @@ private:
       Cell_handle nb_[4];
       for (int i_ = 0; i_ < 4; ++i_) {
         nb_[i_] = c->neighbor(i_);
-        __builtin_prefetch(&*nb_[i_]);
+        prefetch_read(&*nb_[i_]);
       }
 
       for (int i=0; i<4; ++i) {
@@ -1371,7 +1386,7 @@ public:
       Cell_handle nb_[4];
       for(int i_=0; i_<4; ++i_) {
         nb_[i_] = c->neighbor(i_);
-        __builtin_prefetch(&*nb_[i_]);
+        prefetch_read(&*nb_[i_]);
       }
 
       for(int i=0; i<4; ++i) {
