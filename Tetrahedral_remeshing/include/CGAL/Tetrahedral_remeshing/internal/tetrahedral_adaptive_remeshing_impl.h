@@ -149,12 +149,26 @@ private:
   * 32 and 64 measured the same wall time as 16 there and lost more on the
   * small meshes, so the choice among them was made on the small end.
   *
-  * Holding the number of threads per grid cell constant as threads are added
-  * makes the count grow with the cube root of the thread count, since the
-  * grid is three-dimensional: 16 at 4 threads, 20 at 8, 29 at 24. The grid is
-  * never made coarser than the 16 that was screened, and never finer than 64,
-  * where the flat region above 16 was last measured. Its memory is negligible
-  * at either end -- 4096 cells against 262144, one word each.
+  * How it grows with the thread count was then MEASURED at 24, by sweeping
+  * the override below on a 24-core machine (94665_cdt f=0.3, three runs each):
+  *
+  *     cells per axis   16      24      32      48      64
+  *     94665_cdt        24.80s  23.60s  22.66s  22.05s  22.11s
+  *     94665_mesh3       7.15s   6.95s   6.90s   6.95s   7.00s
+  *
+  * so 48 is the best of them on the config that suffers most (-11.1% against
+  * 16) and costs the other one 0.7% against its own best. 64 buys nothing and
+  * loses 1.4% there, which is the same small-mesh argument that settled the
+  * choice at four threads.
+  *
+  * Holding the threads per grid cell constant would make the count grow with
+  * the CUBE ROOT of the thread count -- 29 at 24 threads -- and that is too
+  * shallow: 29 measures about 23.4s above, most of the 11% still on the table.
+  * The exponent that carries the two measured points, 16 at 4 threads and 48
+  * at 24, is 0.6; rounding leaves it at 47 rather than 48, which the sweep
+  * puts inside the flat region -- 48 and 64 are 0.3% apart. The grid is never made coarser than the 16 that was screened
+  * at four threads, and never finer than the 64 swept here. Its memory is
+  * negligible at either end -- 4096 cells against 262144, one word each.
   *
   * CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID overrides the whole rule, so that the
   * count can be swept on a machine without rebuilding. It is read once per
@@ -175,7 +189,7 @@ private:
     const std::size_t threads =
       tbb::global_control::active_value(tbb::global_control::max_allowed_parallelism);
 
-    const double scaled = 16.0 * std::cbrt(double(threads) / 4.0);
+    const double scaled = 16.0 * std::pow(double(threads) / 4.0, 0.6);
     return (std::max)(16, (std::min)(64, int(scaled + 0.5)));
   }
 #endif
