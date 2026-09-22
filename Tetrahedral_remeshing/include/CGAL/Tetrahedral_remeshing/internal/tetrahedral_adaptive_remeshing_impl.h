@@ -32,6 +32,7 @@
 
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_helpers.h>
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
+#include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_instrumentation.h>
 
 #include <memory>
 #include <optional>
@@ -254,7 +255,10 @@ public:
     typedef Edge_split_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeSplitOp;
     EdgeSplitOp split_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
     Executor<EdgeSplitOp> executor;
-    executor.execute(split_op, m_c3t3);
+    {
+      CGAL_TR_TOPSTAGE_SCOPE("split");
+      executor.execute(split_op, m_c3t3);
+    }
 
     // Split allocates the cells it creates in edge-length order, which is
     // spatially random, so it undoes the setup sort on any mesh the run grows.
@@ -277,6 +281,7 @@ public:
     {
       if (m_split_passes % CGAL_TETRAHEDRAL_REMESHING_SPATIAL_SORT_EVERY == 0)
       {
+        CGAL_TR_TOPSTAGE_SCOPE("split spatial-sort rebuild");
         // Everything the smoothing context caches is keyed by vertex handle
         // and is rebuilt by refresh() on entry to every smooth(); collapse and
         // flip never read it. split() only ever runs before the flip/smooth
@@ -321,7 +326,10 @@ public:
     typedef Edge_collapse_operation<C3t3, SizingFunction, CellSelector, Visitor> EdgeCollapseOp;
     EdgeCollapseOp collapse_op(m_sizing, m_cell_selector, m_protect_boundaries, m_visitor);
     Executor<EdgeCollapseOp> executor;
-    executor.execute(collapse_op, m_c3t3);
+    {
+      CGAL_TR_TOPSTAGE_SCOPE("collapse");
+      executor.execute(collapse_op, m_c3t3);
+    }
 
 #ifdef CGAL_TETRAHEDRAL_REMESHING_DEBUG
     CGAL_assertion(tr().tds().is_valid(true));
@@ -349,12 +357,16 @@ public:
 
     InternalFlipOp internal_flip_op(m_cell_selector, m_visitor, inc_cells);
     Executor<InternalFlipOp> internal_executor;
-    internal_executor.execute(internal_flip_op, m_c3t3);
+    {
+      CGAL_TR_TOPSTAGE_SCOPE("flip internal");
+      internal_executor.execute(internal_flip_op, m_c3t3);
+    }
 
     if (!m_protect_boundaries)
     {
       BoundaryFlipOp boundary_flip_op(m_cell_selector, m_visitor, inc_cells);
       Executor<BoundaryFlipOp> boundary_executor;
+      CGAL_TR_TOPSTAGE_SCOPE("flip boundary");
       boundary_executor.execute(boundary_flip_op, m_c3t3);
     }
 
@@ -376,7 +388,10 @@ public:
 
   void smooth()
   {
-    m_smoothing_context->refresh(m_c3t3);
+    {
+      CGAL_TR_TOPSTAGE_SCOPE("smooth refresh");
+      m_smoothing_context->refresh(m_c3t3);
+    }
 
     // Order matches the former Tetrahedral_remeshing_smoother::smooth_vertices():
     // complex (1D) edges, then surface (2D) vertices, then internal (3D) vertices.
@@ -386,17 +401,20 @@ public:
       {
         Complex_edge_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
         Executor<decltype(op)> executor;
+        CGAL_TR_TOPSTAGE_SCOPE("smooth complex edges");
         executor.execute(op, m_c3t3);
       }
       {
         Surface_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
         Executor<decltype(op)> executor;
+        CGAL_TR_TOPSTAGE_SCOPE("smooth surface");
         executor.execute(op, m_c3t3);
       }
     }
     {
       Internal_vertex_smooth_operation<C3t3, SizingFunction, CellSelector> op(m_smoothing_context);
       Executor<decltype(op)> executor;
+      CGAL_TR_TOPSTAGE_SCOPE("smooth internal");
       executor.execute(op, m_c3t3);
     }
 
@@ -418,6 +436,7 @@ public:
 
   bool resolution_reached()
   {
+    CGAL_TR_TOPSTAGE_SCOPE("resolution_reached");
     for (const Edge& e : tr().finite_edges())
     {
       // skip protected edges
@@ -773,6 +792,9 @@ public:
   void remesh(const std::size_t& max_it,
               const std::size_t& nb_extra_iterations)
   {
+    // Nests over every stage below, so it is the denominator, not a row: the
+    // per-stage sum is compared against it rather than added to it.
+    CGAL_TR_TOPSTAGE_SCOPE("= remesh() total");
     std::size_t it_nb = 0;
     while (it_nb < max_it)
     {
@@ -828,8 +850,12 @@ public:
 #endif
     }
 
-    postprocess(); //peel off boundary slivers
+    {
+      CGAL_TR_TOPSTAGE_SCOPE("postprocess");
+      postprocess(); //peel off boundary slivers
+    }
 
+    CGAL_TR_TOPSTAGE_SCOPE("finalize");
     finalize();
     //Warning : triangulation() is now empty
   }

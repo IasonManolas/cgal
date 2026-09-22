@@ -20,6 +20,7 @@
 #include <CGAL/tags.h>
 
 #ifdef CGAL_LINKED_WITH_TBB
+#include <string>
 #include <tbb/blocked_range.h>
 #include <tbb/concurrent_queue.h>
 #include <tbb/concurrent_unordered_map.h>
@@ -570,6 +571,29 @@ private:
         return;
       if(2 * next.size() > todo.size())   // the round cleared less than half
       {
+        // ONE thread finishes what the rounds could not, with the waiting
+        // form of apply_one. This is a serial section, it is not small, and it
+        // GROWS with the thread count -- measured at 4 threads on
+        // 409635_cdt_0.5, one thread finishes 88 015 elements in 0.42 s of an
+        // 11.3 s run, 3.7% of the whole, against nothing at all at one thread,
+        // where no element is ever deferred.
+        //
+        // Spreading it over the threads was tried and does NOT pay: as
+        // tbb::parallel_for_each over the same waiting form it measured
+        // +0.572% wall (5 balanced blocks, sd 1.102%) on 1146193_cdt_1.5 at 4
+        // threads, against a predicted -3.7%. These are precisely the elements
+        // the rounds could not clear, so they conflict with each other; moved
+        // onto several threads they spend the saving waiting in
+        // std::this_thread::yield() instead. Whether that still holds at 24
+        // threads, where the tail is larger, is not measurable on a 4-core
+        // box -- CGAL_TR_TOPSTAGE reports its size and its wall time so that
+        // it can be read off a bigger machine.
+#ifdef CGAL_TR_TOPSTAGE
+        CGAL_TR_TOPSTAGE_SCOPE((std::string("~serial deferred tail: ")
+                                + op.operation_name()).c_str());
+        top_stage_times().by_stage[std::string("~serial deferred tail elements: ")
+                                   + op.operation_name()][2] += double(next.size());
+#endif
         for(const Element_type& element : next)
           apply_one(element, op, c3t3);
         return;

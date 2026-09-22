@@ -24,11 +24,29 @@
 //   CGAL_TR_LOCKCOUNT   lock-zone retries per elementary operation, i.e. the
 //                       spin: how often a worker had to release its zone and
 //                       start over because another thread held part of it.
+//
+//   CGAL_TR_TOPSTAGE    wall and process-CPU time of every top-level stage of
+//                       remesh(), so that the run adds up: the six elementary
+//                       operations, the serial spatial-sort rebuild inside
+//                       split(), the smoothing's refresh(), the edge scan of
+//                       resolution_reached(), and postprocess(). A stage whose
+//                       wall time does not fall as threads are added is a
+//                       serial section, and the sum against the total says how
+//                       much of the run no stage accounts for.
 
 #ifdef CGAL_TR_LOCKCOUNT
 #include <cstdint>
 #include <iostream>
 #include <mutex>
+#endif
+
+#ifdef CGAL_TR_TOPSTAGE
+#include <CGAL/Real_timer.h>
+#include <array>
+#include <iostream>
+#include <map>
+#include <string>
+#include <ctime>
 #endif
 
 namespace CGAL
@@ -106,6 +124,75 @@ inline Lockcount_counters& lockcount_counters()
   static thread_local Lockcount_counters c;
   return c;
 }
+
+#ifdef CGAL_TR_TOPSTAGE
+/**
+* Wall and process-CPU time of each top-level stage of `remesh()`.
+*
+* A DIAGNOSTIC, not a gate. It exists to separate a stage that gets faster
+* when threads are added from one that does not: the second kind is what caps
+* the speedup, and no aggregate wall time can tell the two apart. Process CPU
+* is recorded next to wall so that a stage running at one core shows up as
+* such rather than being inferred.
+*
+* Single-threaded accounting on purpose -- every stage is entered by the
+* calling thread only, so no lock is needed and the timer adds nothing to the
+* parallel region it brackets.
+*/
+struct Top_stage_times
+{
+  std::map<std::string, std::array<double, 3>> by_stage;  // wall, cpu, calls
+  ~Top_stage_times()
+  {
+    for (const auto& [name, v] : by_stage)
+      std::cout << "TOPSTAGE \"" << name << "\" wall=" << v[0]
+                << " cpu=" << v[1] << " calls=" << v[2] << std::endl;
+  }
+};
+
+inline Top_stage_times& top_stage_times()
+{
+  static Top_stage_times t;
+  return t;
+}
+
+inline double top_stage_cpu_seconds()
+{
+  struct timespec ts;
+  clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &ts);
+  return double(ts.tv_sec) + 1e-9 * double(ts.tv_nsec);
+}
+
+struct Top_stage_scope
+{
+  std::array<double, 3>& slot;
+  CGAL::Real_timer t;
+  double c0;
+
+  explicit Top_stage_scope(const char* name)
+    : slot(top_stage_times().by_stage[name]), c0(top_stage_cpu_seconds())
+  {
+    t.start();
+  }
+  ~Top_stage_scope()
+  {
+    t.stop();
+    slot[0] += t.time();
+    slot[1] += top_stage_cpu_seconds() - c0;
+    slot[2] += 1.0;
+  }
+};
+
+// The name carries the line number, so that two stages may be bracketed in the
+// same block -- remesh() times itself and its finalize() side by side.
+#define CGAL_TR_TOPSTAGE_JOIN2(a, b) a##b
+#define CGAL_TR_TOPSTAGE_JOIN(a, b) CGAL_TR_TOPSTAGE_JOIN2(a, b)
+#define CGAL_TR_TOPSTAGE_SCOPE(NAME) \
+  ::CGAL::Tetrahedral_remeshing::internal::Top_stage_scope \
+    CGAL_TR_TOPSTAGE_JOIN(cgal_tr_topstage_scope_, __LINE__)((NAME))
+#else
+#define CGAL_TR_TOPSTAGE_SCOPE(NAME) do {} while (0)
+#endif
 
 } // end namespace internal
 } // end namespace Tetrahedral_remeshing
