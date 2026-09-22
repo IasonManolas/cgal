@@ -20,9 +20,9 @@
 #include <CGAL/tags.h>
 
 #ifdef CGAL_LINKED_WITH_TBB
+#include <atomic>
 #include <string>
 #include <tbb/blocked_range.h>
-#include <tbb/concurrent_queue.h>
 #include <tbb/concurrent_unordered_map.h>
 #include <tbb/concurrent_unordered_set.h>
 #include <tbb/enumerable_thread_specific.h>
@@ -440,10 +440,37 @@ private:
   */
   static constexpr std::size_t max_postponed = 8;
 
+  // How many candidates a worker claims at once in run_ordered().
+  //
+  // The candidates are handed out in blocks rather than one at a time because
+  // the hand-out point is shared by every worker: taking one element is one
+  // atomic read-modify-write on a single word, and that word's cache line has
+  // to travel to whichever core wants the next element. One line, one owner at
+  // a time, once per element -- so the cost of handing work out grows with the
+  // number of workers while the work itself does not. A block of 16 pays it
+  // once per 16 elements instead.
+  //
+  // It stays small because the order the candidates arrive in carries meaning
+  // for these operations: get_elements() puts the most-wanted first, and a
+  // block is the distance by which a worker may run ahead of that order.
+  static constexpr std::size_t claim_block = 16;
+
   static void run_ordered(std::vector<Element_type>& candidates,
                           Operation& op, C3t3& c3t3)
   {
-    tbb::concurrent_queue<Element_type> queue(candidates.begin(), candidates.end());
+    // A shared cursor into the candidates, not a concurrent queue: the queue
+    // holds a second copy of every element and is paid per element, while the
+    // cursor reads the candidates where they already are and is paid per
+    // block. A worker still takes the earliest block nobody has claimed, so
+    // the order elements are STARTED in is the order get_elements() produced,
+    // as it was with the queue.
+    //
+    // At one thread the blocks are claimed 0..15, 16..31, ... by the only
+    // worker, which is the candidate order exactly -- the single-threaded
+    // result is unchanged, byte for byte.
+    std::atomic<std::size_t> next_claim{0};
+    const std::size_t n_candidates = candidates.size();
+
     tbb::parallel_for(0, tbb::this_task_arena::max_concurrency(),
                       [&](int)
                       {
@@ -451,15 +478,24 @@ private:
                         Tr_thread_time* tw_ = tr_tt();
                         const double w0_ = tw_ ? tr_tt_now() : 0.0;
 #endif
-                        Element_type element;
                         std::vector<Element_type> postponed;
-                        while (queue.try_pop(element))
+                        for (;;)
                         {
-                          if (!try_apply_one(element, op, c3t3))
-                            postponed.push_back(element);
+                          const std::size_t first =
+                            next_claim.fetch_add(claim_block, std::memory_order_relaxed);
+                          if (first >= n_candidates)
+                            break;
+                          const std::size_t last =
+                            (std::min)(first + claim_block, n_candidates);
 
-                          if (postponed.size() >= max_postponed)
-                            retry_postponed(postponed, op, c3t3);
+                          for (std::size_t i = first; i < last; ++i)
+                          {
+                            if (!try_apply_one(candidates[i], op, c3t3))
+                              postponed.push_back(candidates[i]);
+
+                            if (postponed.size() >= max_postponed)
+                              retry_postponed(postponed, op, c3t3);
+                          }
                         }
                         // Whatever is still held back is taken with the
                         // waiting form: the pass is over for this worker, so
