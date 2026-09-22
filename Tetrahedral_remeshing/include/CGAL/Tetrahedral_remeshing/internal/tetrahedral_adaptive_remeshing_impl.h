@@ -34,10 +34,16 @@
 #include <CGAL/Tetrahedral_remeshing/internal/compute_c3t3_statistics.h>
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_instrumentation.h>
 
+#include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <optional>
 #include <type_traits>
 #include <boost/container/small_vector.hpp>
+
+#ifdef CGAL_LINKED_WITH_TBB
+#include <tbb/global_control.h>
+#endif
 
 namespace CGAL
 {
@@ -127,6 +133,51 @@ private:
     typename Tr::Lock_data_structure,
     No_lock_data_structure>;
   std::optional<Lock_data_structure_or_empty> m_lock_ds;
+
+  /**
+  * How many lock-grid cells to lay along each axis of the bounding box.
+  *
+  * Two operations running at once conflict when they fall in the same grid
+  * cell even though they touch disjoint tetrahedra, and the loser releases
+  * its zone and starts over. How often that happens depends on how many
+  * threads are sharing the grid, so the number of cells is taken from the
+  * thread count rather than fixed.
+  *
+  * 16 cells per axis is the measured value AT FOUR THREADS: screened over the
+  * 24 Tier-A configs, 16 against the 8 that Mesh_3 uses is -1.907% wall time
+  * and -4.448% instructions, 20 of 24 configs faster and the worst at +0.22%.
+  * 32 and 64 measured the same wall time as 16 there and lost more on the
+  * small meshes, so the choice among them was made on the small end.
+  *
+  * Holding the number of threads per grid cell constant as threads are added
+  * makes the count grow with the cube root of the thread count, since the
+  * grid is three-dimensional: 16 at 4 threads, 20 at 8, 29 at 24. The grid is
+  * never made coarser than the 16 that was screened, and never finer than 64,
+  * where the flat region above 16 was last measured. Its memory is negligible
+  * at either end -- 4096 cells against 262144, one word each.
+  *
+  * CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID overrides the whole rule, so that the
+  * count can be swept on a machine without rebuilding. It is read once per
+  * remesher, never on a locking path.
+  */
+  static int lock_grid_cells_per_axis()
+  {
+    if (const char* const env = std::getenv("CGAL_TETRAHEDRAL_REMESHING_LOCK_GRID"))
+    {
+      const int n = std::atoi(env);
+      if (n > 0)
+        return n;
+    }
+
+    // The effective limit, not tbb::this_task_arena::max_concurrency(): an
+    // arena constrained by a tbb::global_control still reports the machine's
+    // width, which would size the grid for 24 threads on a run asked for 4.
+    const std::size_t threads =
+      tbb::global_control::active_value(tbb::global_control::max_allowed_parallelism);
+
+    const double scaled = 16.0 * std::cbrt(double(threads) / 4.0);
+    return (std::max)(16, (std::min)(64, int(scaled + 0.5)));
+  }
 #endif
 
   /**
@@ -140,13 +191,13 @@ private:
     {
       if (m_c3t3.triangulation().get_lock_data_structure() == nullptr)
       {
-        // 16 cells per axis, not the 8 Mesh_3 uses: at 8 the grid is coarse
-        // enough that distinct operations collide on the same lock and retry.
-        // Screened over the 24 Tier-A configs at 4 threads, 16 vs 8 is
-        // -1.907% wall time and -4.448% instructions, with 20 of 24 configs
-        // faster and the worst at +0.22%. 32 and 64 measure the same wall
-        // time as 16 and lose more on the small meshes.
-        m_lock_ds.emplace(m_c3t3.bbox(), 16);
+        const int cells_per_axis = lock_grid_cells_per_axis();
+#ifdef CGAL_TR_TOPSTAGE
+        std::cout << "LOCKGRID cells_per_axis=" << cells_per_axis
+                  << " threads=" << tbb::global_control::active_value(
+                       tbb::global_control::max_allowed_parallelism) << std::endl;
+#endif
+        m_lock_ds.emplace(m_c3t3.bbox(), cells_per_axis);
         m_c3t3.triangulation().set_lock_data_structure(std::addressof(*m_lock_ds));
       }
     }
