@@ -15,6 +15,8 @@
 
 #include <CGAL/license/Tetrahedral_remeshing.h>
 
+#include <cstdlib>
+
 #include <CGAL/Tetrahedral_remeshing/internal/tetrahedral_remeshing_instrumentation.h>
 
 #include <CGAL/tags.h>
@@ -590,9 +592,38 @@ private:
   * given, the rest is done serially, where a zone cannot fail for want of
   * another thread and every element is taken exactly once.
   */
+  /**
+  * How much of a round has to clear for the next round to be run in parallel.
+  *
+  * The rule was measured at four threads, where the tail is small; at 24 it is
+  * 27.6% of the wall on 94665_cdt f=0.3 (3.66 s of it in the internal flips
+  * alone), so where the cutoff sits is worth a sweep rather than a constant.
+  * CGAL_TR_DEFERRED_CLEARED is the fraction of `todo` a round must clear to
+  * earn another parallel one, in percent. 50 is the rule as measured at four
+  * threads and is the default; 0 lets any progress at all earn another round,
+  * which is the fully parallel replay; 100 can only be met by a round that
+  * clears everything, so the leftovers always go to the serial form. Read once
+  * per process, never on a locking path.
+  */
+  static int deferred_cleared_percent()
+  {
+    static const int pct = []
+    {
+      if(const char* const env = std::getenv("CGAL_TR_DEFERRED_CLEARED"))
+      {
+        const int n = std::atoi(env);
+        if(n >= 0 && n <= 100)
+          return n;
+      }
+      return 50;
+    }();
+    return pct;
+  }
+
   static void run_deferred(std::vector<Element_type> todo,
                            Operation& op, C3t3& c3t3)
   {
+    const int cleared_pct = deferred_cleared_percent();
     while(!todo.empty())
     {
       tbb::enumerable_thread_specific<std::vector<Element_type>> again;
@@ -605,7 +636,9 @@ private:
       std::vector<Element_type> next = gather(again);
       if(next.empty())
         return;
-      if(2 * next.size() > todo.size())   // the round cleared less than half
+      // The round cleared `todo.size() - next.size()`; it earns another one
+      // only if that is at least `cleared_pct` percent of what it was given.
+      if(100 * (todo.size() - next.size()) < std::size_t(cleared_pct) * todo.size())
       {
         // ONE thread finishes what the rounds could not, with the waiting
         // form of apply_one. This is a serial section, it is not small, and it
