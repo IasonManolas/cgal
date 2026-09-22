@@ -314,6 +314,33 @@ public:
     return m_c3t3_pbackup != NULL;
   }
 
+  /**
+  * How often the post-split rebuild runs, every Nth split pass.
+  *
+  * The rebuild is serial, so what it is worth depends on the thread count:
+  * measured at 24 threads on 94665_cdt f=0.3 it is 0.92 s of a 19.34 s run on
+  * ONE core, 4.7% of the wall, against 1.4% at one thread. The layout it
+  * restores is worth more than that -- it is three quarters of the spatial
+  * sort's whole win -- so the number is a trade, not a cost to minimise, and
+  * where it should sit at 24 threads has not been measured.
+  * CGAL_TR_SPATIAL_SORT_EVERY overrides the compile-time default so it can be
+  * swept without rebuilding. Read once per process.
+  */
+  static unsigned int spatial_sort_every()
+  {
+    static const unsigned int every = []() -> unsigned int
+    {
+      if (const char* const env = std::getenv("CGAL_TR_SPATIAL_SORT_EVERY"))
+      {
+        const int n = std::atoi(env);
+        if (n > 0)
+          return static_cast<unsigned int>(n);
+      }
+      return CGAL_TETRAHEDRAL_REMESHING_SPATIAL_SORT_EVERY;
+    }();
+    return every;
+  }
+
   void split()
   {
     CGAL_assertion(check_vertex_dimensions());
@@ -344,7 +371,7 @@ public:
     if constexpr (std::is_convertible_v<Concurrency_tag, CGAL::Parallel_tag>)
 #endif
     {
-      if (m_split_passes % CGAL_TETRAHEDRAL_REMESHING_SPATIAL_SORT_EVERY == 0)
+      if (m_split_passes % spatial_sort_every() == 0)
       {
         CGAL_TR_TOPSTAGE_SCOPE("split spatial-sort rebuild");
         // Everything the smoothing context caches is keyed by vertex handle
