@@ -197,6 +197,10 @@ public:
   // just before flip/smooth steps, when no vertices get inserted
   // nor removed anymore
   std::unordered_map<Vertex_handle, std::size_t> m_vertex_id;
+  // The same vertices in id order, so that a pass over them can be split into
+  // ranges. Filled only under Parallel_tag, where `collect_incident_cells()`
+  // needs it; the map above has no order to split.
+  std::vector<Vertex_handle> m_vertices_by_id;
   std::vector<bool> m_free_vertices{};
   bool m_flip_smooth_steps{false};
 
@@ -529,6 +533,37 @@ private:
     m_inc_cells.clear();
     const std::size_t nbv = tr.number_of_vertices();
     m_inc_cells.resize(nbv, Incident_cells_vector{});
+
+#ifdef CGAL_LINKED_WITH_TBB
+    if constexpr (is_parallel)
+    {
+      // The scan below writes to every vertex of every cell it reads, so it
+      // cannot be split by cells without two threads meeting in the same
+      // vertex's vector. Split by VERTEX instead and gather each star through
+      // the triangulation: a thread owns the vectors of the vertex ids in its
+      // range and nothing is shared, at the cost of walking each cell once per
+      // vertex of it rather than once in total.
+      //
+      // The star comes out in the circulation's order rather than in
+      // `finite_cell_handles()` order. That order is not a promise the
+      // parallel path makes -- its rounds already decide which operations meet
+      // -- and the sequential path below keeps the scan, and its order,
+      // unchanged.
+      tbb::parallel_for(tbb::blocked_range<std::size_t>(0, m_vertices_by_id.size()),
+        [&](const tbb::blocked_range<std::size_t>& range)
+        {
+          for (std::size_t i = range.begin(); i != range.end(); ++i)
+          {
+            if (!is_free(i))
+              continue;
+            tr.finite_incident_cells(m_vertices_by_id[i],
+                                     std::back_inserter(m_inc_cells[i]));
+          }
+        });
+      return;
+    }
+#endif
+
     for (const Cell_handle c : tr.finite_cell_handles())
     {
       for (auto vi : tr.vertices(c))
@@ -996,10 +1031,17 @@ private:
     if(m_flip_smooth_steps)
       return;
     m_vertex_id.clear();
+    if constexpr (is_parallel)
+    {
+      m_vertices_by_id.clear();
+      m_vertices_by_id.reserve(tr.number_of_vertices());
+    }
     std::size_t id = 0;
     for (const Vertex_handle v : tr.finite_vertex_handles())
     {
       m_vertex_id[v] = id++;
+      if constexpr (is_parallel)
+        m_vertices_by_id.push_back(v);
     }
   }
 };
